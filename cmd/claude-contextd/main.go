@@ -49,8 +49,9 @@ func run() error {
 	cfg.LogPath = filepath.Join(cfg.LogsDir, "claude-contextd.log")
 	cfg.MerkleDir = filepath.Join(cfg.StateRoot, "merkle")
 	cfg.LocksDir = filepath.Join(cfg.StateRoot, "locks")
+	cfg.ChunksDir = filepath.Join(cfg.StateRoot, "chunks")
 
-	for _, path := range []string{cfg.StateRoot, cfg.SocketsDir, cfg.LogsDir, cfg.MerkleDir, cfg.LocksDir} {
+	for _, path := range []string{cfg.StateRoot, cfg.SocketsDir, cfg.LogsDir, cfg.MerkleDir, cfg.LocksDir, cfg.ChunksDir} {
 		if err := store.EnsureDir(path); err != nil {
 			slog.Error("ensure state directory failed", "path", path, "err", err)
 			return fmt.Errorf("ensure state directory %s: %w", path, err)

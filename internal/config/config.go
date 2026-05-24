@@ -26,6 +26,7 @@ type Config struct {
 	MerkleDir    string
 	LocksDir     string
 	SocketsDir   string
+	ChunksDir    string
 }
 
 // Default returns the daemon configuration derived from the local environment.
@@ -55,6 +56,7 @@ func Default() (Config, error) {
 		MerkleDir:    filepath.Join(stateRoot, "merkle"),
 		LocksDir:     filepath.Join(stateRoot, "locks"),
 		SocketsDir:   socketsDir,
+		ChunksDir:    filepath.Join(stateRoot, "chunks"),
 	}, nil
 }
 

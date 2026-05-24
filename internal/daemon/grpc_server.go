@@ -171,9 +171,24 @@ func (server *GRPCServer) WatchJobs(request *pb.WatchJobsRequest, stream pb.Clau
 
 // SearchCode is the future search RPC surface for semantic lookups.
 func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCodeRequest) (*pb.SearchCodeResponse, error) {
-	_ = ctx
-	_ = request
-	return nil, status.Error(codes.Unimplemented, "search pipeline not implemented yet")
+	results, err := server.manager.SearchCode(request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	response := &pb.SearchCodeResponse{
+		Results: make([]*pb.SearchResult, 0, len(results)),
+	}
+	for _, result := range results {
+		response.Results = append(response.Results, &pb.SearchResult{
+			RelativePath: result.RelativePath,
+			StartLine:    result.StartLine,
+			EndLine:      result.EndLine,
+			Language:     result.Language,
+			Score:        0,
+			Content:      result.Content,
+		})
+	}
+	return response, nil
 }
 
 // Doctor reports daemon-local diagnostics.

@@ -130,3 +130,56 @@ func ReadJobEvents(path string) (map[string]model.Job, error) {
 	}
 	return jobs, nil
 }
+
+// ReadChunks reads one persisted codebase chunk file.
+func ReadChunks(path string) ([]model.StoredChunk, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		slog.Error("read chunk file failed", "path", path, "err", err)
+		return nil, fmt.Errorf("read chunk file %s: %w", path, err)
+	}
+
+	var chunks []model.StoredChunk
+	if err := json.Unmarshal(data, &chunks); err != nil {
+		slog.Error("unmarshal chunk file failed", "path", path, "err", err)
+		return nil, fmt.Errorf("unmarshal chunk file %s: %w", path, err)
+	}
+	return chunks, nil
+}
+
+// WriteChunks atomically replaces one persisted codebase chunk file.
+func WriteChunks(path string, chunks []model.StoredChunk) error {
+	slog.Info("write chunk file", "path", path, "chunks", len(chunks))
+
+	data, err := json.MarshalIndent(chunks, "", "  ")
+	if err != nil {
+		slog.Error("marshal chunk file failed", "path", path, "err", err)
+		return fmt.Errorf("marshal chunk file %s: %w", path, err)
+	}
+	if err := EnsureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		slog.Error("create temp chunk file failed", "dir", filepath.Dir(path), "err", err)
+		return fmt.Errorf("create temp chunk file in %s: %w", filepath.Dir(path), err)
+	}
+	tempPath := tempFile.Name()
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close()
+		os.Remove(tempPath)
+		slog.Error("write temp chunk file failed", "path", tempPath, "err", err)
+		return fmt.Errorf("write temp chunk file %s: %w", tempPath, err)
+	}
+	if err := tempFile.Close(); err != nil {
+		os.Remove(tempPath)
+		slog.Error("close temp chunk file failed", "path", tempPath, "err", err)
+		return fmt.Errorf("close temp chunk file %s: %w", tempPath, err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		slog.Error("rename temp chunk file failed", "from", tempPath, "to", path, "err", err)
+		return fmt.Errorf("rename temp chunk file %s to %s: %w", tempPath, path, err)
+	}
+	return nil
+}

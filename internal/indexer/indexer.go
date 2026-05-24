@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 
 	"github.com/zilliztech/claude-context-go/internal/discovery"
 	"github.com/zilliztech/claude-context-go/internal/model"
@@ -22,6 +23,7 @@ type Runner struct {
 type Result struct {
 	IndexedFiles int32
 	TotalChunks  int32
+	Chunks       []model.StoredChunk
 }
 
 // NewRunner constructs the local indexing runner.
@@ -40,6 +42,7 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 	}
 
 	var totalChunks int32
+	storedChunks := make([]model.StoredChunk, 0)
 	for _, path := range discoveryResult.Files {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -52,11 +55,27 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 			return Result{}, fmt.Errorf("split source file %s: %w", path, err)
 		}
 		totalChunks += safeInt32(len(splitResult.Chunks))
+		relativePath, err := filepath.Rel(root, path)
+		if err != nil {
+			slog.ErrorContext(ctx, "compute relative chunk path failed", "root", root, "path", path, "err", err)
+			return Result{}, fmt.Errorf("compute relative chunk path for %s: %w", path, err)
+		}
+		for _, chunk := range splitResult.Chunks {
+			storedChunks = append(storedChunks, model.StoredChunk{
+				Content:       chunk.Content,
+				RelativePath:  relativePath,
+				StartLine:     safeInt32(chunk.StartLine),
+				EndLine:       safeInt32(chunk.EndLine),
+				Language:      chunk.Language,
+				FileExtension: filepath.Ext(relativePath),
+			})
+		}
 	}
 
 	return Result{
 		IndexedFiles: safeInt32(len(discoveryResult.Files)),
 		TotalChunks:  totalChunks,
+		Chunks:       storedChunks,
 	}, nil
 }
 

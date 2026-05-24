@@ -465,6 +465,10 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 	}
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
+	chunkPath := manager.chunkPath(codebase.ID)
+	if err := store.WriteChunks(chunkPath, result.Chunks); err != nil {
+		slog.Error("write chunk cache failed", "job_id", jobID, "err", err)
+	}
 	if err := manager.saveLocked(); err != nil {
 		slog.Error("write registry after completed job failed", "job_id", jobID, "err", err)
 	}
@@ -509,6 +513,24 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 	if err := manager.saveLocked(); err != nil {
 		slog.Error("write registry after failed job failed", "job_id", jobID, "err", err)
 	}
+}
+
+// SearchCode performs a local ranked search over persisted chunk content.
+func (manager *Manager) SearchCode(requestedPath string, query string, limit int32, extensionFilter []string) ([]model.StoredChunk, error) {
+	codebase, found, err := manager.GetIndex(requestedPath)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("codebase not tracked: " + requestedPath)
+	}
+
+	chunks, err := store.ReadChunks(manager.chunkPath(codebase.ID))
+	if err != nil {
+		slog.Error("read chunk cache failed", "codebase_id", codebase.ID, "err", err)
+		return nil, fmt.Errorf("read chunk cache for %s: %w", codebase.ID, err)
+	}
+	return rankChunks(chunks, query, limit, extensionFilter), nil
 }
 
 func (manager *Manager) findCodebaseByPathLocked(canonicalPath string, aliasPath string) (model.Codebase, bool) {
@@ -580,10 +602,74 @@ func digestIndexConfig(indexConfig model.IndexConfig) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
+func (manager *Manager) chunkPath(codebaseID string) string {
+	return filepath.Join(manager.config.ChunksDir, codebaseID+".json")
+}
+
 func newID(prefix string) string {
 	randomBytes := make([]byte, 6)
 	if _, err := rand.Read(randomBytes); err != nil {
 		return fmt.Sprintf("%s_%d", prefix, clock.Now().UnixNano())
 	}
 	return fmt.Sprintf("%s_%d_%s", prefix, clock.Now().Unix(), hex.EncodeToString(randomBytes))
+}
+
+func rankChunks(chunks []model.StoredChunk, query string, limit int32, extensionFilter []string) []model.StoredChunk {
+	filteredChunks := make([]model.StoredChunk, 0, len(chunks))
+	filterSet := map[string]struct{}{}
+	for _, extension := range extensionFilter {
+		filterSet[extension] = struct{}{}
+	}
+
+	queryLower := strings.ToLower(query)
+	queryTerms := strings.Fields(queryLower)
+	type scoredChunk struct {
+		chunk model.StoredChunk
+		score int
+	}
+	scored := make([]scoredChunk, 0, len(chunks))
+	for _, chunk := range chunks {
+		if len(filterSet) > 0 {
+			if _, found := filterSet[chunk.FileExtension]; !found {
+				continue
+			}
+		}
+
+		contentLower := strings.ToLower(chunk.Content)
+		score := 0
+		if strings.Contains(contentLower, queryLower) {
+			score += 100
+		}
+		for _, term := range queryTerms {
+			if strings.Contains(contentLower, term) {
+				score++
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		scored = append(scored, scoredChunk{chunk: chunk, score: score})
+	}
+
+	sort.SliceStable(scored, func(i int, j int) bool {
+		if scored[i].score == scored[j].score {
+			if scored[i].chunk.RelativePath == scored[j].chunk.RelativePath {
+				return scored[i].chunk.StartLine < scored[j].chunk.StartLine
+			}
+			return scored[i].chunk.RelativePath < scored[j].chunk.RelativePath
+		}
+		return scored[i].score > scored[j].score
+	})
+
+	maxResults := int(limit)
+	if maxResults <= 0 {
+		maxResults = 10
+	}
+	if maxResults > len(scored) {
+		maxResults = len(scored)
+	}
+	for _, item := range scored[:maxResults] {
+		filteredChunks = append(filteredChunks, item.chunk)
+	}
+	return filteredChunks
 }

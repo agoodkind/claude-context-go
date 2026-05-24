@@ -139,3 +139,13 @@ type JobEvent struct {
 	OccurredAt time.Time `json:"occurred_at"`
 	Job        Job       `json:"job"`
 }
+
+// StoredChunk is one persisted search chunk for a codebase.
+type StoredChunk struct {
+	Content       string `json:"content"`
+	RelativePath  string `json:"relative_path"`
+	StartLine     int32  `json:"start_line"`
+	EndLine       int32  `json:"end_line"`
+	Language      string `json:"language"`
+	FileExtension string `json:"file_extension"`
+}
