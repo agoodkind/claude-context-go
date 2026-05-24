@@ -19,6 +19,7 @@ import (
 
 	"github.com/zilliztech/claude-context-go/internal/clock"
 	"github.com/zilliztech/claude-context-go/internal/config"
+	"github.com/zilliztech/claude-context-go/internal/indexer"
 	"github.com/zilliztech/claude-context-go/internal/model"
 	"github.com/zilliztech/claude-context-go/internal/store"
 )
@@ -29,6 +30,7 @@ type Manager struct {
 	mu        sync.Mutex
 	codebases map[string]model.Codebase
 	jobs      map[string]model.Job
+	runner    *indexer.Runner
 }
 
 // NewManager loads persisted daemon state from disk.
@@ -37,6 +39,7 @@ func NewManager(cfg config.Config) (*Manager, error) {
 		config:    cfg,
 		codebases: map[string]model.Codebase{},
 		jobs:      map[string]model.Job{},
+		runner:    indexer.NewRunner(),
 	}
 	if err := manager.load(); err != nil {
 		slog.Error("load daemon state failed", "state_root", cfg.StateRoot, "err", err)
@@ -173,6 +176,7 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 	if err := manager.appendJobLocked("start_index", job); err != nil {
 		return model.Job{}, model.Codebase{}, false, err
 	}
+	manager.runJobAsync(ctx, job.ID)
 	return job, codebase, false, nil
 }
 
@@ -334,6 +338,136 @@ func (manager *Manager) activeJobLocked(codebase model.Codebase, canonicalPath s
 	}
 
 	return model.Job{}, false, fmt.Errorf("conflicting active job %s for canonical path %s", activeJob.ID, canonicalPath)
+}
+
+func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.ErrorContext(ctx, "indexing goroutine panic", "err", fmt.Errorf("panic: %v", recovered), "job_id", jobID)
+			}
+		}()
+		manager.runJob(ctx, jobID)
+	}()
+}
+
+func (manager *Manager) runJob(ctx context.Context, jobID string) {
+	manager.mu.Lock()
+	job, found := manager.jobs[jobID]
+	manager.mu.Unlock()
+	if !found {
+		return
+	}
+
+	manager.updateJobRunning(job)
+
+	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config)
+	if err != nil {
+		manager.updateJobFailed(job.ID, err)
+		return
+	}
+	manager.updateJobCompleted(job.ID, result)
+}
+
+func (manager *Manager) updateJobRunning(job model.Job) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	currentJob, found := manager.jobs[job.ID]
+	if !found {
+		return
+	}
+	now := clock.Now()
+	currentJob.State = model.JobStateRunning
+	currentJob.UpdatedAt = now
+	currentJob.Progress.Phase = "scanning"
+	currentJob.Progress.LastEventAt = now
+	currentJob.Progress.HeartbeatAt = now
+	_ = manager.appendJobLocked("job_running", currentJob)
+}
+
+func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	job, found := manager.jobs[jobID]
+	if !found {
+		return
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateCompleted
+	job.UpdatedAt = now
+	job.CompletedAt = &now
+	job.Progress.Phase = "completed"
+	job.Progress.OverallPercent = 100
+	job.Progress.FilesProcessed = result.IndexedFiles
+	job.Progress.FilesTotal = result.IndexedFiles
+	job.Progress.ChunksGenerated = result.TotalChunks
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	if err := manager.appendJobLocked("job_completed", job); err != nil {
+		slog.Error("append completed job event failed", "job_id", jobID, "err", err)
+	}
+
+	codebase, found := manager.codebases[job.CodebaseID]
+	if !found {
+		return
+	}
+	codebase.Status = model.CodebaseStatusIndexed
+	codebase.ActiveJobID = ""
+	codebase.LastSuccessfulRun = &model.IndexRunSummary{
+		IndexedFiles: result.IndexedFiles,
+		TotalChunks:  result.TotalChunks,
+		Status:       "completed",
+		CompletedAt:  now,
+	}
+	codebase.UpdatedAt = now
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		slog.Error("write registry after completed job failed", "job_id", jobID, "err", err)
+	}
+}
+
+func (manager *Manager) updateJobFailed(jobID string, runErr error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	job, found := manager.jobs[jobID]
+	if !found {
+		return
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateFailed
+	job.UpdatedAt = now
+	job.CompletedAt = &now
+	job.Progress.Phase = "failed"
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	job.Error = &model.JobError{
+		Message:   runErr.Error(),
+		Retryable: false,
+	}
+	if err := manager.appendJobLocked("job_failed", job); err != nil {
+		slog.Error("append failed job event failed", "job_id", jobID, "err", err)
+	}
+
+	codebase, found := manager.codebases[job.CodebaseID]
+	if !found {
+		return
+	}
+	codebase.Status = model.CodebaseStatusFailed
+	codebase.ActiveJobID = ""
+	codebase.LastFailedRun = &model.IndexRunFailure{
+		Message:  runErr.Error(),
+		FailedAt: now,
+	}
+	codebase.UpdatedAt = now
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		slog.Error("write registry after failed job failed", "job_id", jobID, "err", err)
+	}
 }
 
 func (manager *Manager) findCodebaseByPathLocked(canonicalPath string, aliasPath string) (model.Codebase, bool) {
