@@ -31,6 +31,7 @@ type Manager struct {
 	mu        sync.Mutex
 	codebases map[string]model.Codebase
 	jobs      map[string]model.Job
+	cancels   map[string]context.CancelFunc
 	runner    *indexer.Runner
 }
 
@@ -40,6 +41,7 @@ func NewManager(cfg config.Config) (*Manager, error) {
 		config:    cfg,
 		codebases: map[string]model.Codebase{},
 		jobs:      map[string]model.Job{},
+		cancels:   map[string]context.CancelFunc{},
 		runner:    indexer.NewRunner(),
 	}
 	if err := manager.load(); err != nil {
@@ -258,6 +260,12 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 		return job, nil
 	}
 
+	cancel, found := manager.cancels[jobID]
+	if found {
+		cancel()
+		delete(manager.cancels, jobID)
+	}
+
 	now := clock.Now()
 	job.State = model.JobStateCancelled
 	job.UpdatedAt = now
@@ -382,13 +390,22 @@ func (manager *Manager) activeJobLocked(codebase model.Codebase, canonicalPath s
 }
 
 func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
+	backgroundContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	go func() {
+		manager.mu.Lock()
+		manager.cancels[jobID] = cancel
+		manager.mu.Unlock()
+
 		defer func() {
+			cancel()
 			if recovered := recover(); recovered != nil {
 				slog.ErrorContext(ctx, "indexing goroutine panic", "err", fmt.Errorf("panic: %v", recovered), "job_id", jobID)
 			}
+			manager.mu.Lock()
+			delete(manager.cancels, jobID)
+			manager.mu.Unlock()
 		}()
-		manager.runJob(ctx, jobID)
+		manager.runJob(backgroundContext, jobID)
 	}()
 }
 
@@ -404,6 +421,10 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 
 	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+			return
+		}
 		manager.updateJobFailed(job.ID, err)
 		return
 	}
@@ -512,6 +533,43 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
 		slog.Error("write registry after failed job failed", "job_id", jobID, "err", err)
+	}
+}
+
+func (manager *Manager) updateJobCancelled(jobID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	job, found := manager.jobs[jobID]
+	if !found {
+		return
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateCancelled
+	job.UpdatedAt = now
+	job.CompletedAt = &now
+	job.Progress.Phase = "cancelled"
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	if err := manager.appendJobLocked("job_cancelled", job); err != nil {
+		slog.Error("append cancelled job event failed", "job_id", jobID, "err", err)
+	}
+
+	codebase, found := manager.codebases[job.CodebaseID]
+	if !found {
+		return
+	}
+	codebase.Status = model.CodebaseStatusFailed
+	codebase.ActiveJobID = ""
+	codebase.LastFailedRun = &model.IndexRunFailure{
+		Message:  "job cancelled",
+		FailedAt: now,
+	}
+	codebase.UpdatedAt = now
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		slog.Error("write registry after cancelled job failed", "job_id", jobID, "err", err)
 	}
 }
 

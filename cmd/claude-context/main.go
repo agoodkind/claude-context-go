@@ -33,6 +33,7 @@ const (
 	commandStatus  command = "status"
 	commandJob     command = "job"
 	commandIndex   command = "index"
+	commandSearch  command = "search"
 	commandClear   command = "clear"
 	commandCancel  command = "cancel"
 )
@@ -112,6 +113,17 @@ func execute(selected command, args []string, socketPath string) error {
 		return callAndPrint(socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 			return client.StartIndex(ctx, &pb.StartIndexRequest{Path: args[0], Client: clientInfo})
 		})
+	case commandSearch:
+		if len(args) < 2 {
+			return fmt.Errorf("search requires a path and query")
+		}
+		return callAndPrint(socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+			return client.SearchCode(ctx, &pb.SearchCodeRequest{
+				Path:  args[0],
+				Query: args[1],
+				Limit: 10,
+			})
+		})
 	case commandClear:
 		if len(args) == 0 {
 			return fmt.Errorf("clear requires a path")
@@ -159,7 +171,7 @@ func runDaemonSubcommand(args []string, socketPath string) error {
 }
 
 func usage() string {
-	return "usage: claude-context [--socket PATH] <version|daemon|list|jobs|doctor|status|job|index|clear|cancel> [arg]"
+	return "usage: claude-context [--socket PATH] <version|daemon|list|jobs|doctor|status|job|index|search|clear|cancel> [arg]"
 }
 
 func currentClientInfo() (*pb.ClientInfo, error) {

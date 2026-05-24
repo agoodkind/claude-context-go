@@ -44,6 +44,10 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 	var totalChunks int32
 	storedChunks := make([]model.StoredChunk, 0)
 	for _, path := range discoveryResult.Files {
+		if err := ctx.Err(); err != nil {
+			slog.ErrorContext(ctx, "indexing cancelled before file read", "path", path, "err", err)
+			return Result{}, fmt.Errorf("indexing cancelled before file read %s: %w", path, err)
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			slog.ErrorContext(ctx, "read source file failed", "path", path, "err", err)
