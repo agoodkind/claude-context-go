@@ -8,7 +8,7 @@
 # Identity
 BINARY := claude-contextd
 CMD    := ./cmd/claude-contextd
-VPKG   := github.com/zilliztech/claude-context-go/internal/version
+VPKG   := goodkind.io/claude-context-go/internal/version
 CLI_BINARY := claude-context
 CLI_CMD := ./cmd/$(CLI_BINARY)
 MCP_BINARY := claude-context-mcp
@@ -35,7 +35,7 @@ include bootstrap.mk
 # Project-local
 # ---------------------------------------------------------------------------
 
-.PHONY: build-clients install-clients deploy deploy-service daemon-wait daemon-status
+.PHONY: build-clients install-clients deploy deploy-service daemon-wait daemon-status kill-orphans
 
 CLI_DIST_BIN := $(DIST_DIR)/$(CLI_BINARY)
 MCP_DIST_BIN := $(DIST_DIR)/$(MCP_BINARY)
@@ -67,8 +67,8 @@ install-clients: build-clients
 	mv -f "$$out" "$(MCP_INSTALL_BIN)"
 
 deploy:
-	$(MAKE) BUILD_CHECKS=false install
-	$(MAKE) BUILD_CHECKS=false install-clients
+	$(MAKE) install
+	$(MAKE) install-clients
 	$(MAKE) deploy-service
 	$(MAKE) daemon-wait
 	$(MAKE) daemon-status
@@ -94,3 +94,20 @@ daemon-wait:
 		sleep 0.25; \
 	done; \
 	"$(CLI_INSTALL_BIN)" daemon status
+
+# kill-orphans walks every running claude-context-mcp process and sends
+# SIGKILL when its parent PID is 1 (init). Active sessions with a live parent
+# stay untouched. This is the mitigation for the orphan-pile failure mode
+# (199 zombies on the host pushing system load to 28) that bit the upstream
+# TS adapter; the Go adapter avoids this by exiting on stdin EOF, PPID poll,
+# and panic recovery, but this target stays as a paranoia cleanup.
+kill-orphans:
+	@killed=0; \
+	for pid in $$(pgrep -x $(MCP_BINARY) || true); do \
+		parent=$$(ps -o ppid= -p "$$pid" | tr -d ' '); \
+		if [ "$$parent" = "1" ]; then \
+			echo "kill-orphans: SIGKILL pid=$$pid"; \
+			kill -9 "$$pid" && killed=$$((killed + 1)); \
+		fi; \
+	done; \
+	echo "kill-orphans: killed $$killed orphan(s)"

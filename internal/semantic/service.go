@@ -1,0 +1,754 @@
+// Package semantic implements embedding and Milvus-backed code indexing.
+package semantic
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"github.com/milvus-io/milvus/client/v2/entity"
+	"github.com/milvus-io/milvus/client/v2/index"
+	"github.com/milvus-io/milvus/client/v2/milvusclient"
+	"goodkind.io/claude-context-go/internal/config"
+	"goodkind.io/claude-context-go/internal/embedding"
+	"goodkind.io/claude-context-go/internal/model"
+)
+
+const (
+	maxCollectionNameLength = 255
+	denseVectorFieldName    = "vector"
+	sparseVectorFieldName   = "sparse_vector"
+	contentFieldName        = "content"
+	relativePathFieldName   = "relative_path"
+	startLineFieldName      = "start_line"
+	endLineFieldName        = "end_line"
+	languageFieldName       = "language"
+	fileExtensionFieldName  = "file_extension"
+	idFieldName             = "id"
+)
+
+// Progress reports semantic indexing progress after chunk extraction.
+type Progress struct {
+	Phase                     string
+	OverallPercent            float64
+	EmbeddingBatchesTotal     int32
+	EmbeddingBatchesCompleted int32
+	CollectionRowsWritten     int32
+}
+
+// Service owns the embedding provider and Milvus client for semantic search.
+type Service struct {
+	cfg       config.Config
+	embedder  embedding.Provider
+	milvus    *milvusclient.Client
+	available bool
+}
+
+// NewService constructs the semantic search runtime.
+func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
+	if strings.TrimSpace(cfg.MilvusAddress) == "" {
+		return &Service{
+			cfg:       cfg,
+			embedder:  nil,
+			milvus:    nil,
+			available: false,
+		}, nil
+	}
+
+	embedder, err := embedding.NewProvider(cfg)
+	if err != nil {
+		slog.ErrorContext(ctx, "create embedding provider failed", "provider", cfg.EmbeddingProvider, "err", err)
+		return nil, fmt.Errorf("create embedding provider: %w", err)
+	}
+
+	clientConfig := &milvusclient.ClientConfig{
+		Address: cfg.MilvusAddress,
+		APIKey:  cfg.MilvusToken,
+	}
+	client, err := milvusclient.New(ctx, clientConfig)
+	if err != nil {
+		slog.ErrorContext(ctx, "connect to Milvus failed", "address", cfg.MilvusAddress, "err", err)
+		return nil, fmt.Errorf("connect to Milvus at %s: %w", cfg.MilvusAddress, err)
+	}
+
+	return &Service{
+		cfg:       cfg,
+		embedder:  embedder,
+		milvus:    client,
+		available: true,
+	}, nil
+}
+
+// Close shuts down external resources held by the semantic service.
+func (service *Service) Close(ctx context.Context) error {
+	if service == nil || service.milvus == nil {
+		return nil
+	}
+	if err := service.milvus.Close(ctx); err != nil {
+		slog.ErrorContext(ctx, "close Milvus client failed", "err", err)
+		return fmt.Errorf("close Milvus client: %w", err)
+	}
+	return nil
+}
+
+// Available reports whether semantic indexing is configured.
+func (service *Service) Available() bool {
+	return service != nil && service.available
+}
+
+// CollectionName matches the TypeScript collection naming contract.
+func (service *Service) CollectionName(codebasePath string) string {
+	prefix := "code_chunks"
+	if service.cfg.HybridMode {
+		prefix = "hybrid_code_chunks"
+	}
+
+	normalizedPath, err := filepath.Abs(codebasePath)
+	if err != nil {
+		normalizedPath = codebasePath
+	}
+	pathHashBytes := sha256.Sum256([]byte(normalizedPath))
+	pathHash := hex.EncodeToString(pathHashBytes[:])[:8]
+
+	override := strings.TrimSpace(service.cfg.CollectionNameOverride)
+	if override == "" {
+		return prefix + "_" + pathHash
+	}
+
+	hashSuffix := "_" + pathHash
+	maxReadableLength := maxCollectionNameLength - len(prefix) - 1 - len(hashSuffix)
+	sanitized := sanitizeCollectionSuffix(override)
+	if len(sanitized) > maxReadableLength {
+		sanitized = sanitized[:maxReadableLength]
+	}
+	if sanitized == "" {
+		sanitized = "custom"
+	}
+	return prefix + "_" + sanitized + hashSuffix
+}
+
+// Replace drops and rebuilds one codebase collection from chunk data.
+func (service *Service) Replace(ctx context.Context, codebasePath string, chunks []model.StoredChunk, progress func(Progress)) error {
+	if !service.Available() {
+		return nil
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	collectionName := service.CollectionName(codebasePath)
+	if err := service.dropIfExists(ctx, collectionName); err != nil {
+		return err
+	}
+
+	batchSize := service.cfg.EmbeddingBatchSize
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+
+	totalBatches := (len(chunks) + batchSize - 1) / batchSize
+	var writtenRows int32
+	collectionReady := false
+
+	for batchIndex := range totalBatches {
+		start := batchIndex * batchSize
+		end := min(start+batchSize, len(chunks))
+
+		chunkBatch := chunks[start:end]
+		textBatch := make([]string, 0, len(chunkBatch))
+		for _, chunk := range chunkBatch {
+			textBatch = append(textBatch, chunk.Content)
+		}
+
+		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
+		if err != nil {
+			slog.ErrorContext(ctx, "embed batch failed", "err", err)
+			return fmt.Errorf("embed batch: %w", err)
+		}
+		if len(vectors) != len(chunkBatch) {
+			slog.ErrorContext(ctx, "embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
+			return fmt.Errorf("embedding batch returned %d vectors for %d chunks", len(vectors), len(chunkBatch))
+		}
+
+		if !collectionReady {
+			dimension := len(vectors[0])
+			if err := service.createCollection(ctx, collectionName, dimension); err != nil {
+				return err
+			}
+			collectionReady = true
+		}
+
+		if err := service.insertBatch(ctx, collectionName, chunkBatch, vectors); err != nil {
+			return err
+		}
+
+		writtenRows += safeInt32FromInt(len(chunkBatch))
+		if progress != nil {
+			progress(Progress{
+				Phase:                     "Generating embeddings and writing to Milvus...",
+				OverallPercent:            90 + (float64(batchIndex+1)/float64(totalBatches))*10,
+				EmbeddingBatchesTotal:     safeInt32FromInt(totalBatches),
+				EmbeddingBatchesCompleted: safeInt32FromInt(batchIndex + 1),
+				CollectionRowsWritten:     writtenRows,
+			})
+		}
+	}
+	return nil
+}
+
+// Reindex applies a per-file delta against an existing collection.
+//
+// removedOrModifiedRelativePaths is deleted via Milvus expression
+// `relative_path == "<escaped>"`. The chunk batch is then embedded and
+// inserted in the same batched flow Replace uses. Reindex returns
+// ErrCollectionMissing if the collection no longer exists so callers can
+// fall back to a full Replace.
+func (service *Service) Reindex(ctx context.Context, codebasePath string, addedOrModifiedChunks []model.StoredChunk, removedOrModifiedRelativePaths []string, progress func(Progress)) error {
+	if !service.Available() {
+		return nil
+	}
+
+	collectionName := service.CollectionName(codebasePath)
+	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "check Milvus collection for reindex failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("check Milvus collection %s: %w", collectionName, err)
+	}
+	if !hasCollection {
+		return ErrCollectionMissing
+	}
+
+	if len(removedOrModifiedRelativePaths) > 0 {
+		if err := service.deleteByRelativePaths(ctx, collectionName, removedOrModifiedRelativePaths); err != nil {
+			return err
+		}
+	}
+
+	if len(addedOrModifiedChunks) == 0 {
+		return nil
+	}
+
+	batchSize := service.cfg.EmbeddingBatchSize
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+
+	totalBatches := (len(addedOrModifiedChunks) + batchSize - 1) / batchSize
+	var writtenRows int32
+	for batchIndex := range totalBatches {
+		start := batchIndex * batchSize
+		end := min(start+batchSize, len(addedOrModifiedChunks))
+
+		chunkBatch := addedOrModifiedChunks[start:end]
+		textBatch := make([]string, 0, len(chunkBatch))
+		for _, chunk := range chunkBatch {
+			textBatch = append(textBatch, chunk.Content)
+		}
+
+		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
+		if err != nil {
+			slog.ErrorContext(ctx, "embed reindex batch failed", "err", err)
+			return fmt.Errorf("embed reindex batch: %w", err)
+		}
+		if len(vectors) != len(chunkBatch) {
+			slog.ErrorContext(ctx, "reindex embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
+			return fmt.Errorf("reindex embedding batch returned %d vectors for %d chunks", len(vectors), len(chunkBatch))
+		}
+
+		if err := service.insertBatch(ctx, collectionName, chunkBatch, vectors); err != nil {
+			return err
+		}
+
+		writtenRows += safeInt32FromInt(len(chunkBatch))
+		if progress != nil {
+			progress(Progress{
+				Phase:                     "Reindexing changed files...",
+				OverallPercent:            90 + (float64(batchIndex+1)/float64(totalBatches))*10,
+				EmbeddingBatchesTotal:     safeInt32FromInt(totalBatches),
+				EmbeddingBatchesCompleted: safeInt32FromInt(batchIndex + 1),
+				CollectionRowsWritten:     writtenRows,
+			})
+		}
+	}
+	return nil
+}
+
+// deleteByRelativePaths removes existing chunks for the given relative paths.
+// Paths are escaped to be safe inside the Milvus filter expression.
+func (service *Service) deleteByRelativePaths(ctx context.Context, collectionName string, relativePaths []string) error {
+	if len(relativePaths) == 0 {
+		return nil
+	}
+
+	quoted := make([]string, 0, len(relativePaths))
+	for _, path := range relativePaths {
+		quoted = append(quoted, `"`+escapeMilvusString(path)+`"`)
+	}
+	expression := fmt.Sprintf(`%s in [%s]`, relativePathFieldName, strings.Join(quoted, ","))
+
+	if _, err := service.milvus.Delete(ctx, milvusclient.NewDeleteOption(collectionName).WithExpr(expression)); err != nil {
+		slog.ErrorContext(ctx, "delete by relative path failed", "collection", collectionName, "count", len(relativePaths), "err", err)
+		return fmt.Errorf("delete from %s by relative path: %w", collectionName, err)
+	}
+	return nil
+}
+
+// escapeMilvusString matches the TS escape rule at context.ts:412 and quotes
+// any backslash or double quote in a filter string.
+func escapeMilvusString(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
+}
+
+// Search executes semantic or hybrid search against the configured collection.
+func (service *Service) Search(ctx context.Context, codebasePath string, query string, limit int32, extensionFilter []string) ([]model.StoredChunk, error) {
+	if !service.Available() {
+		return nil, ErrUnavailable
+	}
+
+	collectionName := service.CollectionName(codebasePath)
+	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "check Milvus collection failed", "collection", collectionName, "err", err)
+		return nil, fmt.Errorf("check Milvus collection %s: %w", collectionName, err)
+	}
+	if !hasCollection {
+		return nil, ErrCollectionMissing
+	}
+
+	queryVector, err := service.embedder.Embed(ctx, query)
+	if err != nil {
+		slog.ErrorContext(ctx, "embed query failed", "err", err)
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+
+	searchLimit := int(limit)
+	if searchLimit <= 0 {
+		searchLimit = 10
+	}
+	filterExpr := buildExtensionFilter(extensionFilter)
+
+	outputFields := []string{
+		contentFieldName,
+		relativePathFieldName,
+		startLineFieldName,
+		endLineFieldName,
+		languageFieldName,
+		fileExtensionFieldName,
+	}
+
+	if service.cfg.HybridMode {
+		denseRequest := milvusclient.NewAnnRequest(denseVectorFieldName, maxInt(searchLimit, 10), entity.FloatVector(queryVector))
+		sparseRequest := milvusclient.NewAnnRequest(sparseVectorFieldName, maxInt(searchLimit, 10), entity.Text(query))
+		if filterExpr != "" {
+			denseRequest = denseRequest.WithFilter(filterExpr)
+			sparseRequest = sparseRequest.WithFilter(filterExpr)
+		}
+		resultSets, err := service.milvus.HybridSearch(ctx, milvusclient.NewHybridSearchOption(
+			collectionName,
+			searchLimit,
+			denseRequest,
+			sparseRequest,
+		).WithReranker(milvusclient.NewRRFReranker()).WithOutputFields(outputFields...))
+		if err != nil {
+			slog.ErrorContext(ctx, "hybrid search failed", "collection", collectionName, "err", err)
+			if strings.Contains(err.Error(), "collection not loaded") {
+				return nil, ErrCollectionNotReady
+			}
+			return nil, fmt.Errorf("hybrid search collection %s: %w", collectionName, err)
+		}
+		return resultSetsToChunks(resultSets)
+	}
+
+	searchOption := milvusclient.NewSearchOption(
+		collectionName,
+		searchLimit,
+		[]entity.Vector{entity.FloatVector(queryVector)},
+	).WithANNSField(denseVectorFieldName).WithOutputFields(outputFields...)
+	if filterExpr != "" {
+		searchOption = searchOption.WithFilter(filterExpr)
+	}
+
+	resultSets, err := service.milvus.Search(ctx, searchOption)
+	if err != nil {
+		slog.ErrorContext(ctx, "dense search failed", "collection", collectionName, "err", err)
+		if strings.Contains(err.Error(), "collection not loaded") {
+			return nil, ErrCollectionNotReady
+		}
+		return nil, fmt.Errorf("search collection %s: %w", collectionName, err)
+	}
+	return resultSetsToChunks(resultSets)
+}
+
+// Drop removes one semantic index collection.
+func (service *Service) Drop(ctx context.Context, codebasePath string) error {
+	if !service.Available() {
+		return nil
+	}
+	return service.dropIfExists(ctx, service.CollectionName(codebasePath))
+}
+
+// Count returns the current row count for one semantic collection.
+func (service *Service) Count(ctx context.Context, codebasePath string) (int32, error) {
+	if !service.Available() {
+		return 0, ErrUnavailable
+	}
+
+	stats, err := service.milvus.GetCollectionStats(ctx, milvusclient.NewGetCollectionStatsOption(service.CollectionName(codebasePath)))
+	if err != nil {
+		slog.ErrorContext(ctx, "get collection stats failed", "collection", service.CollectionName(codebasePath), "err", err)
+		return 0, fmt.Errorf("get collection stats: %w", err)
+	}
+
+	rowCount, found := stats["row_count"]
+	if !found {
+		slog.ErrorContext(ctx, "collection stats missing row_count", "collection", service.CollectionName(codebasePath), "err", errors.New("missing row_count"))
+		return 0, errors.New("milvus collection stats missing row_count")
+	}
+	parsedCount, err := strconv.ParseInt(rowCount, 10, 32)
+	if err != nil {
+		slog.ErrorContext(ctx, "parse row count failed", "row_count", rowCount, "err", err)
+		return 0, fmt.Errorf("parse row_count %q: %w", rowCount, err)
+	}
+	return int32(parsedCount), nil
+}
+
+// ListCollections returns the current semantic collection names from Milvus.
+func (service *Service) ListCollections(ctx context.Context) ([]string, error) {
+	if !service.Available() {
+		return nil, ErrUnavailable
+	}
+	collections, err := service.milvus.ListCollections(ctx, milvusclient.NewListCollectionOption())
+	if err != nil {
+		slog.ErrorContext(ctx, "list Milvus collections failed", "err", err)
+		return nil, fmt.Errorf("list Milvus collections: %w", err)
+	}
+	return collections, nil
+}
+
+func (service *Service) dropIfExists(ctx context.Context, collectionName string) error {
+	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "check Milvus collection before drop failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("check Milvus collection %s: %w", collectionName, err)
+	}
+	if !hasCollection {
+		return nil
+	}
+	if err := service.milvus.DropCollection(ctx, milvusclient.NewDropCollectionOption(collectionName)); err != nil {
+		slog.ErrorContext(ctx, "drop Milvus collection failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("drop Milvus collection %s: %w", collectionName, err)
+	}
+	return nil
+}
+
+func (service *Service) createCollection(ctx context.Context, collectionName string, dimension int) error {
+	schema := entity.NewSchema().
+		WithField(entity.NewField().WithName(idFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(512).WithIsPrimaryKey(true)).
+		WithField(entity.NewField().WithName(contentFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(65535).WithEnableAnalyzer(true).WithEnableMatch(true)).
+		WithField(entity.NewField().WithName(relativePathFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(4096)).
+		WithField(entity.NewField().WithName(startLineFieldName).WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName(endLineFieldName).WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName(languageFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(128)).
+		WithField(entity.NewField().WithName(fileExtensionFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
+		WithField(entity.NewField().WithName(denseVectorFieldName).WithDataType(entity.FieldTypeFloatVector).WithDim(int64(dimension)))
+
+	indexOptions := []milvusclient.CreateIndexOption{
+		milvusclient.NewCreateIndexOption(collectionName, denseVectorFieldName, index.NewAutoIndex(entity.COSINE)),
+	}
+
+	if service.cfg.HybridMode {
+		schema = schema.
+			WithField(entity.NewField().WithName(sparseVectorFieldName).WithDataType(entity.FieldTypeSparseVector)).
+			WithFunction(entity.NewFunction().WithName("bm25").WithType(entity.FunctionTypeBM25).WithInputFields(contentFieldName).WithOutputFields(sparseVectorFieldName))
+		indexOptions = append(indexOptions, milvusclient.NewCreateIndexOption(collectionName, sparseVectorFieldName, index.NewSparseInvertedIndex(entity.BM25, 0.2)))
+	}
+
+	if err := service.milvus.CreateCollection(ctx, milvusclient.NewCreateCollectionOption(collectionName, schema).WithIndexOptions(indexOptions...)); err != nil {
+		slog.ErrorContext(ctx, "create Milvus collection failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("create Milvus collection %s: %w", collectionName, err)
+	}
+	loadTask, err := service.milvus.LoadCollection(ctx, milvusclient.NewLoadCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "load Milvus collection failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("load Milvus collection %s: %w", collectionName, err)
+	}
+	if err := loadTask.Await(ctx); err != nil {
+		slog.ErrorContext(ctx, "await Milvus collection load failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("await Milvus collection load %s: %w", collectionName, err)
+	}
+	return nil
+}
+
+func (service *Service) insertBatch(ctx context.Context, collectionName string, chunks []model.StoredChunk, vectors [][]float32) error {
+	insertOption := milvusclient.NewColumnBasedInsertOption(collectionName)
+
+	ids := make([]string, 0, len(chunks))
+	contents := make([]string, 0, len(chunks))
+	relativePaths := make([]string, 0, len(chunks))
+	startLines := make([]int64, 0, len(chunks))
+	endLines := make([]int64, 0, len(chunks))
+	languages := make([]string, 0, len(chunks))
+	fileExtensions := make([]string, 0, len(chunks))
+
+	for index, chunk := range chunks {
+		ids = append(ids, generateID(chunk, index))
+		contents = append(contents, chunk.Content)
+		relativePaths = append(relativePaths, chunk.RelativePath)
+		startLines = append(startLines, int64(chunk.StartLine))
+		endLines = append(endLines, int64(chunk.EndLine))
+		languages = append(languages, chunk.Language)
+		fileExtensions = append(fileExtensions, chunk.FileExtension)
+	}
+
+	insertOption = insertOption.
+		WithVarcharColumn(idFieldName, ids).
+		WithVarcharColumn(contentFieldName, contents).
+		WithVarcharColumn(relativePathFieldName, relativePaths).
+		WithInt64Column(startLineFieldName, startLines).
+		WithInt64Column(endLineFieldName, endLines).
+		WithVarcharColumn(languageFieldName, languages).
+		WithVarcharColumn(fileExtensionFieldName, fileExtensions).
+		WithFloatVectorColumn(denseVectorFieldName, len(vectors[0]), vectors)
+
+	if _, err := service.milvus.Insert(ctx, insertOption); err != nil {
+		slog.ErrorContext(ctx, "insert Milvus batch failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("insert Milvus batch into %s: %w", collectionName, err)
+	}
+	return nil
+}
+
+func resultSetsToChunks(resultSets []milvusclient.ResultSet) ([]model.StoredChunk, error) {
+	if len(resultSets) == 0 {
+		return []model.StoredChunk{}, nil
+	}
+
+	resultSet := resultSets[0]
+	contentColumn := resultSet.GetColumn(contentFieldName)
+	relativePathColumn := resultSet.GetColumn(relativePathFieldName)
+	startLineColumn := resultSet.GetColumn(startLineFieldName)
+	endLineColumn := resultSet.GetColumn(endLineFieldName)
+	languageColumn := resultSet.GetColumn(languageFieldName)
+	fileExtensionColumn := resultSet.GetColumn(fileExtensionFieldName)
+	if contentColumn == nil || relativePathColumn == nil || startLineColumn == nil || endLineColumn == nil || languageColumn == nil || fileExtensionColumn == nil {
+		return nil, ErrSearchResultIncomplete
+	}
+
+	chunks := make([]model.StoredChunk, 0, resultSet.ResultCount)
+	for index := range resultSet.ResultCount {
+		contentValue, err := contentColumn.GetAsString(index)
+		if err != nil {
+			slog.Error("read content column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read content column at %d: %w", index, err)
+		}
+		relativePathValue, err := relativePathColumn.GetAsString(index)
+		if err != nil {
+			slog.Error("read relative path column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read relative path column at %d: %w", index, err)
+		}
+		startLineValue, err := startLineColumn.GetAsInt64(index)
+		if err != nil {
+			slog.Error("read start line column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read start line column at %d: %w", index, err)
+		}
+		endLineValue, err := endLineColumn.GetAsInt64(index)
+		if err != nil {
+			slog.Error("read end line column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read end line column at %d: %w", index, err)
+		}
+		languageValue, err := languageColumn.GetAsString(index)
+		if err != nil {
+			slog.Error("read language column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read language column at %d: %w", index, err)
+		}
+		fileExtensionValue, err := fileExtensionColumn.GetAsString(index)
+		if err != nil {
+			slog.Error("read file extension column failed", "index", index, "err", err)
+			return nil, fmt.Errorf("read file extension column at %d: %w", index, err)
+		}
+
+		chunks = append(chunks, model.StoredChunk{
+			Content:       contentValue,
+			RelativePath:  relativePathValue,
+			StartLine:     safeInt32FromInt64(startLineValue),
+			EndLine:       safeInt32FromInt64(endLineValue),
+			Language:      languageValue,
+			FileExtension: fileExtensionValue,
+		})
+	}
+	return chunks, nil
+}
+
+func generateID(chunk model.StoredChunk, index int) string {
+	hashInput := fmt.Sprintf("%s:%d:%d:%d:%s", chunk.RelativePath, chunk.StartLine, chunk.EndLine, index, chunk.Content)
+	sum := sha256.Sum256([]byte(hashInput))
+	return hex.EncodeToString(sum[:])
+}
+
+func buildExtensionFilter(extensionFilter []string) string {
+	cleanedExtensions := make([]string, 0, len(extensionFilter))
+	for _, extension := range normalizeExtensionFilter(extensionFilter) {
+		trimmedExtension := strings.TrimSpace(extension)
+		if trimmedExtension == "" {
+			continue
+		}
+		cleanedExtensions = append(cleanedExtensions, fmt.Sprintf("%q", trimmedExtension))
+	}
+	if len(cleanedExtensions) == 0 {
+		return ""
+	}
+	return fileExtensionFieldName + " in [" + strings.Join(cleanedExtensions, ", ") + "]"
+}
+
+func sanitizeCollectionSuffix(value string) string {
+	var builder strings.Builder
+	for _, runeValue := range value {
+		switch {
+		case runeValue >= 'A' && runeValue <= 'Z':
+			builder.WriteRune(runeValue)
+		case runeValue >= 'a' && runeValue <= 'z':
+			builder.WriteRune(runeValue)
+		case runeValue >= '0' && runeValue <= '9':
+			builder.WriteRune(runeValue)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
+}
+
+func maxInt(values ...int) int {
+	currentMax := 0
+	for _, value := range values {
+		if value > currentMax {
+			currentMax = value
+		}
+	}
+	return currentMax
+}
+
+// ErrUnavailable reports that the semantic backend is not configured.
+var ErrUnavailable = errors.New("semantic backend is unavailable")
+
+// ErrCollectionMissing reports that the semantic collection does not exist yet.
+var ErrCollectionMissing = errors.New("semantic collection is missing")
+
+// ErrCollectionNotReady reports that the semantic collection exists but cannot be searched yet.
+var ErrCollectionNotReady = errors.New("semantic collection is not ready")
+
+// ErrSearchResultIncomplete reports that Milvus returned a result set without the requested fields.
+var ErrSearchResultIncomplete = errors.New("semantic search result is incomplete")
+
+// ValidateExtensionFilter returns the normalized extension list or an error if any entry is invalid.
+func ValidateExtensionFilter(extensionFilter []string) ([]string, error) {
+	cleanedExtensions := normalizeExtensionFilter(extensionFilter)
+	invalidExtensions := make([]string, 0)
+	for _, extension := range cleanedExtensions {
+		if !isValidExtension(extension) {
+			invalidExtensions = append(invalidExtensions, extension)
+		}
+	}
+	if len(invalidExtensions) > 0 {
+		err := fmt.Errorf("invalid file extensions in extensionFilter: %v. Use proper extensions like '.ts', '.py'", invalidExtensions)
+		slog.Error("validate extension filter failed", "err", err)
+		return nil, err
+	}
+	return cleanedExtensions, nil
+}
+
+// DeduplicateChunks removes overlapping results from the same file.
+func DeduplicateChunks(chunks []model.StoredChunk) []model.StoredChunk {
+	keptChunks := make([]model.StoredChunk, 0, len(chunks))
+
+	for _, chunk := range chunks {
+		hasOverlap := false
+		for _, existingChunk := range keptChunks {
+			if existingChunk.RelativePath != chunk.RelativePath {
+				continue
+			}
+			overlapStart := maxInt32(existingChunk.StartLine, chunk.StartLine)
+			overlapEnd := minInt32(existingChunk.EndLine, chunk.EndLine)
+			if overlapStart > overlapEnd {
+				continue
+			}
+			overlapSize := overlapEnd - overlapStart + 1
+			chunkSize := chunk.EndLine - chunk.StartLine + 1
+			if chunkSize > 0 && float64(overlapSize)/float64(chunkSize) > 0.5 {
+				hasOverlap = true
+				break
+			}
+		}
+		if !hasOverlap {
+			keptChunks = append(keptChunks, chunk)
+		}
+	}
+
+	return keptChunks
+}
+
+func normalizeExtensionFilter(extensionFilter []string) []string {
+	cleanedExtensions := make([]string, 0, len(extensionFilter))
+	for _, extension := range extensionFilter {
+		trimmedExtension := strings.TrimSpace(extension)
+		if trimmedExtension == "" {
+			continue
+		}
+		cleanedExtensions = append(cleanedExtensions, trimmedExtension)
+	}
+	return cleanedExtensions
+}
+
+func isValidExtension(extension string) bool {
+	if !strings.HasPrefix(extension, ".") || len(extension) <= 1 {
+		return false
+	}
+	for _, runeValue := range extension {
+		if unicode.IsSpace(runeValue) {
+			return false
+		}
+	}
+	return true
+}
+
+func maxInt32(left int32, right int32) int32 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt32(left int32, right int32) int32 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func safeInt32FromInt(value int) int32 {
+	if value > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if value < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(value)
+}
+
+func safeInt32FromInt64(value int64) int32 {
+	if value > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if value < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(value)
+}

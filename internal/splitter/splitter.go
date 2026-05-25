@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
+	tree_sitter_csharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
 	tree_sitter_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -46,6 +47,8 @@ type Dispatcher struct {
 	fallbackOverlap   int
 }
 
+const splitterTypeLangchain = "langchain"
+
 type grammarKey string
 
 const (
@@ -63,6 +66,8 @@ const (
 	grammarRust       grammarKey = "rust"
 	grammarRS         grammarKey = "rs"
 	grammarScala      grammarKey = "scala"
+	grammarCSharp     grammarKey = "csharp"
+	grammarCS         grammarKey = "cs"
 )
 
 var splittableNodeTypes = map[string][]string{
@@ -73,7 +78,7 @@ var splittableNodeTypes = map[string][]string{
 	"cpp":        {"function_definition", "class_specifier", "namespace_definition", "declaration"},
 	"go":         {"function_declaration", "method_declaration", "type_declaration", "var_declaration", "const_declaration"},
 	"rust":       {"function_item", "impl_item", "struct_item", "enum_item", "trait_item", "mod_item"},
-	"csharp":     {"method_declaration", "class_declaration", "interface_declaration", "struct_declaration", "enum_declaration"},
+	"csharp":     {"method_declaration", "class_declaration", "interface_declaration", "struct_declaration", "record_declaration", "enum_declaration", "namespace_declaration", "constructor_declaration", "property_declaration"},
 	"scala":      {"method_declaration", "class_declaration", "interface_declaration", "constructor_declaration"},
 }
 
@@ -115,7 +120,19 @@ func NewDispatcher() *Dispatcher {
 
 // SplitFile splits one file into chunks using AST or fallback behavior.
 func (dispatcher *Dispatcher) SplitFile(ctx context.Context, path string, content []byte) (Result, error) {
+	return dispatcher.SplitFileWithType(ctx, path, content, "")
+}
+
+// SplitFileWithType splits one file using the requested splitter type.
+func (dispatcher *Dispatcher) SplitFileWithType(ctx context.Context, path string, content []byte, splitterType string) (Result, error) {
 	language := languageForPath(path)
+	if strings.EqualFold(strings.TrimSpace(splitterType), splitterTypeLangchain) {
+		return Result{
+			Chunks:   langchainSplit(string(content), language, path, dispatcher.fallbackChunkSize, dispatcher.fallbackOverlap),
+			Strategy: splitterTypeLangchain,
+		}, nil
+	}
+
 	astChunks, err := dispatcher.tryAST(ctx, content, language, path)
 	if err == nil {
 		return Result{Chunks: astChunks, Strategy: "ast"}, nil
@@ -340,6 +357,8 @@ func grammarForLanguage(language string) (*tree_sitter.Language, bool) {
 		return tree_sitter.NewLanguage(tree_sitter_rust.Language()), true
 	case grammarScala:
 		return tree_sitter.NewLanguage(tree_sitter_scala.Language()), true
+	case grammarCSharp, grammarCS:
+		return tree_sitter.NewLanguage(tree_sitter_csharp.Language()), true
 	default:
 		return nil, false
 	}

@@ -3,17 +3,26 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-	pb "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1"
-	"github.com/zilliztech/claude-context-go/internal/config"
-	"github.com/zilliztech/claude-context-go/internal/grpcutil"
-	"github.com/zilliztech/claude-context-go/internal/version"
-	"google.golang.org/protobuf/encoding/protojson"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
+	"goodkind.io/claude-context-go/internal/config"
+	"goodkind.io/claude-context-go/internal/grpcutil"
+	"goodkind.io/claude-context-go/internal/response"
+	"goodkind.io/claude-context-go/internal/version"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+const outputModeEnv = "CLAUDE_CONTEXT_MCP_OUTPUT"
 
 // Run starts the MCP stdio server and blocks until the client disconnects.
 func Run(ctx context.Context) error {
@@ -25,299 +34,252 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("load MCP config: %w", err)
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "claude-context",
-		Version: version.Version,
-	}, nil)
+	outputMode := response.ParseMode(os.Getenv(outputModeEnv))
+	mcpServer := server.NewMCPServer("claude-context", version.Version)
 
-	registerIndexTool(server, cfg.SocketPath)
-	registerClearTool(server, cfg.SocketPath)
-	registerStatusTool(server, cfg.SocketPath)
-	registerListIndexesTool(server, cfg.SocketPath)
-	registerListJobsTool(server, cfg.SocketPath)
-	registerGetJobTool(server, cfg.SocketPath)
-	registerDoctorTool(server, cfg.SocketPath)
-	registerSearchTool(server, cfg.SocketPath)
+	registerSemanticSearchResource(mcpServer)
+	registerSemanticSearchPrompt(mcpServer)
+	registerIndexTool(mcpServer, cfg.SocketPath, outputMode)
+	registerClearTool(mcpServer, cfg.SocketPath, outputMode)
+	registerStatusTool(mcpServer, cfg.SocketPath, outputMode)
+	registerListIndexesTool(mcpServer, cfg.SocketPath, outputMode)
+	registerListJobsTool(mcpServer, cfg.SocketPath, outputMode)
+	registerGetJobTool(mcpServer, cfg.SocketPath, outputMode)
+	registerDoctorTool(mcpServer, cfg.SocketPath, outputMode)
+	registerSearchTool(mcpServer, cfg.SocketPath, outputMode)
 
-	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
-		slog.ErrorContext(ctx, "run MCP server failed", "err", err)
-		return fmt.Errorf("run MCP server: %w", err)
+	stdioServer := server.NewStdioServer(mcpServer)
+
+	// Three lifecycle signals can shut the adapter down:
+	//   1. The parent dies (PPID becomes init). Without this guard, orphans
+	//      pile up in `S` state holding 50-100MB of memory each.
+	//   2. The client closes stdin. The Listen read loop returns on EOF.
+	//   3. SIGTERM/SIGINT.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(runCtx, "MCP signal watcher panicked", "err", fmt.Errorf("panic: %v", r))
+			}
+		}()
+		select {
+		case <-signals:
+			slog.InfoContext(runCtx, "MCP server received shutdown signal")
+			cancel()
+		case <-runCtx.Done():
+		}
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.ErrorContext(runCtx, "MCP orphan guard panicked", "err", fmt.Errorf("panic: %v", r))
+			}
+		}()
+		watchParentDeath(runCtx, cancel)
+	}()
+
+	if err := stdioServer.Listen(runCtx, os.Stdin, os.Stdout); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("serve MCP stdio: %w", err)
 	}
 	return nil
 }
 
-type emptyInput struct{}
+type daemonProtoCall func(context.Context, pb.ClaudeContextDaemonServiceClient) (proto.Message, error)
 
-type pathInput struct {
-	Path string `json:"path" jsonschema:"absolute path to the codebase directory"`
-}
-
-type indexInput struct {
-	Path             string   `json:"path" jsonschema:"absolute path to the codebase directory"`
-	Force            bool     `json:"force,omitempty" jsonschema:"force reindex even if already indexed"`
-	Splitter         string   `json:"splitter,omitempty" jsonschema:"splitter type, typically ast"`
-	CustomExtensions []string `json:"customExtensions,omitempty" jsonschema:"extra file extensions to include"`
-	IgnorePatterns   []string `json:"ignorePatterns,omitempty" jsonschema:"extra ignore patterns to exclude"`
-}
-
-type searchInput struct {
-	Path            string   `json:"path" jsonschema:"absolute path to the codebase directory"`
-	Query           string   `json:"query" jsonschema:"natural language code search query"`
-	Limit           int32    `json:"limit,omitempty" jsonschema:"maximum number of results"`
-	ExtensionFilter []string `json:"extensionFilter,omitempty" jsonschema:"optional file extensions filter"`
-}
-
-type listJobsInput struct {
-	CodebaseID string `json:"codebase_id,omitempty" jsonschema:"optional codebase id to filter jobs"`
-}
-
-type getJobInput struct {
-	JobID string `json:"job_id" jsonschema:"job id to inspect"`
-}
-
-type toolOutput struct {
-	Message string `json:"message" jsonschema:"human-readable tool result"`
-}
-
-type daemonTextCall func(context.Context, pb.ClaudeContextDaemonServiceClient) (string, error)
-
-func registerIndexTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, indexToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input indexInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.StartIndex(ctx, &pb.StartIndexRequest{
-				Path:             input.Path,
-				Force:            input.Force,
-				CustomExtensions: append([]string{}, input.CustomExtensions...),
-				IgnorePatterns:   append([]string{}, input.IgnorePatterns...),
-				Splitter:         &pb.SplitterConfig{Type: input.Splitter},
-				Client:           &pb.ClientInfo{Name: "mcp"},
+func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"index_codebase",
+			mcp.WithDescription("Index a codebase directory for semantic search through the daemon"),
+			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+			mcp.WithBoolean("force", mcp.Description("force reindex even if already indexed")),
+			mcp.WithString("splitter", mcp.Description("splitter type, typically ast")),
+			mcp.WithArray("customExtensions", mcp.Description("extra file extensions to include"), mcp.WithStringItems()),
+			mcp.WithArray("ignorePatterns", mcp.Description("extra ignore patterns to exclude"), mcp.WithStringItems()),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.StartIndex(ctx, &pb.StartIndexRequest{
+					Path:             req.GetString("path", ""),
+					Force:            req.GetBool("force", false),
+					CustomExtensions: req.GetStringSlice("customExtensions", []string{}),
+					IgnorePatterns:   req.GetStringSlice("ignorePatterns", []string{}),
+					Splitter:         &pb.SplitterConfig{Type: req.GetString("splitter", "")},
+					Client:           &pb.ClientInfo{Name: "mcp"},
+				})
 			})
-			if err != nil {
-				return "", fmt.Errorf("start index RPC: %w", err)
-			}
-			return "Started indexing job " + response.GetJobId() + " for " + response.GetCanonicalPath(), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "index tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerClearTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, clearToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.ClearIndex(ctx, &pb.ClearIndexRequest{Path: input.Path, Client: &pb.ClientInfo{Name: "mcp"}})
-			if err != nil {
-				return "", fmt.Errorf("clear index RPC: %w", err)
-			}
-			return "Cleared codebase " + response.GetCodebaseId(), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "clear tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerStatusTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, statusToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.GetIndex(ctx, &pb.GetIndexRequest{Path: input.Path})
-			if err != nil {
-				return "", fmt.Errorf("get index RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "status tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerListIndexesTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, listIndexesToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input emptyInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.ListIndexes(ctx, &pb.ListIndexesRequest{})
-			if err != nil {
-				return "", fmt.Errorf("list indexes RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "list indexes tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerListJobsTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, listJobsToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input listJobsInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.ListJobs(ctx, &pb.ListJobsRequest{CodebaseId: input.CodebaseID})
-			if err != nil {
-				return "", fmt.Errorf("list jobs RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "list jobs tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerGetJobTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, getJobToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input getJobInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.GetJob(ctx, &pb.GetJobRequest{JobId: input.JobID})
-			if err != nil {
-				return "", fmt.Errorf("get job RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "get job tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerDoctorTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, doctorToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input emptyInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.Doctor(ctx, &pb.DoctorRequest{})
-			if err != nil {
-				return "", fmt.Errorf("doctor RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "doctor tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func registerSearchTool(server *mcp.Server, socketPath string) {
-	mcp.AddTool(server, searchToolDefinition(), func(ctx context.Context, req *mcp.CallToolRequest, input searchInput) (*mcp.CallToolResult, toolOutput, error) {
-		output, err := callDaemon(ctx, socketPath, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (string, error) {
-			response, err := client.SearchCode(ctx, &pb.SearchCodeRequest{
-				Path:            input.Path,
-				Query:           input.Query,
-				Limit:           input.Limit,
-				ExtensionFilter: append([]string{}, input.ExtensionFilter...),
-			})
-			if err != nil {
-				return "", fmt.Errorf("search code RPC: %w", err)
-			}
-			return renderProto(response), nil
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "search tool failed", "err", err)
-			return nil, toolOutput{}, err
-		}
-		return textResult(output), toolOutput{Message: output}, nil
-	})
-}
-
-func textResult(message string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: message},
 		},
-	}
+	)
 }
 
-func callDaemon(ctx context.Context, socketPath string, call daemonTextCall) (string, error) {
+func registerClearTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"clear_index",
+			mcp.WithDescription("Clear a tracked codebase index through the daemon"),
+			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.ClearIndex(ctx, &pb.ClearIndexRequest{
+					Path:   req.GetString("path", ""),
+					Client: &pb.ClientInfo{Name: "mcp"},
+				})
+			})
+		},
+	)
+}
+
+func registerStatusTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"get_indexing_status",
+			mcp.WithDescription("Get the current indexing status of one codebase path"),
+			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.GetIndex(ctx, &pb.GetIndexRequest{Path: req.GetString("path", "")})
+			})
+		},
+	)
+}
+
+func registerListIndexesTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"list_indexing_statuses",
+			mcp.WithDescription("List every tracked codebase and its current indexing status"),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.ListIndexes(ctx, &pb.ListIndexesRequest{})
+			})
+		},
+	)
+}
+
+func registerListJobsTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"list_indexing_jobs",
+			mcp.WithDescription("List active and historical indexing jobs"),
+			mcp.WithString("codebase_id", mcp.Description("optional codebase id to filter jobs")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.ListJobs(ctx, &pb.ListJobsRequest{CodebaseId: req.GetString("codebase_id", "")})
+			})
+		},
+	)
+}
+
+func registerGetJobTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"get_indexing_job",
+			mcp.WithDescription("Get one indexing job by id"),
+			mcp.WithString("job_id", mcp.Description("job id to inspect")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.GetJob(ctx, &pb.GetJobRequest{JobId: req.GetString("job_id", "")})
+			})
+		},
+	)
+}
+
+func registerDoctorTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"doctor_indexing",
+			mcp.WithDescription("Inspect local daemon indexing health and diagnostics"),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.Doctor(ctx, &pb.DoctorRequest{})
+			})
+		},
+	)
+}
+
+func registerSearchTool(mcpServer *server.MCPServer, socketPath string, outputMode response.Mode) {
+	mcpServer.AddTool(
+		mcp.NewTool(
+			"search_code",
+			mcp.WithDescription("Search indexed code in the daemon"),
+			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+			mcp.WithString("query", mcp.Description("natural language code search query")),
+			mcp.WithNumber("limit", mcp.Description("maximum number of results")),
+			mcp.WithArray("extensionFilter", mcp.Description("optional file extensions filter"), mcp.WithStringItems()),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
+				return client.SearchCode(ctx, &pb.SearchCodeRequest{
+					Path:            req.GetString("path", ""),
+					Query:           req.GetString("query", ""),
+					Limit:           safeInt32(req.GetInt("limit", 10)),
+					ExtensionFilter: req.GetStringSlice("extensionFilter", []string{}),
+				})
+			})
+		},
+	)
+}
+
+func callDaemonTool(ctx context.Context, socketPath string, outputMode response.Mode, call daemonProtoCall) (*mcp.CallToolResult, error) {
 	connection, client, err := grpcutil.DialDaemon(ctx, socketPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "dial daemon failed", "socket_path", socketPath, "err", err)
-		return "", fmt.Errorf("dial daemon: %w", err)
+		return nil, fmt.Errorf("dial daemon: %w", err)
 	}
 	defer connection.Close()
 
 	result, err := call(ctx, client)
 	if err != nil {
 		slog.ErrorContext(ctx, "daemon RPC failed", "socket_path", socketPath, "err", err)
-		return "", fmt.Errorf("daemon RPC: %w", err)
+		return toolErrorResult(rpcErrorText(err)), nil
 	}
-	return result, nil
+
+	return renderToolResponse(outputMode, result)
 }
 
-func renderProto(message proto.Message) string {
-	marshaler := protojson.MarshalOptions{
-		Indent:    "  ",
-		Multiline: true,
-	}
-	data, err := marshaler.Marshal(message)
+func renderToolResponse(outputMode response.Mode, message proto.Message) (*mcp.CallToolResult, error) {
+	formatted, err := response.FormatProto(outputMode, message)
 	if err != nil {
-		slog.Error("marshal daemon response failed", "err", err)
-		return fmt.Sprintf("%v", message)
+		slog.Error("format daemon response failed", "err", err)
+		return nil, fmt.Errorf("format daemon response: %w", err)
 	}
-	return string(data)
+	return mcp.NewToolResultText(formatted), nil
 }
 
-func indexToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "index_codebase",
-		Description: "Index a codebase directory for semantic search through the daemon",
-	}
-}
-
-func clearToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "clear_index",
-		Description: "Clear a tracked codebase index through the daemon",
+func toolErrorResult(message string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{mcp.NewTextContent(message)},
 	}
 }
 
-func statusToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "get_indexing_status",
-		Description: "Get the current indexing status of one codebase path",
+func rpcErrorText(err error) string {
+	grpcStatus, ok := status.FromError(err)
+	if ok && grpcStatus != nil {
+		return grpcStatus.Message()
 	}
+	return err.Error()
 }
 
-func listIndexesToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "list_indexing_statuses",
-		Description: "List every tracked codebase and its current indexing status",
+func safeInt32(value int) int32 {
+	if value < 0 {
+		return 0
 	}
-}
-
-func listJobsToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "list_indexing_jobs",
-		Description: "List active and historical indexing jobs",
+	if value > math.MaxInt32 {
+		return math.MaxInt32
 	}
-}
-
-func getJobToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "get_indexing_job",
-		Description: "Get one indexing job by id",
-	}
-}
-
-func doctorToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "doctor_indexing",
-		Description: "Inspect local daemon indexing health and diagnostics",
-	}
-}
-
-func searchToolDefinition() *mcp.Tool {
-	return &mcp.Tool{
-		Name:        "search_code",
-		Description: "Search indexed code in the daemon",
-	}
+	return int32(value)
 }

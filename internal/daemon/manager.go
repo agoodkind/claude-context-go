@@ -16,13 +16,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/zilliztech/claude-context-go/internal/clock"
-	"github.com/zilliztech/claude-context-go/internal/config"
-	"github.com/zilliztech/claude-context-go/internal/indexer"
-	"github.com/zilliztech/claude-context-go/internal/migrate"
-	"github.com/zilliztech/claude-context-go/internal/model"
-	"github.com/zilliztech/claude-context-go/internal/store"
+	"goodkind.io/claude-context-go/internal/clock"
+	"goodkind.io/claude-context-go/internal/config"
+	"goodkind.io/claude-context-go/internal/indexer"
+	"goodkind.io/claude-context-go/internal/merkle"
+	"goodkind.io/claude-context-go/internal/migrate"
+	"goodkind.io/claude-context-go/internal/model"
+	"goodkind.io/claude-context-go/internal/semantic"
+	"goodkind.io/claude-context-go/internal/store"
 )
 
 // Manager coordinates persisted codebase and job state for the daemon.
@@ -32,18 +35,40 @@ type Manager struct {
 	codebases map[string]model.Codebase
 	jobs      map[string]model.Job
 	cancels   map[string]context.CancelFunc
-	runner    *indexer.Runner
+	done      map[string]chan struct{}
+	runner    indexingRunner
+	semantic  *semantic.Service
+}
+
+// SearchOutcome carries search results plus current indexing context.
+type SearchOutcome struct {
+	Codebase  model.Codebase
+	ActiveJob *model.Job
+	Results   []model.StoredChunk
+}
+
+type indexingRunner interface {
+	Index(context.Context, string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
+	IndexFiles(context.Context, string, []string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
 }
 
 // NewManager loads persisted daemon state from disk.
 func NewManager(cfg config.Config) (*Manager, error) {
 	manager := &Manager{
 		config:    cfg,
+		mu:        sync.Mutex{},
 		codebases: map[string]model.Codebase{},
 		jobs:      map[string]model.Job{},
 		cancels:   map[string]context.CancelFunc{},
+		done:      map[string]chan struct{}{},
 		runner:    indexer.NewRunner(),
+		semantic:  nil,
 	}
+	semanticService, err := semantic.NewService(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create semantic service: %w", err)
+	}
+	manager.semantic = semanticService
 	if err := manager.load(); err != nil {
 		slog.Error("load daemon state failed", "state_root", cfg.StateRoot, "err", err)
 		return nil, fmt.Errorf("load daemon state: %w", err)
@@ -151,94 +176,312 @@ func (manager *Manager) Version() map[string]string {
 	}
 }
 
-// StartIndex registers a new indexing job or deduplicates an existing one.
-func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool) (model.Job, model.Codebase, bool, error) {
-	_ = ctx
-
-	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
-	if err != nil {
-		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
-		return model.Job{}, model.Codebase{}, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
+func (manager *Manager) reconcileIndexedCodebases(ctx context.Context) {
+	if manager.semantic == nil || !manager.semantic.Available() {
+		return
 	}
 
-	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
+	collections, err := manager.semantic.ListCollections(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "reconcile indexed codebases failed", "err", err)
+		return
+	}
+
+	collectionSet := make(map[string]struct{}, len(collections))
+	for _, collectionName := range collections {
+		collectionSet[collectionName] = struct{}{}
+	}
 
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
+
+	changed := false
+	for codebaseID, codebase := range manager.codebases {
+		if codebase.Status != model.CodebaseStatusIndexed {
+			continue
+		}
+		expectedCollectionName := codebase.CollectionName
+		if expectedCollectionName == "" && manager.semantic != nil {
+			expectedCollectionName = manager.semantic.CollectionName(codebase.CanonicalPath)
+			codebase.CollectionName = expectedCollectionName
+			manager.codebases[codebaseID] = codebase
+			changed = true
+		}
+		if expectedCollectionName == "" {
+			continue
+		}
+		if _, found := collectionSet[expectedCollectionName]; found {
+			continue
+		}
+		delete(manager.codebases, codebaseID)
+		changed = true
+	}
+	if changed {
+		if err := manager.saveLocked(); err != nil {
+			slog.ErrorContext(ctx, "persist reconciled codebases failed", "err", err)
+		}
+	}
+}
+
+func newCodebaseRecord(canonicalPath string) model.Codebase {
+	return model.Codebase{
+		ID:                newID("cb"),
+		CanonicalPath:     canonicalPath,
+		Aliases:           nil,
+		Status:            model.CodebaseStatusNotIndexed,
+		ActiveJobID:       "",
+		LastSuccessfulRun: nil,
+		LastFailedRun:     nil,
+		EffectiveConfig: model.IndexConfig{
+			SplitterType:       "",
+			SplitterChunkSize:  0,
+			SplitterOverlap:    0,
+			Extensions:         nil,
+			IgnorePatterns:     nil,
+			IgnoreDigest:       "",
+			EmbeddingProvider:  "",
+			EmbeddingModel:     "",
+			EmbeddingDimension: 0,
+			VectorBackend:      "",
+			Hybrid:             false,
+		},
+		CollectionName:        "",
+		LegacyCollectionNames: nil,
+		MerkleSnapshotPath:    "",
+		UpdatedAt:             clock.Now(),
+	}
+}
+
+func newQueuedJob(
+	codebaseID string,
+	requestedPath string,
+	canonicalPath string,
+	client model.ClientInfo,
+	operation string,
+	indexConfig model.IndexConfig,
+	now time.Time,
+) model.Job {
+	return model.Job{
+		ID:            newID("job"),
+		CodebaseID:    codebaseID,
+		RequestedPath: requestedPath,
+		CanonicalPath: canonicalPath,
+		Client:        client,
+		Operation:     operation,
+		State:         model.JobStateQueued,
+		Progress: model.Progress{
+			Phase:                     "queued",
+			PhasePercent:              0,
+			OverallPercent:            0,
+			FilesTotal:                0,
+			FilesProcessed:            0,
+			ChunksGenerated:           0,
+			EmbeddingBatchesTotal:     0,
+			EmbeddingBatchesCompleted: 0,
+			CollectionRowsWritten:     0,
+			LastEventAt:               now,
+			HeartbeatAt:               now,
+		},
+		Config:      indexConfig,
+		StartedAt:   now,
+		UpdatedAt:   now,
+		CompletedAt: nil,
+		Error:       nil,
+	}
+}
+
+// StartIndex registers a new indexing job or deduplicates an existing one.
+func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool) (model.Job, model.Codebase, bool, error) {
+	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
+	}
+
+	indexConfig = manager.enrichIndexConfig(indexConfig)
+	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
+
+	if dedupedJob, dedupedCodebase, deduped := manager.dedupAgainstActiveJob(canonicalPath, aliasPath, indexConfig); deduped {
+		return dedupedJob, dedupedCodebase, true, nil
+	}
+
+	if force {
+		if err := manager.cancelActiveJobForPath(ctx, canonicalPath, aliasPath); err != nil {
+			var emptyJob model.Job
+			var emptyCodebase model.Codebase
+			return emptyJob, emptyCodebase, false, err
+		}
+	}
+
+	manager.mu.Lock()
 
 	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
 	if found {
 		activeJob, deduplicated, err := manager.activeJobLocked(codebase, canonicalPath, indexConfig)
 		if err != nil {
 			slog.ErrorContext(ctx, "resolve active job failed", "canonical_path", canonicalPath, "err", err)
-			return model.Job{}, model.Codebase{}, false, err
+			manager.mu.Unlock()
+			var emptyJob model.Job
+			var emptyCodebase model.Codebase
+			return emptyJob, emptyCodebase, false, err
 		}
 		if deduplicated {
+			manager.mu.Unlock()
 			return activeJob, codebase, true, nil
 		}
 		if !force && codebase.Status == model.CodebaseStatusIndexed {
-			return model.Job{}, model.Codebase{}, false, errors.New("codebase already indexed: " + canonicalPath)
+			manager.mu.Unlock()
+			var emptyJob model.Job
+			var emptyCodebase model.Codebase
+			return emptyJob, emptyCodebase, false, errors.New("codebase already indexed: " + canonicalPath)
 		}
 	} else {
-		codebase = model.Codebase{
-			ID:            newID("cb"),
-			CanonicalPath: canonicalPath,
-			Status:        model.CodebaseStatusNotIndexed,
-		}
+		codebase = newCodebaseRecord(canonicalPath)
 	}
 
 	codebase.Aliases = mergeAliases(codebase.Aliases, aliasPath, requestedPath, canonicalPath)
 	codebase.Status = model.CodebaseStatusIndexing
 	codebase.EffectiveConfig = indexConfig
+	if manager.semantic != nil && manager.semantic.Available() {
+		codebase.CollectionName = manager.semantic.CollectionName(canonicalPath)
+	}
 	codebase.UpdatedAt = clock.Now()
 
 	now := clock.Now()
-	job := model.Job{
-		ID:            newID("job"),
-		CodebaseID:    codebase.ID,
-		RequestedPath: requestedPath,
-		CanonicalPath: canonicalPath,
-		Client:        client,
-		Operation:     "index",
-		State:         model.JobStateQueued,
-		Progress: model.Progress{
-			Phase:       "queued",
-			LastEventAt: now,
-			HeartbeatAt: now,
-		},
-		Config:    indexConfig,
-		StartedAt: now,
-		UpdatedAt: now,
-	}
+	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, "index", indexConfig, now)
 
 	codebase.ActiveJobID = job.ID
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
-		return model.Job{}, model.Codebase{}, false, err
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, err
 	}
 	if err := manager.appendJobLocked("start_index", job); err != nil {
-		return model.Job{}, model.Codebase{}, false, err
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, err
 	}
+	manager.mu.Unlock()
+	manager.runJobAsync(ctx, job.ID)
+	return job, codebase, false, nil
+}
+
+// SyncIndex registers a new sync job for an existing tracked codebase.
+func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, client model.ClientInfo) (model.Job, model.Codebase, bool, error) {
+	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
+	}
+
+	manager.mu.Lock()
+
+	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	if !found {
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, errors.New("codebase not tracked: " + requestedPath)
+	}
+
+	indexConfig := manager.enrichIndexConfig(codebase.EffectiveConfig)
+	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
+
+	activeJob, deduplicated, err := manager.activeJobLocked(codebase, canonicalPath, indexConfig)
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve active sync job failed", "canonical_path", canonicalPath, "err", err)
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, err
+	}
+	if deduplicated {
+		manager.mu.Unlock()
+		return activeJob, codebase, true, nil
+	}
+
+	codebase.Aliases = mergeAliases(codebase.Aliases, aliasPath, requestedPath, canonicalPath)
+	codebase.Status = model.CodebaseStatusIndexing
+	codebase.EffectiveConfig = indexConfig
+	if manager.semantic != nil && manager.semantic.Available() {
+		codebase.CollectionName = manager.semantic.CollectionName(canonicalPath)
+	}
+	codebase.UpdatedAt = clock.Now()
+
+	now := clock.Now()
+	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, "sync", indexConfig, now)
+
+	codebase.ActiveJobID = job.ID
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, err
+	}
+	if err := manager.appendJobLocked("start_sync", job); err != nil {
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, err
+	}
+	manager.mu.Unlock()
 	manager.runJobAsync(ctx, job.ID)
 	return job, codebase, false, nil
 }
 
 // ClearIndex removes a tracked codebase from daemon state.
-func (manager *Manager) ClearIndex(requestedPath string, client model.ClientInfo) (model.Codebase, error) {
+func (manager *Manager) ClearIndex(ctx context.Context, requestedPath string, client model.ClientInfo) (model.Codebase, error) {
 	_ = client
 
 	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
 	if err != nil {
-		slog.Error("canonicalize path failed", "path", requestedPath, "err", err)
+		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
 		return model.Codebase{}, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
+	}
+
+	manager.mu.Lock()
+	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	if !found {
+		manager.mu.Unlock()
+		return model.Codebase{}, errors.New("codebase not tracked: " + requestedPath)
+	}
+	jobDone, cancel := manager.beginActiveJobCancellationLocked(codebase)
+	manager.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if err := waitForJobDone(ctx, jobDone); err != nil {
+		return model.Codebase{}, err
+	}
+
+	if err := store.RemoveFile(manager.chunkPath(codebase.ID)); err != nil {
+		return model.Codebase{}, fmt.Errorf("remove chunk cache for %s: %w", codebase.ID, err)
+	}
+	if err := store.RemoveFile(manager.merklePath(codebase.ID)); err != nil {
+		return model.Codebase{}, fmt.Errorf("remove Merkle snapshot for %s: %w", codebase.ID, err)
+	}
+	if manager.semantic != nil {
+		if err := manager.semantic.Drop(ctx, canonicalPath); err != nil && !errors.Is(err, semantic.ErrUnavailable) {
+			return model.Codebase{}, fmt.Errorf("drop semantic index for %s: %w", canonicalPath, err)
+		}
 	}
 
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
-	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	clearedCodebase := codebase
+	codebase, found = manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
 	if !found {
-		return model.Codebase{}, errors.New("codebase not tracked: " + requestedPath)
+		return clearedCodebase, nil
 	}
 	delete(manager.codebases, codebase.ID)
 	if err := manager.saveLocked(); err != nil {
@@ -282,8 +525,9 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 		codebase.ActiveJobID = ""
 		codebase.Status = model.CodebaseStatusFailed
 		codebase.LastFailedRun = &model.IndexRunFailure{
-			Message:  "job cancelled",
-			FailedAt: now,
+			Message:                 "job cancelled",
+			LastAttemptedPercentage: 0,
+			FailedAt:                now,
 		}
 		codebase.UpdatedAt = now
 		manager.codebases[codebase.ID] = codebase
@@ -296,21 +540,29 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 }
 
 // GetIndex resolves one tracked codebase by canonical path or alias.
-func (manager *Manager) GetIndex(requestedPath string) (model.Codebase, bool, error) {
+func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (model.Codebase, *model.Job, bool, error) {
+	manager.reconcileIndexedCodebases(ctx)
+
 	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
 	if err != nil {
-		slog.Error("canonicalize path failed", "path", requestedPath, "err", err)
-		return model.Codebase{}, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
+		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
+		return model.Codebase{}, nil, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
 	}
 
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
-	return codebase, found, nil
+	if !found {
+		var emptyCodebase model.Codebase
+		return emptyCodebase, nil, false, nil
+	}
+	return codebase, manager.activeJobSnapshotLocked(codebase), true, nil
 }
 
 // ListIndexes returns every tracked codebase in canonical path order.
-func (manager *Manager) ListIndexes() []model.Codebase {
+func (manager *Manager) ListIndexes(ctx context.Context) []model.Codebase {
+	manager.reconcileIndexedCodebases(ctx)
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -364,38 +616,147 @@ func (manager *Manager) Doctor() []string {
 	return diagnostics
 }
 
+// dedupAgainstActiveJob returns an existing in-flight job that matches the
+// caller's effective config so concurrent MCP requests (including
+// force-reindex requests) collapse into a single embedding pass.
+func (manager *Manager) dedupAgainstActiveJob(canonicalPath string, aliasPath string, indexConfig model.IndexConfig) (model.Job, model.Codebase, bool) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	existingCodebase, codebaseFound := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	if !codebaseFound {
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false
+	}
+	activeJob, deduplicated, err := manager.activeJobLocked(existingCodebase, canonicalPath, indexConfig)
+	if err != nil || !deduplicated {
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false
+	}
+	return activeJob, existingCodebase, true
+}
+
 func (manager *Manager) activeJobLocked(codebase model.Codebase, canonicalPath string, indexConfig model.IndexConfig) (model.Job, bool, error) {
 	if codebase.ActiveJobID == "" {
-		return model.Job{}, false, nil
+		var emptyJob model.Job
+		return emptyJob, false, nil
 	}
 
 	activeJob, found := manager.jobs[codebase.ActiveJobID]
 	if !found {
-		return model.Job{}, false, nil
+		var emptyJob model.Job
+		return emptyJob, false, nil
 	}
 
 	switch activeJob.State {
 	case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
-		return model.Job{}, false, nil
+		var emptyJob model.Job
+		return emptyJob, false, nil
 	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
 	default:
-		return model.Job{}, false, fmt.Errorf("unknown job state %s for active job %s", activeJob.State, activeJob.ID)
+		var emptyJob model.Job
+		return emptyJob, false, fmt.Errorf("unknown job state %s for active job %s", activeJob.State, activeJob.ID)
 	}
 
 	if activeJob.Config.IgnoreDigest == indexConfig.IgnoreDigest && activeJob.Config.SplitterType == indexConfig.SplitterType {
 		return activeJob, true, nil
 	}
 
-	return model.Job{}, false, fmt.Errorf("conflicting active job %s for canonical path %s", activeJob.ID, canonicalPath)
+	var emptyJob model.Job
+	return emptyJob, false, fmt.Errorf("conflicting active job %s for canonical path %s", activeJob.ID, canonicalPath)
+}
+
+func (manager *Manager) activeJobSnapshotLocked(codebase model.Codebase) *model.Job {
+	if codebase.ActiveJobID == "" {
+		return nil
+	}
+
+	job, found := manager.jobs[codebase.ActiveJobID]
+	if !found {
+		return nil
+	}
+	switch job.State {
+	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+		jobCopy := job
+		return &jobCopy
+	case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
+		return nil
+	default:
+		return nil
+	}
+}
+
+func (manager *Manager) cancelActiveJobForPath(ctx context.Context, canonicalPath string, aliasPath string) error {
+	manager.mu.Lock()
+	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	if !found {
+		manager.mu.Unlock()
+		return nil
+	}
+	jobDone, cancel := manager.beginActiveJobCancellationLocked(codebase)
+	manager.mu.Unlock()
+
+	if cancel == nil {
+		return nil
+	}
+
+	cancel()
+	if err := waitForJobDone(ctx, jobDone); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (manager *Manager) beginActiveJobCancellationLocked(codebase model.Codebase) (chan struct{}, context.CancelFunc) {
+	if codebase.ActiveJobID == "" {
+		return nil, nil
+	}
+
+	job, found := manager.jobs[codebase.ActiveJobID]
+	if !found {
+		return nil, nil
+	}
+	if job.State == model.JobStateCompleted || job.State == model.JobStateFailed || job.State == model.JobStateCancelled {
+		return nil, nil
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateCancelling
+	job.UpdatedAt = now
+	job.Progress.Phase = "cancelling"
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	manager.jobs[job.ID] = job
+	cancel := manager.cancels[job.ID]
+	jobDone := manager.done[job.ID]
+	return jobDone, cancel
+}
+
+func waitForJobDone(ctx context.Context, jobDone chan struct{}) error {
+	if jobDone == nil {
+		return nil
+	}
+
+	select {
+	case <-jobDone:
+		return nil
+	case <-ctx.Done():
+		slog.ErrorContext(ctx, "wait for active job cancellation failed", "err", ctx.Err())
+		return fmt.Errorf("wait for active job cancellation: %w", ctx.Err())
+	}
 }
 
 func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
 	backgroundContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	go func() {
-		manager.mu.Lock()
-		manager.cancels[jobID] = cancel
-		manager.mu.Unlock()
+	done := make(chan struct{})
 
+	manager.mu.Lock()
+	manager.cancels[jobID] = cancel
+	manager.done[jobID] = done
+	manager.mu.Unlock()
+
+	go func() {
 		defer func() {
 			cancel()
 			if recovered := recover(); recovered != nil {
@@ -403,7 +764,9 @@ func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
 			}
 			manager.mu.Lock()
 			delete(manager.cancels, jobID)
+			delete(manager.done, jobID)
 			manager.mu.Unlock()
+			close(done)
 		}()
 		manager.runJob(backgroundContext, jobID)
 	}()
@@ -419,7 +782,13 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 
 	manager.updateJobRunning(job)
 
-	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config)
+	if job.Operation == "sync" && manager.runDeltaSync(ctx, job) {
+		return
+	}
+
+	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config, func(progress indexer.Progress) {
+		manager.updateJobProgress(job.ID, progress)
+	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			manager.updateJobCancelled(job.ID)
@@ -428,7 +797,98 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 		manager.updateJobFailed(job.ID, err)
 		return
 	}
+	if manager.semantic != nil && manager.semantic.Available() {
+		err = manager.semantic.Replace(ctx, job.CanonicalPath, result.Chunks, func(progress semantic.Progress) {
+			manager.updateJobSemanticProgress(job.ID, progress)
+		})
+		if err != nil {
+			manager.updateJobFailed(job.ID, err)
+			return
+		}
+	}
 	manager.updateJobCompleted(job.ID, result)
+}
+
+// runDeltaSync attempts the incremental sync path and returns true when it
+// fully handled the job (success, failure, no-op, or cancellation). It
+// returns false to fall back to the full Replace path when there is no
+// previous snapshot or the semantic collection is gone.
+func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
+	manager.mu.Lock()
+	codebase, codebaseFound := manager.codebases[job.CodebaseID]
+	manager.mu.Unlock()
+	if !codebaseFound {
+		return false
+	}
+
+	snapshotPath := manager.merklePath(codebase.ID)
+	previousSnapshot, snapshotErr := merkle.ReadSnapshot(snapshotPath)
+	if snapshotErr != nil {
+		slog.WarnContext(ctx, "no previous merkle snapshot for sync; falling back to full reindex", "path", snapshotPath, "err", snapshotErr)
+		return false
+	}
+
+	currentSnapshot, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+			return true
+		}
+		manager.updateJobFailed(job.ID, fmt.Errorf("capture sync snapshot: %w", err))
+		return true
+	}
+
+	diff := merkle.DiffSnapshots(previousSnapshot, currentSnapshot)
+	if diff.Empty() {
+		manager.updateJobCompleted(job.ID, indexer.Result{
+			IndexedFiles: 0,
+			TotalChunks:  0,
+			Chunks:       nil,
+			FileHashes:   currentSnapshot.Files,
+		})
+		return true
+	}
+
+	changedFiles := append([]string{}, diff.Added...)
+	changedFiles = append(changedFiles, diff.Modified...)
+
+	result, err := manager.runner.IndexFiles(ctx, job.CanonicalPath, changedFiles, job.Config, func(progress indexer.Progress) {
+		manager.updateJobProgress(job.ID, progress)
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+			return true
+		}
+		manager.updateJobFailed(job.ID, err)
+		return true
+	}
+
+	if manager.semantic != nil && manager.semantic.Available() {
+		removedOrModified := append([]string{}, diff.Removed...)
+		removedOrModified = append(removedOrModified, diff.Modified...)
+
+		err = manager.semantic.Reindex(ctx, job.CanonicalPath, result.Chunks, removedOrModified, func(progress semantic.Progress) {
+			manager.updateJobSemanticProgress(job.ID, progress)
+		})
+		switch {
+		case errors.Is(err, semantic.ErrCollectionMissing):
+			slog.WarnContext(ctx, "semantic collection missing during delta sync; falling back to full reindex", "job_id", job.ID)
+			return false
+		case errors.Is(err, context.Canceled):
+			manager.updateJobCancelled(job.ID)
+			return true
+		case err != nil:
+			manager.updateJobFailed(job.ID, err)
+			return true
+		}
+	}
+
+	mergedHashes := make(map[string]string, len(currentSnapshot.Files))
+	maps.Copy(mergedHashes, currentSnapshot.Files)
+	result.FileHashes = mergedHashes
+	manager.updateJobCompleted(job.ID, result)
+	return true
 }
 
 func (manager *Manager) updateJobRunning(job model.Job) {
@@ -442,10 +902,61 @@ func (manager *Manager) updateJobRunning(job model.Job) {
 	now := clock.Now()
 	currentJob.State = model.JobStateRunning
 	currentJob.UpdatedAt = now
-	currentJob.Progress.Phase = "scanning"
+	currentJob.Progress.Phase = "Preparing and scanning files..."
 	currentJob.Progress.LastEventAt = now
 	currentJob.Progress.HeartbeatAt = now
+	currentJob.Progress.OverallPercent = 0
 	_ = manager.appendJobLocked("job_running", currentJob)
+}
+
+func (manager *Manager) updateJobProgress(jobID string, progress indexer.Progress) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	job, found := manager.jobs[jobID]
+	if !found {
+		return
+	}
+	if job.State != model.JobStateQueued && job.State != model.JobStateRunning && job.State != model.JobStateCancelling {
+		return
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateRunning
+	job.UpdatedAt = now
+	job.Progress.Phase = progress.Phase
+	job.Progress.OverallPercent = progress.OverallPercent
+	job.Progress.FilesTotal = progress.FilesTotal
+	job.Progress.FilesProcessed = progress.FilesProcessed
+	job.Progress.ChunksGenerated = progress.ChunksGenerated
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	manager.jobs[jobID] = job
+}
+
+func (manager *Manager) updateJobSemanticProgress(jobID string, progress semantic.Progress) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	job, found := manager.jobs[jobID]
+	if !found {
+		return
+	}
+	if job.State != model.JobStateQueued && job.State != model.JobStateRunning && job.State != model.JobStateCancelling {
+		return
+	}
+
+	now := clock.Now()
+	job.State = model.JobStateRunning
+	job.UpdatedAt = now
+	job.Progress.Phase = progress.Phase
+	job.Progress.OverallPercent = progress.OverallPercent
+	job.Progress.EmbeddingBatchesTotal = progress.EmbeddingBatchesTotal
+	job.Progress.EmbeddingBatchesCompleted = progress.EmbeddingBatchesCompleted
+	job.Progress.CollectionRowsWritten = progress.CollectionRowsWritten
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	manager.jobs[jobID] = job
 }
 
 func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) {
@@ -484,11 +995,18 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 		Status:       "completed",
 		CompletedAt:  now,
 	}
+	codebase.MerkleSnapshotPath = manager.merklePath(codebase.ID)
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
 	chunkPath := manager.chunkPath(codebase.ID)
 	if err := store.WriteChunks(chunkPath, result.Chunks); err != nil {
 		slog.Error("write chunk cache failed", "job_id", jobID, "err", err)
+	}
+	if len(result.FileHashes) != 0 {
+		snapshot := merkle.Snapshot{Files: result.FileHashes}
+		if err := merkle.WriteSnapshot(codebase.MerkleSnapshotPath, snapshot); err != nil {
+			slog.Error("write Merkle snapshot failed", "job_id", jobID, "err", err)
+		}
 	}
 	if err := manager.saveLocked(); err != nil {
 		slog.Error("write registry after completed job failed", "job_id", jobID, "err", err)
@@ -526,8 +1044,9 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 	codebase.Status = model.CodebaseStatusFailed
 	codebase.ActiveJobID = ""
 	codebase.LastFailedRun = &model.IndexRunFailure{
-		Message:  runErr.Error(),
-		FailedAt: now,
+		Message:                 runErr.Error(),
+		LastAttemptedPercentage: 0,
+		FailedAt:                now,
 	}
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
@@ -563,8 +1082,9 @@ func (manager *Manager) updateJobCancelled(jobID string) {
 	codebase.Status = model.CodebaseStatusFailed
 	codebase.ActiveJobID = ""
 	codebase.LastFailedRun = &model.IndexRunFailure{
-		Message:  "job cancelled",
-		FailedAt: now,
+		Message:                 "job cancelled",
+		LastAttemptedPercentage: 0,
+		FailedAt:                now,
 	}
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
@@ -574,35 +1094,80 @@ func (manager *Manager) updateJobCancelled(jobID string) {
 }
 
 // SearchCode performs a local ranked search over persisted chunk content.
-func (manager *Manager) SearchCode(requestedPath string, query string, limit int32, extensionFilter []string) ([]model.StoredChunk, error) {
-	codebase, found, err := manager.GetIndex(requestedPath)
+func (manager *Manager) SearchCode(ctx context.Context, requestedPath string, query string, limit int32, extensionFilter []string) (SearchOutcome, error) {
+	normalizedExtensions, err := semantic.ValidateExtensionFilter(extensionFilter)
 	if err != nil {
-		return nil, err
+		return SearchOutcome{}, fmt.Errorf("validate extension filter: %w", err)
+	}
+
+	codebase, activeJob, found, err := manager.GetIndex(ctx, requestedPath)
+	if err != nil {
+		return SearchOutcome{}, err
 	}
 	if !found {
-		return nil, errors.New("codebase not tracked: " + requestedPath)
+		return SearchOutcome{}, errors.New("codebase not tracked: " + requestedPath)
+	}
+
+	if manager.semantic != nil && manager.semantic.Available() {
+		chunks, semanticErr := manager.semantic.Search(ctx, codebase.CanonicalPath, query, limit, normalizedExtensions)
+		switch {
+		case semanticErr == nil:
+			return SearchOutcome{
+				Codebase:  codebase,
+				ActiveJob: activeJob,
+				Results:   semantic.DeduplicateChunks(chunks),
+			}, nil
+		case (errors.Is(semanticErr, semantic.ErrCollectionMissing) ||
+			errors.Is(semanticErr, semantic.ErrCollectionNotReady) ||
+			errors.Is(semanticErr, semantic.ErrSearchResultIncomplete)) &&
+			codebase.Status == model.CodebaseStatusIndexing:
+			return SearchOutcome{Codebase: codebase, ActiveJob: activeJob, Results: []model.StoredChunk{}}, nil
+		case errors.Is(semanticErr, semantic.ErrCollectionMissing):
+			return SearchOutcome{}, fmt.Errorf("index data for '%s' has been lost (collection not found in Milvus). Please re-index using index_codebase with force=true", codebase.CanonicalPath)
+		case errors.Is(semanticErr, semantic.ErrUnavailable):
+		default:
+			return SearchOutcome{}, fmt.Errorf("semantic search for %s: %w", codebase.CanonicalPath, semanticErr)
+		}
 	}
 
 	chunks, err := store.ReadChunks(manager.chunkPath(codebase.ID))
 	if err != nil {
-		slog.Error("read chunk cache failed", "codebase_id", codebase.ID, "err", err)
-		return nil, fmt.Errorf("read chunk cache for %s: %w", codebase.ID, err)
+		if errors.Is(err, os.ErrNotExist) && codebase.Status == model.CodebaseStatusIndexing {
+			return SearchOutcome{Codebase: codebase, ActiveJob: activeJob, Results: []model.StoredChunk{}}, nil
+		}
+		slog.ErrorContext(ctx, "read chunk cache failed", "codebase_id", codebase.ID, "err", err)
+		return SearchOutcome{}, fmt.Errorf("read chunk cache for %s: %w", codebase.ID, err)
 	}
-	return rankChunks(chunks, query, limit, extensionFilter), nil
+	return SearchOutcome{Codebase: codebase, ActiveJob: activeJob, Results: rankChunks(chunks, query, limit, normalizedExtensions)}, nil
 }
 
 func (manager *Manager) findCodebaseByPathLocked(canonicalPath string, aliasPath string) (model.Codebase, bool) {
+	var bestMatch model.Codebase
+	bestMatchLength := -1
+
 	for _, codebase := range manager.codebases {
 		if codebase.CanonicalPath == canonicalPath {
 			return codebase, true
+		}
+		if pathCovers(codebase.CanonicalPath, canonicalPath) && len(codebase.CanonicalPath) > bestMatchLength {
+			bestMatch = codebase
+			bestMatchLength = len(codebase.CanonicalPath)
 		}
 		for _, alias := range codebase.Aliases {
 			if alias == aliasPath || alias == canonicalPath {
 				return codebase, true
 			}
+			if pathCovers(alias, aliasPath) && len(alias) > bestMatchLength {
+				bestMatch = codebase
+				bestMatchLength = len(alias)
+			}
 		}
 	}
-	return model.Codebase{}, false
+	if bestMatchLength >= 0 {
+		return bestMatch, true
+	}
+	var emptyCodebase model.Codebase
+	return emptyCodebase, false
 }
 
 func canonicalizePath(requestedPath string) (string, string, error) {
@@ -650,6 +1215,16 @@ func mergeAliases(existing []string, aliases ...string) []string {
 	return merged
 }
 
+func pathCovers(rootPath string, targetPath string) bool {
+	rootPath = filepath.Clean(rootPath)
+	targetPath = filepath.Clean(targetPath)
+	if rootPath == targetPath {
+		return true
+	}
+	prefixWithSeparator := rootPath + string(filepath.Separator)
+	return strings.HasPrefix(targetPath, prefixWithSeparator)
+}
+
 func digestIndexConfig(indexConfig model.IndexConfig) string {
 	digestBytes, err := json.Marshal(indexConfig)
 	if err != nil {
@@ -660,8 +1235,59 @@ func digestIndexConfig(indexConfig model.IndexConfig) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
+func (manager *Manager) enrichIndexConfig(indexConfig model.IndexConfig) model.IndexConfig {
+	if strings.TrimSpace(indexConfig.SplitterType) == "" {
+		indexConfig.SplitterType = "ast"
+	}
+	if indexConfig.SplitterChunkSize == 0 {
+		indexConfig.SplitterChunkSize = 2500
+	}
+	if indexConfig.SplitterOverlap == 0 {
+		indexConfig.SplitterOverlap = 300
+	}
+	indexConfig.EmbeddingProvider = manager.config.EmbeddingProvider
+	indexConfig.EmbeddingModel = manager.config.EmbeddingModel
+	if manager.config.EmbeddingDimension > 0 {
+		indexConfig.EmbeddingDimension = manager.config.EmbeddingDimension
+	}
+	indexConfig.VectorBackend = "milvus"
+	indexConfig.Hybrid = manager.config.HybridMode
+	indexConfig.Extensions = mergeDistinct(indexConfig.Extensions, manager.config.CustomExtensions)
+	indexConfig.IgnorePatterns = mergeDistinct(indexConfig.IgnorePatterns, manager.config.CustomIgnorePatterns)
+	return indexConfig
+}
+
+// mergeDistinct returns base + extras with duplicates removed and original
+// ordering preserved.
+func mergeDistinct(base []string, extras []string) []string {
+	if len(extras) == 0 {
+		return base
+	}
+	seen := make(map[string]struct{}, len(base)+len(extras))
+	out := make([]string, 0, len(base)+len(extras))
+	for _, value := range base {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	for _, value := range extras {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (manager *Manager) chunkPath(codebaseID string) string {
 	return filepath.Join(manager.config.ChunksDir, codebaseID+".json")
+}
+
+func (manager *Manager) merklePath(codebaseID string) string {
+	return filepath.Join(manager.config.MerkleDir, codebaseID+".json")
 }
 
 func newID(prefix string) string {
