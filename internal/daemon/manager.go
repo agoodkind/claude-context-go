@@ -110,7 +110,81 @@ func (manager *Manager) load() error {
 		return fmt.Errorf("read jobs: %w", err)
 	}
 	maps.Copy(manager.jobs, jobs)
+	manager.recoverOrphanJobsLocked()
 	return nil
+}
+
+// recoverOrphanJobsLocked marks jobs that were queued or running when the
+// previous daemon process exited as cancelled. The goroutines that owned
+// those jobs are gone, so any in-progress state in the journal is stale.
+// Codebases pointing at an orphan job are flipped to Failed so the next
+// StartIndex call can retry through the streaming path.
+func (manager *Manager) recoverOrphanJobsLocked() {
+	now := clock.Now()
+	for id, job := range manager.jobs {
+		switch job.State {
+		case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+		case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
+			continue
+		default:
+			continue
+		}
+		job.State = model.JobStateCancelled
+		job.UpdatedAt = now
+		completedAt := now
+		job.CompletedAt = &completedAt
+		job.Progress.Phase = "cancelled"
+		job.Progress.LastEventAt = now
+		job.Progress.HeartbeatAt = now
+		manager.jobs[id] = job
+		if err := store.AppendJobEvent(manager.config.JobsPath, model.JobEvent{
+			Event:      "job_orphan_recovered",
+			OccurredAt: now,
+			Job:        job,
+		}); err != nil {
+			slog.Error("append orphan recovery event failed", "job_id", id, "err", err)
+		}
+		slog.Warn("recovered orphan job from prior daemon", "job_id", id, "codebase_id", job.CodebaseID)
+	}
+	registryDirty := false
+	for codebaseID, codebase := range manager.codebases {
+		if codebase.ActiveJobID == "" {
+			continue
+		}
+		job, jobFound := manager.jobs[codebase.ActiveJobID]
+		if !jobFound {
+			codebase.ActiveJobID = ""
+			codebase.UpdatedAt = now
+			manager.codebases[codebaseID] = codebase
+			registryDirty = true
+			continue
+		}
+		switch job.State {
+		case model.JobStateCompleted:
+			codebase.ActiveJobID = ""
+			codebase.UpdatedAt = now
+			manager.codebases[codebaseID] = codebase
+			registryDirty = true
+		case model.JobStateFailed, model.JobStateCancelled:
+			codebase.ActiveJobID = ""
+			codebase.Status = model.CodebaseStatusFailed
+			codebase.LastFailedRun = &model.IndexRunFailure{
+				Message:                 "previous daemon exited before job finished",
+				LastAttemptedPercentage: int32(job.Progress.OverallPercent),
+				FailedAt:                now,
+			}
+			codebase.UpdatedAt = now
+			manager.codebases[codebaseID] = codebase
+			registryDirty = true
+		case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+		default:
+		}
+	}
+	if registryDirty {
+		if err := manager.saveLocked(); err != nil {
+			slog.Error("persist registry after orphan recovery failed", "err", err)
+		}
+	}
 }
 
 func (manager *Manager) saveLocked() error {
@@ -278,15 +352,12 @@ type startIndexDecision struct {
 	alreadyIndexed   bool
 }
 
-// decideStartIndexLocked resolves the codebase record for a StartIndex call
-// and decides whether to dedupe, refuse with "already indexed", or run a
-// streaming reindex against the existing collection. Caller must hold
-// manager.mu.
 // decideStartIndexLocked resolves the codebase record and routing decision
 // from the registry plus the caller-provided Milvus collection state. A
 // registry miss with hasCollection=true produces an Indexed codebase that
-// streams its next reindex into the existing collection. Caller must hold
-// manager.mu.
+// streams its next reindex into the existing collection. A Failed status
+// always allows retry: streaming when the collection exists, full bootstrap
+// otherwise. Caller must hold manager.mu.
 func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath string, indexConfig model.IndexConfig, force bool, hasCollection bool) (startIndexDecision, error) {
 	var emptyJob model.Job
 	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
@@ -320,6 +391,18 @@ func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath s
 			activeJob:        activeJob,
 			dedup:            true,
 			streamingReindex: false,
+			alreadyIndexed:   false,
+		}, nil
+	}
+	// A Failed (or Stale) last run always allows retry. Stream when the
+	// Milvus collection is still around so the existing rows get
+	// rewritten, otherwise bootstrap fresh.
+	if codebase.Status == model.CodebaseStatusFailed || codebase.Status == model.CodebaseStatusStale {
+		return startIndexDecision{
+			codebase:         codebase,
+			activeJob:        emptyJob,
+			dedup:            false,
+			streamingReindex: hasCollection,
 			alreadyIndexed:   false,
 		}, nil
 	}
