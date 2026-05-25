@@ -138,7 +138,12 @@ func WriteSnapshot(path string, snapshot Snapshot) error {
 // matches the requested digest. A missing, unreadable, or mismatched
 // snapshot returns an empty snapshot stamped with the requested digest so
 // the caller can begin writing per-file checkpoints under the new config.
-func LoadSnapshotForConfig(path string, configDigest string) Snapshot {
+//
+// legacyAcceptDigest salvages snapshots that predate the ConfigDigest
+// field. When a snapshot's stored digest is empty and the supplied
+// legacy digest matches the request, the snapshot is treated as valid
+// and returned with the request digest stamped in memory.
+func LoadSnapshotForConfig(path string, configDigest string, legacyAcceptDigest string) Snapshot {
 	empty := Snapshot{ConfigDigest: configDigest, Files: map[string]string{}}
 	snapshot, err := ReadSnapshot(path)
 	if err != nil {
@@ -147,10 +152,15 @@ func LoadSnapshotForConfig(path string, configDigest string) Snapshot {
 		}
 		return empty
 	}
-	if snapshot.ConfigDigest != configDigest {
+	storedDigest := snapshot.ConfigDigest
+	if storedDigest == "" {
+		storedDigest = legacyAcceptDigest
+	}
+	if storedDigest != configDigest {
 		slog.Info("merkle snapshot config digest mismatch; starting fresh checkpoint", "path", path, "snapshot_digest", snapshot.ConfigDigest, "request_digest", configDigest)
 		return empty
 	}
+	snapshot.ConfigDigest = configDigest
 	return snapshot
 }
 

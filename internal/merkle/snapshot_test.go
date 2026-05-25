@@ -10,7 +10,7 @@ func TestLoadSnapshotForConfigMissingFile(t *testing.T) {
 	t.Parallel()
 
 	tempDir := t.TempDir()
-	snapshot := LoadSnapshotForConfig(filepath.Join(tempDir, "missing.json"), "sha256:request")
+	snapshot := LoadSnapshotForConfig(filepath.Join(tempDir, "missing.json"), "sha256:request", "")
 	if snapshot.ConfigDigest != "sha256:request" {
 		t.Fatalf("ConfigDigest = %q, want sha256:request", snapshot.ConfigDigest)
 	}
@@ -27,7 +27,7 @@ func TestLoadSnapshotForConfigMatchingDigest(t *testing.T) {
 	if err := WriteSnapshot(path, stored); err != nil {
 		t.Fatalf("WriteSnapshot returned error: %v", err)
 	}
-	loaded := LoadSnapshotForConfig(path, "sha256:digest-a")
+	loaded := LoadSnapshotForConfig(path, "sha256:digest-a", "")
 	if loaded.ConfigDigest != "sha256:digest-a" {
 		t.Fatalf("ConfigDigest = %q", loaded.ConfigDigest)
 	}
@@ -44,12 +44,49 @@ func TestLoadSnapshotForConfigMismatchedDigest(t *testing.T) {
 	if err := WriteSnapshot(path, stored); err != nil {
 		t.Fatalf("WriteSnapshot returned error: %v", err)
 	}
-	loaded := LoadSnapshotForConfig(path, "sha256:digest-b")
+	loaded := LoadSnapshotForConfig(path, "sha256:digest-b", "")
 	if loaded.ConfigDigest != "sha256:digest-b" {
 		t.Fatalf("ConfigDigest = %q, want fresh sha256:digest-b", loaded.ConfigDigest)
 	}
 	if len(loaded.Files) != 0 {
 		t.Fatalf("Files = %#v, want empty due to digest mismatch", loaded.Files)
+	}
+}
+
+// TestLoadSnapshotForConfigLegacyAcceptDigest proves a snapshot from before
+// the ConfigDigest field existed is salvaged when the legacy fallback
+// matches the request digest. The returned snapshot is stamped with the
+// request digest so subsequent saves keep it valid.
+func TestLoadSnapshotForConfigLegacyAcceptDigest(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	stored := Snapshot{ConfigDigest: "", Files: map[string]string{"a.go": "hash-a"}}
+	if err := WriteSnapshot(path, stored); err != nil {
+		t.Fatalf("WriteSnapshot returned error: %v", err)
+	}
+	loaded := LoadSnapshotForConfig(path, "sha256:request", "sha256:request")
+	if loaded.ConfigDigest != "sha256:request" {
+		t.Fatalf("ConfigDigest = %q, want stamped request digest", loaded.ConfigDigest)
+	}
+	if !reflect.DeepEqual(loaded.Files, stored.Files) {
+		t.Fatalf("Files = %#v, want %#v", loaded.Files, stored.Files)
+	}
+}
+
+// TestLoadSnapshotForConfigLegacyRejectsOnMismatch proves a legacy snapshot
+// is treated as empty when the legacy fallback does not match the request.
+func TestLoadSnapshotForConfigLegacyRejectsOnMismatch(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	stored := Snapshot{ConfigDigest: "", Files: map[string]string{"a.go": "hash-a"}}
+	if err := WriteSnapshot(path, stored); err != nil {
+		t.Fatalf("WriteSnapshot returned error: %v", err)
+	}
+	loaded := LoadSnapshotForConfig(path, "sha256:request", "sha256:other")
+	if len(loaded.Files) != 0 {
+		t.Fatalf("Files = %#v, want empty due to legacy digest mismatch", loaded.Files)
 	}
 }
 

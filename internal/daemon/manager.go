@@ -1048,7 +1048,8 @@ type deltaPlan struct {
 // any file whose content hash is already recorded under the same config.
 func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
 	configDigest := job.Config.IgnoreDigest
-	seed := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest)
+	legacyDigest := manager.legacyDigestForCodebase(codebaseID)
+	seed := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest, legacyDigest)
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1088,7 +1089,8 @@ func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job,
 func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
 	configDigest := job.Config.IgnoreDigest
 	snapshotPath := manager.merklePath(codebaseID)
-	seed := merkle.LoadSnapshotForConfig(snapshotPath, configDigest)
+	legacyDigest := manager.legacyDigestForCodebase(codebaseID)
+	seed := merkle.LoadSnapshotForConfig(snapshotPath, configDigest, legacyDigest)
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1694,6 +1696,20 @@ func pathCovers(rootPath string, targetPath string) bool {
 	}
 	prefixWithSeparator := rootPath + string(filepath.Separator)
 	return strings.HasPrefix(targetPath, prefixWithSeparator)
+}
+
+// legacyDigestForCodebase returns the canonical digest of the codebase's
+// stored EffectiveConfig. The plan helpers pass this to
+// merkle.LoadSnapshotForConfig so a pre-config-digest snapshot is salvaged
+// when the request matches what the codebase was last indexed under.
+func (manager *Manager) legacyDigestForCodebase(codebaseID string) string {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	codebase, found := manager.codebases[codebaseID]
+	if !found {
+		return ""
+	}
+	return digestIndexConfig(codebase.EffectiveConfig)
 }
 
 // digestIndexConfig hashes the indexing-relevant fields of an IndexConfig.
