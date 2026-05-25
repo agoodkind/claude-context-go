@@ -283,10 +283,9 @@ type startIndexDecision struct {
 // streaming reindex against the existing collection. Caller must hold
 // manager.mu.
 // decideStartIndexLocked resolves the codebase record and routing decision
-// using the registry plus the caller-provided Milvus collection state.
-// Milvus is the source of truth for indexed state, so a registry miss with
-// hasCollection=true promotes the path to an indexed codebase that streams
-// the next reindex into the existing collection. Caller must hold
+// from the registry plus the caller-provided Milvus collection state. A
+// registry miss with hasCollection=true produces an Indexed codebase that
+// streams its next reindex into the existing collection. Caller must hold
 // manager.mu.
 func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath string, indexConfig model.IndexConfig, force bool, hasCollection bool) (startIndexDecision, error) {
 	var emptyJob model.Job
@@ -605,10 +604,9 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 	return job, nil
 }
 
-// GetIndex resolves one tracked codebase by canonical path or alias. Milvus
-// is the source of truth for indexed state, so GetIndex returns Indexed for
-// any path whose Milvus collection exists, synthesizing a record when the
-// registry has no entry for it.
+// GetIndex resolves one tracked codebase by canonical path or alias.
+// GetIndex returns Indexed for any path whose Milvus collection exists,
+// synthesizing a record when the registry has no entry for it.
 func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (model.Codebase, *model.Job, bool, error) {
 	manager.reconcileIndexedCodebases(ctx)
 
@@ -641,10 +639,8 @@ func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (mod
 	return emptyCodebase, nil, false, nil
 }
 
-// synthesizeUnregisteredCodebase builds an in-memory codebase record from
-// the Milvus collection state for a path with no registry entry. The record
-// stays in-memory and lets GetIndex answer "indexed" from the shared data
-// store alone.
+// synthesizeUnregisteredCodebase builds an in-memory codebase record for a
+// path whose Milvus collection exists without a registry entry.
 func (manager *Manager) synthesizeUnregisteredCodebase(canonicalPath string) model.Codebase {
 	collectionName := ""
 	if manager.semantic != nil {
@@ -1039,12 +1035,10 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 // previous snapshot or the semantic collection is gone.
 //
 // Two operations route here. "sync" computes the merkle diff against the
-// previous snapshot and processes only added and modified files; this is the
-// background-sync hot path. "streaming_reindex" skips the diff entirely and
-// treats every discovered file as modified so the agent can upgrade the
-// splitter (for example coarse one-chunk-per-file to ast) without dropping
-// the Milvus collection; the existing index stays searchable file by file as
-// semantic.Reindex deletes and upserts each row.
+// previous snapshot and processes only added and modified files.
+// "streaming_reindex" treats every discovered file as modified and feeds
+// the list through semantic.Reindex so the Milvus collection stays
+// populated row-by-row while the splitter upgrade runs.
 func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 	manager.mu.Lock()
 	codebase, codebaseFound := manager.codebases[job.CodebaseID]
@@ -1100,6 +1094,30 @@ func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 		case err != nil:
 			manager.updateJobFailed(job.ID, err)
 			return true
+		}
+
+		// A streaming reindex synthesizes its diff from the current file
+		// walk and has no record of files removed since the last
+		// indexing pass. Drop any rows whose relativePath is outside the
+		// current file set so the collection matches the working tree.
+		if jobOperation(job.Operation) == jobOperationStreamingReindex {
+			currentPaths := make([]string, 0, len(currentSnapshot.Files))
+			for relativePath := range currentSnapshot.Files {
+				currentPaths = append(currentPaths, relativePath)
+			}
+			sort.Strings(currentPaths)
+			if pruneErr := manager.semantic.PruneToCurrent(ctx, job.CanonicalPath, currentPaths); pruneErr != nil {
+				switch {
+				case errors.Is(pruneErr, context.Canceled):
+					manager.updateJobCancelled(job.ID)
+					return true
+				case errors.Is(pruneErr, semantic.ErrCollectionMissing):
+					slog.WarnContext(ctx, "semantic collection missing during streaming prune", "job_id", job.ID)
+				default:
+					manager.updateJobFailed(job.ID, pruneErr)
+					return true
+				}
+			}
 		}
 	}
 

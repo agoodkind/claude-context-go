@@ -11,36 +11,51 @@ import (
 	"strings"
 )
 
-var defaultSupportedExtensions = []string{
-	".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".cpp", ".c", ".h", ".hpp",
-	".cs", ".go", ".rs", ".php", ".rb", ".swift", ".kt", ".scala", ".m", ".mm",
-	".dart", ".sol", ".md", ".markdown", ".ipynb",
-}
-
+// defaultIgnorePatterns is the denylist applied to every codebase. It
+// covers VCS internals, dependency and build output, editor scratch, OS
+// metadata, common binary file extensions, package lockfiles, and minified
+// or generated bundles. Discovery walks every other file regardless of
+// extension; binary content is filtered later by the indexer's UTF-8 check.
 var defaultIgnorePatterns = []string{
-	"node_modules/**",
-	"dist/**",
-	"build/**",
-	"out/**",
-	"target/**",
-	"coverage/**",
-	".nyc_output/**",
-	".vscode/**",
-	".idea/**",
-	"*.swp",
-	"*.swo",
-	".git/**",
-	".svn/**",
-	".hg/**",
-	".cache/**",
-	"__pycache__/**",
-	".pytest_cache/**",
-	"logs/**",
-	"tmp/**",
-	"temp/**",
-	"*.log",
+	"node_modules/",
+	"dist/",
+	"build/",
+	"out/",
+	"target/",
+	"vendor/",
+	"coverage/",
+	".nyc_output/",
+	".vscode/",
+	".idea/",
+	".git/",
+	".svn/",
+	".hg/",
+	".cache/",
+	".next/",
+	".nuxt/",
+	".turbo/",
+	".parcel-cache/",
+	".pnpm-store/",
+	".yarn/",
+	".gradle/",
+	".terraform/",
+	".direnv/",
+	"__pycache__/",
+	".pytest_cache/",
+	".mypy_cache/",
+	".ruff_cache/",
+	".tox/",
+	".venv/",
+	"venv/",
+	"logs/",
+	"tmp/",
+	"temp/",
+	".DS_Store",
 	".env",
 	".env.*",
+	"*.swp",
+	"*.swo",
+	"*.log",
 	"*.local",
 	"*.min.js",
 	"*.min.css",
@@ -52,23 +67,83 @@ var defaultIgnorePatterns = []string{
 	"*.polyfills.js",
 	"*.runtime.js",
 	"*.map",
-	"node_modules",
-	".git",
-	".svn",
-	".hg",
-	"build",
-	"dist",
-	"out",
-	"target",
-	".vscode",
-	".idea",
-	"__pycache__",
-	".pytest_cache",
-	"coverage",
-	".nyc_output",
-	"logs",
-	"tmp",
-	"temp",
+	// Image formats.
+	"*.png",
+	"*.jpg",
+	"*.jpeg",
+	"*.gif",
+	"*.ico",
+	"*.webp",
+	"*.bmp",
+	"*.tiff",
+	"*.tif",
+	"*.heic",
+	"*.avif",
+	// Document and archive binaries.
+	"*.pdf",
+	"*.doc",
+	"*.docx",
+	"*.xls",
+	"*.xlsx",
+	"*.ppt",
+	"*.pptx",
+	"*.zip",
+	"*.tar",
+	"*.tgz",
+	"*.gz",
+	"*.bz2",
+	"*.xz",
+	"*.7z",
+	"*.rar",
+	"*.dmg",
+	"*.iso",
+	// Native, compiled, and packaged binaries.
+	"*.exe",
+	"*.dll",
+	"*.so",
+	"*.dylib",
+	"*.o",
+	"*.obj",
+	"*.a",
+	"*.lib",
+	"*.class",
+	"*.jar",
+	"*.war",
+	"*.ear",
+	"*.wasm",
+	"*.pyc",
+	"*.pyo",
+	"*.pyd",
+	// Fonts.
+	"*.ttf",
+	"*.otf",
+	"*.woff",
+	"*.woff2",
+	"*.eot",
+	// Audio and video.
+	"*.mp3",
+	"*.mp4",
+	"*.mov",
+	"*.avi",
+	"*.mkv",
+	"*.webm",
+	"*.wav",
+	"*.flac",
+	"*.ogg",
+	// Databases and embedded blobs.
+	"*.sqlite",
+	"*.sqlite3",
+	"*.db",
+	"*.bin",
+	// Package lockfiles.
+	"package-lock.json",
+	"yarn.lock",
+	"pnpm-lock.yaml",
+	"Cargo.lock",
+	"Gemfile.lock",
+	"composer.lock",
+	"poetry.lock",
+	"go.sum",
 }
 
 // Result is one discovery pass over a codebase root.
@@ -78,7 +153,10 @@ type Result struct {
 	Extensions     []string
 }
 
-// Discover applies the current ignore and extension rules to one codebase root.
+// Discover walks a codebase root and returns every file that survives the
+// ignore-pattern denylist. Extensions in the request are honored for
+// backwards compatibility but no longer gate inclusion; the binary content
+// gate now lives in the indexer's UTF-8 check.
 func Discover(ctx context.Context, root string, additionalIgnorePatterns []string, additionalExtensions []string) (Result, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -91,11 +169,9 @@ func Discover(ctx context.Context, root string, additionalIgnorePatterns []strin
 		return Result{}, err
 	}
 	effectiveExtensions := normalizeExtensions(additionalExtensions)
-	effectiveExtensions = append(dedupStrings(defaultSupportedExtensions), effectiveExtensions...)
-	effectiveExtensions = dedupStrings(effectiveExtensions)
 
 	files := []string{}
-	if err := walkFiles(ctx, absoluteRoot, absoluteRoot, effectiveIgnorePatterns, effectiveExtensions, &files); err != nil {
+	if err := walkFiles(ctx, absoluteRoot, absoluteRoot, effectiveIgnorePatterns, &files); err != nil {
 		return Result{}, err
 	}
 	slices.Sort(files)
@@ -107,7 +183,7 @@ func Discover(ctx context.Context, root string, additionalIgnorePatterns []strin
 	}, nil
 }
 
-func walkFiles(ctx context.Context, root string, current string, ignorePatterns []string, extensions []string, files *[]string) error {
+func walkFiles(ctx context.Context, root string, current string, ignorePatterns []string, files *[]string) error {
 	if err := ctx.Err(); err != nil {
 		slog.ErrorContext(ctx, "walk cancelled", "path", current, "err", err)
 		return fmt.Errorf("walk cancelled at %s: %w", current, err)
@@ -131,16 +207,13 @@ func walkFiles(ctx context.Context, root string, current string, ignorePatterns 
 		}
 
 		if entry.IsDir() {
-			if err := walkFiles(ctx, root, fullPath, ignorePatterns, extensions, files); err != nil {
+			if err := walkFiles(ctx, root, fullPath, ignorePatterns, files); err != nil {
 				return err
 			}
 			continue
 		}
 
-		extension := filepath.Ext(entry.Name())
-		if slices.Contains(extensions, extension) {
-			*files = append(*files, fullPath)
-		}
+		*files = append(*files, fullPath)
 	}
 	return nil
 }
@@ -206,12 +279,6 @@ func readIgnoreFile(ctx context.Context, path string) ([]string, error) {
 }
 
 func shouldIgnore(relativePath string, ignorePatterns []string) bool {
-	for part := range strings.SplitSeq(relativePath, string(filepath.Separator)) {
-		if strings.HasPrefix(part, ".") {
-			return true
-		}
-	}
-
 	normalizedPath := strings.Trim(strings.ReplaceAll(relativePath, "\\", "/"), "/")
 	if normalizedPath == "" {
 		return false

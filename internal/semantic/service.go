@@ -288,6 +288,39 @@ func (service *Service) Reindex(ctx context.Context, codebasePath string, addedO
 	return nil
 }
 
+// PruneToCurrent removes rows whose relativePath is outside the provided
+// set of current files. Use it after a streaming reindex to drop chunks
+// left over from files that no longer exist on disk.
+func (service *Service) PruneToCurrent(ctx context.Context, codebasePath string, currentRelativePaths []string) error {
+	if !service.Available() {
+		return nil
+	}
+	if len(currentRelativePaths) == 0 {
+		return nil
+	}
+	collectionName := service.CollectionName(codebasePath)
+	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "check Milvus collection for prune failed", "collection", collectionName, "err", err)
+		return fmt.Errorf("check Milvus collection %s: %w", collectionName, err)
+	}
+	if !hasCollection {
+		return ErrCollectionMissing
+	}
+
+	quoted := make([]string, 0, len(currentRelativePaths))
+	for _, path := range currentRelativePaths {
+		quoted = append(quoted, `"`+escapeMilvusString(path)+`"`)
+	}
+	expression := fmt.Sprintf(`%s not in [%s]`, relativePathFieldName, strings.Join(quoted, ","))
+
+	if _, err := service.milvus.Delete(ctx, milvusclient.NewDeleteOption(collectionName).WithExpr(expression)); err != nil {
+		slog.ErrorContext(ctx, "prune orphans failed", "collection", collectionName, "current_count", len(currentRelativePaths), "err", err)
+		return fmt.Errorf("prune orphans from %s: %w", collectionName, err)
+	}
+	return nil
+}
+
 // deleteByRelativePaths removes existing chunks for the given relative paths.
 // Paths are escaped to be safe inside the Milvus filter expression.
 func (service *Service) deleteByRelativePaths(ctx context.Context, collectionName string, relativePaths []string) error {
@@ -443,7 +476,7 @@ func (service *Service) ListCollections(ctx context.Context) ([]string, error) {
 }
 
 // HasCollectionForPath reports whether Milvus has the collection for the
-// given codebase path. Milvus is the source of truth for indexed state.
+// given codebase path.
 func (service *Service) HasCollectionForPath(ctx context.Context, codebasePath string) (bool, error) {
 	if !service.Available() {
 		return false, ErrUnavailable
@@ -555,6 +588,9 @@ func resultSetsToChunks(resultSets []milvusclient.ResultSet) ([]model.StoredChun
 	}
 
 	resultSet := resultSets[0]
+	if resultSet.ResultCount == 0 {
+		return []model.StoredChunk{}, nil
+	}
 	contentColumn := resultSet.GetColumn(contentFieldName)
 	relativePathColumn := resultSet.GetColumn(relativePathFieldName)
 	startLineColumn := resultSet.GetColumn(startLineFieldName)
@@ -750,12 +786,18 @@ func DeduplicateChunks(chunks []model.StoredChunk) []model.StoredChunk {
 	return keptChunks
 }
 
+// normalizeExtensionFilter trims whitespace and prepends a leading dot when
+// missing so the filter matches the dot-prefixed values that [filepath.Ext]
+// writes into the file_extension column.
 func normalizeExtensionFilter(extensionFilter []string) []string {
 	cleanedExtensions := make([]string, 0, len(extensionFilter))
 	for _, extension := range extensionFilter {
 		trimmedExtension := strings.TrimSpace(extension)
 		if trimmedExtension == "" {
 			continue
+		}
+		if !strings.HasPrefix(trimmedExtension, ".") {
+			trimmedExtension = "." + trimmedExtension
 		}
 		cleanedExtensions = append(cleanedExtensions, trimmedExtension)
 	}

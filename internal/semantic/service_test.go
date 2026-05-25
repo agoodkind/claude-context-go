@@ -29,6 +29,24 @@ func TestValidateExtensionFilter(t *testing.T) {
 	}
 }
 
+func TestValidateExtensionFilterAcceptsBareExtensions(t *testing.T) {
+	t.Parallel()
+
+	normalized, err := ValidateExtensionFilter([]string{"go", " ts ", "mk", "sh"})
+	if err != nil {
+		t.Fatalf("ValidateExtensionFilter returned error: %v", err)
+	}
+	want := []string{".go", ".ts", ".mk", ".sh"}
+	if len(normalized) != len(want) {
+		t.Fatalf("ValidateExtensionFilter returned %d entries, want %d: %+v", len(normalized), len(want), normalized)
+	}
+	for index, value := range normalized {
+		if value != want[index] {
+			t.Fatalf("ValidateExtensionFilter[%d] = %q, want %q", index, value, want[index])
+		}
+	}
+}
+
 func TestDeduplicateChunks(t *testing.T) {
 	t.Parallel()
 

@@ -70,8 +70,6 @@ func main() {
 }
 
 func run() error {
-	slog.Info("start cli")
-
 	cfg, err := config.Default()
 	if err != nil {
 		slog.Error("load config failed", "err", err)
