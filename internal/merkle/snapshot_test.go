@@ -1,9 +1,57 @@
 package merkle
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestLoadSnapshotForConfigMissingFile(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	snapshot := LoadSnapshotForConfig(filepath.Join(tempDir, "missing.json"), "sha256:request")
+	if snapshot.ConfigDigest != "sha256:request" {
+		t.Fatalf("ConfigDigest = %q, want sha256:request", snapshot.ConfigDigest)
+	}
+	if len(snapshot.Files) != 0 {
+		t.Fatalf("Files = %#v, want empty", snapshot.Files)
+	}
+}
+
+func TestLoadSnapshotForConfigMatchingDigest(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	stored := Snapshot{ConfigDigest: "sha256:digest-a", Files: map[string]string{"a.go": "hash-a"}}
+	if err := WriteSnapshot(path, stored); err != nil {
+		t.Fatalf("WriteSnapshot returned error: %v", err)
+	}
+	loaded := LoadSnapshotForConfig(path, "sha256:digest-a")
+	if loaded.ConfigDigest != "sha256:digest-a" {
+		t.Fatalf("ConfigDigest = %q", loaded.ConfigDigest)
+	}
+	if !reflect.DeepEqual(loaded.Files, stored.Files) {
+		t.Fatalf("Files = %#v, want %#v", loaded.Files, stored.Files)
+	}
+}
+
+func TestLoadSnapshotForConfigMismatchedDigest(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	stored := Snapshot{ConfigDigest: "sha256:digest-a", Files: map[string]string{"a.go": "hash-a"}}
+	if err := WriteSnapshot(path, stored); err != nil {
+		t.Fatalf("WriteSnapshot returned error: %v", err)
+	}
+	loaded := LoadSnapshotForConfig(path, "sha256:digest-b")
+	if loaded.ConfigDigest != "sha256:digest-b" {
+		t.Fatalf("ConfigDigest = %q, want fresh sha256:digest-b", loaded.ConfigDigest)
+	}
+	if len(loaded.Files) != 0 {
+		t.Fatalf("Files = %#v, want empty due to digest mismatch", loaded.Files)
+	}
+}
 
 func TestDiffSnapshotsEmpty(t *testing.T) {
 	t.Parallel()

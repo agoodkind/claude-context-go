@@ -85,56 +85,75 @@ func renderGetIndex(requestedPath string, tracked bool, codebase *model.Codebase
 	if !tracked || codebase == nil {
 		return fmt.Sprintf("❌ Codebase '%s' is not indexed. Please use the index_codebase tool to index it first.", requestedPath)
 	}
-
+	// An active job always wins the display. A historical LastFailedRun
+	// that lingers in the registry alongside an in-flight retry would
+	// otherwise read as the current state and confuse callers.
+	if activeJob != nil {
+		return renderIndexingActive(codebase, activeJob)
+	}
 	switch codebase.Status {
 	case model.CodebaseStatusNotIndexed:
 		return fmt.Sprintf("❌ Codebase '%s' is not indexed. Please use the index_codebase tool to index it first.", requestedPath)
 	case model.CodebaseStatusIndexed:
-		if codebase.LastSuccessfulRun == nil {
-			return fmt.Sprintf("✅ Codebase '%s' is fully indexed and ready for search.", codebase.CanonicalPath)
-		}
-		base := fmt.Sprintf(
-			"✅ Codebase '%s' is fully indexed and ready for search.\n📊 Statistics: %d files, %d chunks\n📅 Status: %s\n🕐 Last updated: %s",
-			codebase.CanonicalPath,
-			codebase.LastSuccessfulRun.IndexedFiles,
-			codebase.LastSuccessfulRun.TotalChunks,
-			orDefault(codebase.LastSuccessfulRun.Status, "completed"),
-			formatLocalTime(codebase.LastSuccessfulRun.CompletedAt),
-		)
-		if skipLine := renderSkippedFiles(codebase.LastSuccessfulRun.SkippedFiles); skipLine != "" {
-			base += "\n" + skipLine
-		}
-		return base
+		return renderIndexedDetail(codebase)
 	case model.CodebaseStatusIndexing:
-		progress := 0.0
-		lastUpdated := codebase.UpdatedAt
-		if activeJob != nil {
-			progress = activeJob.Progress.OverallPercent
-			if !activeJob.Progress.LastEventAt.IsZero() {
-				lastUpdated = activeJob.Progress.LastEventAt
-			}
-		}
-		return fmt.Sprintf(
-			"🔄 Codebase '%s' is currently being indexed. Progress: %.1f%%%s\n🕐 Last updated: %s",
-			codebase.CanonicalPath,
-			progress,
-			progressPhaseSuffix(progress),
-			formatLocalTime(lastUpdated),
-		)
+		return renderIndexingActive(codebase, activeJob)
 	case model.CodebaseStatusFailed, model.CodebaseStatusStale:
-		if codebase.LastFailedRun == nil {
-			return fmt.Sprintf("❌ Codebase '%s' indexing failed. You can retry indexing.", codebase.CanonicalPath)
-		}
-		return fmt.Sprintf(
-			"❌ Codebase '%s' indexing failed.\n🚨 Error: %s\n📊 Failed at: %.1f%% progress\n🕐 Failed at: %s\n💡 You can retry indexing by running the index_codebase command again.",
-			codebase.CanonicalPath,
-			orDefault(codebase.LastFailedRun.Message, "unknown error"),
-			float64(codebase.LastFailedRun.LastAttemptedPercentage),
-			formatLocalTime(codebase.LastFailedRun.FailedAt),
-		)
+		return renderHistoricalFailure(codebase)
 	default:
 		return fmt.Sprintf("❌ Codebase '%s' is not indexed. Please use the index_codebase tool to index it first.", requestedPath)
 	}
+}
+
+func renderIndexedDetail(codebase *model.Codebase) string {
+	if codebase.LastSuccessfulRun == nil {
+		return fmt.Sprintf("✅ Codebase '%s' is fully indexed and ready for search.", codebase.CanonicalPath)
+	}
+	base := fmt.Sprintf(
+		"✅ Codebase '%s' is fully indexed and ready for search.\n📊 Statistics: %d files, %d chunks\n📅 Status: %s\n🕐 Last updated: %s",
+		codebase.CanonicalPath,
+		codebase.LastSuccessfulRun.IndexedFiles,
+		codebase.LastSuccessfulRun.TotalChunks,
+		orDefault(codebase.LastSuccessfulRun.Status, "completed"),
+		formatLocalTime(codebase.LastSuccessfulRun.CompletedAt),
+	)
+	if skipLine := renderSkippedFiles(codebase.LastSuccessfulRun.SkippedFiles); skipLine != "" {
+		base += "\n" + skipLine
+	}
+	return base
+}
+
+func renderIndexingActive(codebase *model.Codebase, activeJob *model.Job) string {
+	progress := 0.0
+	lastUpdated := codebase.UpdatedAt
+	if activeJob != nil {
+		progress = activeJob.Progress.OverallPercent
+		if !activeJob.Progress.LastEventAt.IsZero() {
+			lastUpdated = activeJob.Progress.LastEventAt
+		}
+	}
+	return fmt.Sprintf(
+		"🔄 Codebase '%s' is currently being indexed. Progress: %.1f%%%s\n🕐 Last updated: %s",
+		codebase.CanonicalPath,
+		progress,
+		progressPhaseSuffix(progress),
+		formatLocalTime(lastUpdated),
+	)
+}
+
+// renderHistoricalFailure reads as past tense so callers do not mistake an
+// old failure record for a live one.
+func renderHistoricalFailure(codebase *model.Codebase) string {
+	if codebase.LastFailedRun == nil {
+		return fmt.Sprintf("❌ Codebase '%s' last indexing attempt failed. Call index_codebase to retry.", codebase.CanonicalPath)
+	}
+	return fmt.Sprintf(
+		"❌ Codebase '%s' last indexing attempt failed at %s (%.1f%% complete).\n🚨 Previous error: %s\n💡 Call index_codebase to retry; the previous failure no longer blocks new attempts.",
+		codebase.CanonicalPath,
+		formatLocalTime(codebase.LastFailedRun.FailedAt),
+		float64(codebase.LastFailedRun.LastAttemptedPercentage),
+		orDefault(codebase.LastFailedRun.Message, "unknown error"),
+	)
 }
 
 func renderListIndexes(codebases []model.Codebase) string {

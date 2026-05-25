@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,9 +19,13 @@ import (
 	"goodkind.io/claude-context-go/internal/store"
 )
 
-// Snapshot stores one content hash per relative file path.
+// Snapshot stores one content hash per relative file path. ConfigDigest
+// records the IgnoreDigest of the request that produced these hashes so a
+// resuming run can detect when a config change has invalidated the
+// checkpoint and trigger a fresh embed pass.
 type Snapshot struct {
-	Files map[string]string `json:"files"`
+	ConfigDigest string            `json:"config_digest,omitempty"`
+	Files        map[string]string `json:"files"`
 }
 
 // Capture walks a codebase and records content hashes for the tracked files.
@@ -78,7 +83,7 @@ func Capture(
 		files[relativePath] = digestBytes(data)
 	}
 
-	return Snapshot{Files: files}, nil
+	return Snapshot{ConfigDigest: "", Files: files}, nil
 }
 
 // WriteSnapshot persists a snapshot atomically.
@@ -127,6 +132,26 @@ func WriteSnapshot(path string, snapshot Snapshot) error {
 		return fmt.Errorf("rename temp snapshot %s to %s: %w", tempPath, path, err)
 	}
 	return nil
+}
+
+// LoadSnapshotForConfig returns the snapshot at path when its ConfigDigest
+// matches the requested digest. A missing, unreadable, or mismatched
+// snapshot returns an empty snapshot stamped with the requested digest so
+// the caller can begin writing per-file checkpoints under the new config.
+func LoadSnapshotForConfig(path string, configDigest string) Snapshot {
+	empty := Snapshot{ConfigDigest: configDigest, Files: map[string]string{}}
+	snapshot, err := ReadSnapshot(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("load merkle snapshot failed; treating as empty", "path", path, "err", err)
+		}
+		return empty
+	}
+	if snapshot.ConfigDigest != configDigest {
+		slog.Info("merkle snapshot config digest mismatch; starting fresh checkpoint", "path", path, "snapshot_digest", snapshot.ConfigDigest, "request_digest", configDigest)
+		return empty
+	}
+	return snapshot
 }
 
 // ReadSnapshot loads one persisted snapshot.

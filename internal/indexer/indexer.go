@@ -85,6 +85,28 @@ type processedFile struct {
 	Skipped  bool
 }
 
+// OneFileResult mirrors the per-file accumulator output for callers that
+// drive their own iteration (the daemon's per-file delta loop).
+type OneFileResult = processedFile
+
+// IndexOne reads, gates, and splits a single file. The daemon's per-file
+// delta loop calls this so the merkle snapshot can be flushed after each
+// successful semantic.Reindex call.
+func (runner *Runner) IndexOne(ctx context.Context, root string, relativePath string, cfg model.IndexConfig) (OneFileResult, error) {
+	fullPath := filepath.Join(root, relativePath)
+	if oversize, err := runner.isOversize(ctx, fullPath, relativePath); err != nil {
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false}, err
+	} else if oversize {
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: true}, nil
+	}
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "read source file failed", "path", fullPath, "err", err)
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false}, fmt.Errorf("read source file %s: %w", fullPath, err)
+	}
+	return runner.processFile(ctx, fullPath, relativePath, data, cfg.SplitterType)
+}
+
 // isOversize reports whether the file at fullPath exceeds the runner's
 // per-file size cap. A cap of 0 or below disables the check.
 func (runner *Runner) isOversize(ctx context.Context, fullPath string, relativePath string) (bool, error) {

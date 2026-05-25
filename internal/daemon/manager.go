@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -68,6 +69,7 @@ type SearchOutcome struct {
 type indexingRunner interface {
 	Index(context.Context, string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
 	IndexFiles(context.Context, string, []string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
+	IndexOne(context.Context, string, string, model.IndexConfig) (indexer.OneFileResult, error)
 }
 
 // NewManager loads persisted daemon state from disk.
@@ -110,16 +112,17 @@ func (manager *Manager) load() error {
 		return fmt.Errorf("read jobs: %w", err)
 	}
 	maps.Copy(manager.jobs, jobs)
-	manager.recoverOrphanJobsLocked()
+	manager.reconcileJournalOnStartLocked()
 	return nil
 }
 
-// recoverOrphanJobsLocked marks jobs that were queued or running when the
-// previous daemon process exited as cancelled. The goroutines that owned
-// those jobs are gone, so any in-progress state in the journal is stale.
-// Codebases pointing at an orphan job are flipped to Failed so the next
-// StartIndex call can retry through the streaming path.
-func (manager *Manager) recoverOrphanJobsLocked() {
+// reconcileJournalOnStartLocked sanitizes the job journal after the previous
+// daemon process exited. Any queued, running, or cancelling job becomes
+// cancelled in the journal because its goroutine is gone. Codebase records
+// keep Status=Indexing when they were mid-flight so ResumeOrphanedJobs can
+// pick them back up with a fresh streaming reindex; the registry already
+// holds the canonical path and effective config that resume needs.
+func (manager *Manager) reconcileJournalOnStartLocked() {
 	now := clock.Now()
 	for id, job := range manager.jobs {
 		switch job.State {
@@ -144,45 +147,47 @@ func (manager *Manager) recoverOrphanJobsLocked() {
 		}); err != nil {
 			slog.Error("append orphan recovery event failed", "job_id", id, "err", err)
 		}
-		slog.Warn("recovered orphan job from prior daemon", "job_id", id, "codebase_id", job.CodebaseID)
+		slog.Warn("orphan job sanitized in journal after restart", "job_id", id, "codebase_id", job.CodebaseID)
 	}
-	registryDirty := false
-	for codebaseID, codebase := range manager.codebases {
-		if codebase.ActiveJobID == "" {
+}
+
+// ResumeOrphanedJobs re-queues a streaming reindex for every codebase whose
+// previous indexing job was still running when the daemon exited. The
+// streaming path's per-file delete-then-upsert keeps the run idempotent, so
+// resuming is safe even though no mid-job state is persisted. Call this
+// once after NewManager returns and before the daemon advertises ready.
+func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
+	manager.mu.Lock()
+	type resumePlan struct {
+		canonicalPath string
+		config        model.IndexConfig
+		codebaseID    string
+	}
+	plans := make([]resumePlan, 0)
+	for _, codebase := range manager.codebases {
+		if codebase.Status != model.CodebaseStatusIndexing {
 			continue
 		}
-		job, jobFound := manager.jobs[codebase.ActiveJobID]
-		if !jobFound {
-			codebase.ActiveJobID = ""
-			codebase.UpdatedAt = now
-			manager.codebases[codebaseID] = codebase
-			registryDirty = true
-			continue
-		}
-		switch job.State {
-		case model.JobStateCompleted:
-			codebase.ActiveJobID = ""
-			codebase.UpdatedAt = now
-			manager.codebases[codebaseID] = codebase
-			registryDirty = true
-		case model.JobStateFailed, model.JobStateCancelled:
-			codebase.ActiveJobID = ""
-			codebase.Status = model.CodebaseStatusFailed
-			codebase.LastFailedRun = &model.IndexRunFailure{
-				Message:                 "previous daemon exited before job finished",
-				LastAttemptedPercentage: int32(job.Progress.OverallPercent),
-				FailedAt:                now,
-			}
-			codebase.UpdatedAt = now
-			manager.codebases[codebaseID] = codebase
-			registryDirty = true
-		case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
-		default:
-		}
+		plans = append(plans, resumePlan{
+			canonicalPath: codebase.CanonicalPath,
+			config:        codebase.EffectiveConfig,
+			codebaseID:    codebase.ID,
+		})
 	}
-	if registryDirty {
-		if err := manager.saveLocked(); err != nil {
-			slog.Error("persist registry after orphan recovery failed", "err", err)
+	manager.mu.Unlock()
+
+	if len(plans) > 0 {
+		paths := make([]string, 0, len(plans))
+		for _, plan := range plans {
+			paths = append(paths, plan.canonicalPath)
+		}
+		slog.InfoContext(ctx, "resuming orphaned indexing jobs", "count", len(plans), "paths", paths)
+	}
+	for _, plan := range plans {
+		client := model.ClientInfo{Name: "daemon-resume", PID: 0}
+		_, _, _, err := manager.StartIndex(ctx, plan.canonicalPath, client, plan.config, false)
+		if err != nil {
+			slog.ErrorContext(ctx, "resume orphaned job failed", "codebase_id", plan.codebaseID, "path", plan.canonicalPath, "err", err)
 		}
 	}
 }
@@ -394,10 +399,13 @@ func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath s
 			alreadyIndexed:   false,
 		}, nil
 	}
-	// A Failed (or Stale) last run always allows retry. Stream when the
-	// Milvus collection is still around so the existing rows get
-	// rewritten, otherwise bootstrap fresh.
-	if codebase.Status == model.CodebaseStatusFailed || codebase.Status == model.CodebaseStatusStale {
+	// Failed, Stale, or Indexing-without-an-active-job all allow a new
+	// indexing pass. The Indexing case is the daemon-restart resume path:
+	// the codebase was mid-flight when the previous process exited, so
+	// the resumed run streams into the existing collection (or bootstraps
+	// when Milvus is empty).
+	switch codebase.Status {
+	case model.CodebaseStatusFailed, model.CodebaseStatusStale, model.CodebaseStatusIndexing:
 		return startIndexDecision{
 			codebase:         codebase,
 			activeJob:        emptyJob,
@@ -405,6 +413,7 @@ func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath s
 			streamingReindex: hasCollection,
 			alreadyIndexed:   false,
 		}, nil
+	case model.CodebaseStatusIndexed, model.CodebaseStatusNotIndexed:
 	}
 	indexed := codebase.Status == model.CodebaseStatusIndexed || hasCollection
 	if !indexed {
@@ -1020,18 +1029,26 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 // deltaPlan packages the file-set decision for one runDeltaSync invocation.
 // fallback=true signals "no usable previous snapshot, route through full
 // Replace instead". handled=true signals the helper already terminated the
-// job (cancellation, snapshot-capture failure, or a no-op completion).
+// job (cancellation, snapshot-capture failure, or a no-op completion). The
+// seedSnapshot is the previous on-disk checkpoint loaded under the
+// requested ConfigDigest so the per-file loop can skip files already
+// embedded by a prior crashed run.
 type deltaPlan struct {
 	diff            merkle.Diff
 	currentSnapshot merkle.Snapshot
+	seedSnapshot    merkle.Snapshot
+	configDigest    string
 	fallback        bool
 	handled         bool
 }
 
 // planStreamingReindex captures a fresh merkle snapshot and synthesizes a
-// diff where every discovered file counts as "modified". This is the
-// "upgrade splitter granularity without dropping the collection" path.
-func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job) deltaPlan {
+// diff where every discovered file counts as "modified". The streaming
+// path also loads the previous checkpoint so the per-file loop can skip
+// any file whose content hash is already recorded under the same config.
+func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
+	configDigest := job.Config.IgnoreDigest
+	seed := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest)
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1041,7 +1058,9 @@ func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job)
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
-			currentSnapshot: merkle.Snapshot{Files: nil},
+			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil},
+			seedSnapshot:    seed,
+			configDigest:    configDigest,
 			fallback:        false,
 			handled:         true,
 		}
@@ -1054,26 +1073,22 @@ func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job)
 	return deltaPlan{
 		diff:            merkle.Diff{Added: nil, Modified: modifiedFiles, Removed: nil},
 		currentSnapshot: captured,
+		seedSnapshot:    seed,
+		configDigest:    configDigest,
 		fallback:        false,
 		handled:         false,
 	}
 }
 
-// planSyncDiff reads the previous snapshot, captures the current one, and
-// returns the diff. An empty diff completes the job here as a no-op tagged
-// "already up to date".
+// planSyncDiff loads the previous snapshot under the requested config
+// digest, captures the current one, and returns the diff. An empty diff
+// completes the job as a no-op. A missing snapshot produces an empty seed
+// whose diff classifies every file as Added, which the per-file loop
+// handles uniformly.
 func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
+	configDigest := job.Config.IgnoreDigest
 	snapshotPath := manager.merklePath(codebaseID)
-	previousSnapshot, snapshotErr := merkle.ReadSnapshot(snapshotPath)
-	if snapshotErr != nil {
-		slog.WarnContext(ctx, "no previous merkle snapshot for sync; falling back to full reindex", "path", snapshotPath, "err", snapshotErr)
-		return deltaPlan{
-			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
-			currentSnapshot: merkle.Snapshot{Files: nil},
-			fallback:        true,
-			handled:         false,
-		}
-	}
+	seed := merkle.LoadSnapshotForConfig(snapshotPath, configDigest)
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1083,12 +1098,14 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
-			currentSnapshot: merkle.Snapshot{Files: nil},
+			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil},
+			seedSnapshot:    seed,
+			configDigest:    configDigest,
 			fallback:        false,
 			handled:         true,
 		}
 	}
-	diff := merkle.DiffSnapshots(previousSnapshot, captured)
+	diff := merkle.DiffSnapshots(seed, captured)
 	if diff.Empty() {
 		manager.updateJobCompleted(job.ID, indexer.Result{
 			IndexedFiles: 0,
@@ -1100,6 +1117,8 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 		return deltaPlan{
 			diff:            diff,
 			currentSnapshot: captured,
+			seedSnapshot:    seed,
+			configDigest:    configDigest,
 			fallback:        false,
 			handled:         true,
 		}
@@ -1107,6 +1126,8 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 	return deltaPlan{
 		diff:            diff,
 		currentSnapshot: captured,
+		seedSnapshot:    seed,
+		configDigest:    configDigest,
 		fallback:        false,
 		handled:         false,
 	}
@@ -1122,6 +1143,22 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 // "streaming_reindex" treats every discovered file as modified and feeds
 // the list through semantic.Reindex so the Milvus collection stays
 // populated row-by-row while the splitter upgrade runs.
+// deltaOutcome reports what happened inside a runDeltaSync step.
+// fallback=true tells the caller to drop to full Replace. handled=true
+// means the step terminated the job (failed, cancelled, or progressed
+// normally and the caller should not run later steps).
+type deltaOutcome struct {
+	fallback bool
+	handled  bool
+}
+
+type deltaState struct {
+	plan         deltaPlan
+	snapshotPath string
+	working      map[string]string
+	semantic     bool
+}
+
 func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 	manager.mu.Lock()
 	codebase, codebaseFound := manager.codebases[job.CodebaseID]
@@ -1130,85 +1167,198 @@ func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 		return false
 	}
 
-	var plan deltaPlan
-	if jobOperation(job.Operation) == jobOperationStreamingReindex {
-		plan = manager.planStreamingReindex(ctx, job)
-	} else {
-		plan = manager.planSyncDiff(ctx, job, codebase.ID)
-	}
+	streamingReindex := jobOperation(job.Operation) == jobOperationStreamingReindex
+	plan := manager.computeDeltaPlan(ctx, job, codebase.ID, streamingReindex)
 	if plan.fallback {
 		return false
 	}
 	if plan.handled {
 		return true
 	}
-	diff := plan.diff
-	currentSnapshot := plan.currentSnapshot
 
-	changedFiles := append([]string{}, diff.Added...)
-	changedFiles = append(changedFiles, diff.Modified...)
+	state := deltaState{
+		plan:         plan,
+		snapshotPath: manager.merklePath(codebase.ID),
+		working:      make(map[string]string, len(plan.seedSnapshot.Files)),
+		semantic:     manager.semantic != nil && manager.semantic.Available(),
+	}
+	maps.Copy(state.working, plan.seedSnapshot.Files)
 
-	result, err := manager.runner.IndexFiles(ctx, job.CanonicalPath, changedFiles, job.Config, func(progress indexer.Progress) {
-		manager.updateJobProgress(job.ID, progress)
-	})
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
-			return true
-		}
-		manager.updateJobFailed(job.ID, err)
+	if outcome := manager.applyDeltaRemovals(ctx, job, state); outcome.fallback {
+		return false
+	} else if outcome.handled {
 		return true
 	}
 
-	if manager.semantic != nil && manager.semantic.Available() {
-		removedOrModified := append([]string{}, diff.Removed...)
-		removedOrModified = append(removedOrModified, diff.Modified...)
+	result, outcome := manager.applyDeltaChanges(ctx, job, state)
+	if outcome.fallback {
+		return false
+	}
+	if outcome.handled {
+		return true
+	}
 
-		err = manager.semantic.Reindex(ctx, job.CanonicalPath, result.Chunks, removedOrModified, func(progress semantic.Progress) {
-			manager.updateJobSemanticProgress(job.ID, progress)
-		})
-		switch {
-		case errors.Is(err, semantic.ErrCollectionMissing):
-			slog.WarnContext(ctx, "semantic collection missing during delta sync; falling back to full reindex", "job_id", job.ID)
-			return false
-		case errors.Is(err, context.Canceled):
-			manager.updateJobCancelled(job.ID)
+	if streamingReindex && state.semantic {
+		if outcome := manager.pruneAfterStreaming(ctx, job, plan.currentSnapshot); outcome.handled {
 			return true
-		case err != nil:
-			manager.updateJobFailed(job.ID, err)
-			return true
-		}
-
-		// A streaming reindex synthesizes its diff from the current file
-		// walk and has no record of files removed since the last
-		// indexing pass. Drop any rows whose relativePath is outside the
-		// current file set so the collection matches the working tree.
-		if jobOperation(job.Operation) == jobOperationStreamingReindex {
-			currentPaths := make([]string, 0, len(currentSnapshot.Files))
-			for relativePath := range currentSnapshot.Files {
-				currentPaths = append(currentPaths, relativePath)
-			}
-			sort.Strings(currentPaths)
-			if pruneErr := manager.semantic.PruneToCurrent(ctx, job.CanonicalPath, currentPaths); pruneErr != nil {
-				switch {
-				case errors.Is(pruneErr, context.Canceled):
-					manager.updateJobCancelled(job.ID)
-					return true
-				case errors.Is(pruneErr, semantic.ErrCollectionMissing):
-					slog.WarnContext(ctx, "semantic collection missing during streaming prune", "job_id", job.ID)
-				default:
-					manager.updateJobFailed(job.ID, pruneErr)
-					return true
-				}
-			}
 		}
 	}
 
-	mergedHashes := make(map[string]string, len(currentSnapshot.Files))
-	maps.Copy(mergedHashes, currentSnapshot.Files)
-	result.FileHashes = mergedHashes
+	result.FileHashes = state.working
 	manager.updateJobCompleted(job.ID, result)
 	return true
+}
+
+func (manager *Manager) computeDeltaPlan(ctx context.Context, job model.Job, codebaseID string, streamingReindex bool) deltaPlan {
+	if streamingReindex {
+		return manager.planStreamingReindex(ctx, job, codebaseID)
+	}
+	return manager.planSyncDiff(ctx, job, codebaseID)
+}
+
+func (manager *Manager) applyDeltaRemovals(ctx context.Context, job model.Job, state deltaState) deltaOutcome {
+	removed := state.plan.diff.Removed
+	if len(removed) == 0 || !state.semantic {
+		return deltaOutcome{fallback: false, handled: false}
+	}
+	if err := manager.semantic.Reindex(ctx, job.CanonicalPath, nil, removed, nil); err != nil {
+		return manager.classifyReindexErr(ctx, job, err, "delta removal")
+	}
+	for _, path := range removed {
+		delete(state.working, path)
+	}
+	manager.writeCheckpoint(ctx, state, "removals")
+	return deltaOutcome{fallback: false, handled: false}
+}
+
+func (manager *Manager) applyDeltaChanges(ctx context.Context, job model.Job, state deltaState) (indexer.Result, deltaOutcome) {
+	changed := make([]string, 0, len(state.plan.diff.Added)+len(state.plan.diff.Modified))
+	changed = append(changed, state.plan.diff.Added...)
+	changed = append(changed, state.plan.diff.Modified...)
+
+	totalChanged := len(changed)
+	totalFiles := safeInt32(totalChanged)
+	result := indexer.Result{
+		IndexedFiles: 0,
+		TotalChunks:  0,
+		Chunks:       make([]model.StoredChunk, 0),
+		FileHashes:   nil,
+		SkippedFiles: []string{},
+	}
+	for index, relativePath := range changed {
+		if err := ctx.Err(); err != nil {
+			manager.updateJobCancelled(job.ID)
+			return result, deltaOutcome{fallback: false, handled: true}
+		}
+		if seedHash, present := state.plan.seedSnapshot.Files[relativePath]; present && seedHash == state.plan.currentSnapshot.Files[relativePath] {
+			state.working[relativePath] = seedHash
+			manager.reportDeltaProgress(job.ID, index, totalChanged, totalFiles, result.TotalChunks)
+			continue
+		}
+		outcome := manager.handleChangedFile(ctx, job, state, relativePath, &result)
+		if outcome.fallback || outcome.handled {
+			return result, outcome
+		}
+		manager.writeCheckpoint(ctx, state, relativePath)
+		manager.reportDeltaProgress(job.ID, index, totalChanged, totalFiles, result.TotalChunks)
+	}
+	return result, deltaOutcome{fallback: false, handled: false}
+}
+
+func (manager *Manager) handleChangedFile(ctx context.Context, job model.Job, state deltaState, relativePath string, result *indexer.Result) deltaOutcome {
+	fileResult, err := manager.runner.IndexOne(ctx, job.CanonicalPath, relativePath, job.Config)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+		} else {
+			manager.updateJobFailed(job.ID, err)
+		}
+		return deltaOutcome{fallback: false, handled: true}
+	}
+	if fileResult.Skipped {
+		result.SkippedFiles = append(result.SkippedFiles, relativePath)
+		return deltaOutcome{fallback: false, handled: false}
+	}
+	if state.semantic {
+		if err := manager.semantic.Reindex(ctx, job.CanonicalPath, fileResult.Chunks, []string{relativePath}, nil); err != nil {
+			return manager.classifyReindexErr(ctx, job, err, "per-file reindex")
+		}
+	}
+	state.working[relativePath] = fileResult.FileHash
+	result.Chunks = append(result.Chunks, fileResult.Chunks...)
+	result.TotalChunks += safeInt32(len(fileResult.Chunks))
+	result.IndexedFiles++
+	return deltaOutcome{fallback: false, handled: false}
+}
+
+func (manager *Manager) classifyReindexErr(ctx context.Context, job model.Job, err error, phase string) deltaOutcome {
+	switch {
+	case errors.Is(err, semantic.ErrCollectionMissing):
+		slog.WarnContext(ctx, "semantic collection missing; falling back to full reindex", "job_id", job.ID, "phase", phase)
+		return deltaOutcome{fallback: true, handled: false}
+	case errors.Is(err, context.Canceled):
+		manager.updateJobCancelled(job.ID)
+		return deltaOutcome{fallback: false, handled: true}
+	default:
+		manager.updateJobFailed(job.ID, err)
+		return deltaOutcome{fallback: false, handled: true}
+	}
+}
+
+func (manager *Manager) writeCheckpoint(ctx context.Context, state deltaState, label string) {
+	snapshot := merkle.Snapshot{ConfigDigest: state.plan.configDigest, Files: state.working}
+	if err := merkle.WriteSnapshot(state.snapshotPath, snapshot); err != nil {
+		slog.ErrorContext(ctx, "checkpoint write failed", "path", state.snapshotPath, "label", label, "err", err)
+	}
+}
+
+func (manager *Manager) reportDeltaProgress(jobID string, index int, totalChanged int, totalFiles int32, totalChunks int32) {
+	manager.updateJobProgress(jobID, indexer.Progress{
+		Phase:           "Reindexing changed files...",
+		OverallPercent:  10 + (float64(index+1)/float64(maxInt(totalChanged, 1)))*90,
+		FilesTotal:      totalFiles,
+		FilesProcessed:  safeInt32(index + 1),
+		ChunksGenerated: totalChunks,
+	})
+}
+
+func (manager *Manager) pruneAfterStreaming(ctx context.Context, job model.Job, currentSnapshot merkle.Snapshot) deltaOutcome {
+	currentPaths := make([]string, 0, len(currentSnapshot.Files))
+	for relativePath := range currentSnapshot.Files {
+		currentPaths = append(currentPaths, relativePath)
+	}
+	sort.Strings(currentPaths)
+	if err := manager.semantic.PruneToCurrent(ctx, job.CanonicalPath, currentPaths); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			manager.updateJobCancelled(job.ID)
+			return deltaOutcome{fallback: false, handled: true}
+		case errors.Is(err, semantic.ErrCollectionMissing):
+			slog.WarnContext(ctx, "semantic collection missing during streaming prune", "job_id", job.ID)
+		default:
+			manager.updateJobFailed(job.ID, err)
+			return deltaOutcome{fallback: false, handled: true}
+		}
+	}
+	return deltaOutcome{fallback: false, handled: false}
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// safeInt32 clamps int to int32 for protobuf-bound progress fields.
+func safeInt32(value int) int32 {
+	if value > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if value < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(value)
 }
 
 func (manager *Manager) updateJobRunning(job model.Job) {
@@ -1324,7 +1474,7 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 		slog.Error("write chunk cache failed", "job_id", jobID, "err", err)
 	}
 	if len(result.FileHashes) != 0 {
-		snapshot := merkle.Snapshot{Files: result.FileHashes}
+		snapshot := merkle.Snapshot{ConfigDigest: codebase.EffectiveConfig.IgnoreDigest, Files: result.FileHashes}
 		if err := merkle.WriteSnapshot(codebase.MerkleSnapshotPath, snapshot); err != nil {
 			slog.Error("write Merkle snapshot failed", "job_id", jobID, "err", err)
 		}
@@ -1546,10 +1696,17 @@ func pathCovers(rootPath string, targetPath string) bool {
 	return strings.HasPrefix(targetPath, prefixWithSeparator)
 }
 
+// digestIndexConfig hashes the indexing-relevant fields of an IndexConfig.
+// The IgnoreDigest field itself is excluded from the hash input so the
+// digest is stable across runs: re-hashing a stored EffectiveConfig
+// produces the same value, which the merkle snapshot's ConfigDigest match
+// relies on for resume.
 func digestIndexConfig(indexConfig model.IndexConfig) string {
-	digestBytes, err := json.Marshal(indexConfig)
+	hashable := indexConfig
+	hashable.IgnoreDigest = ""
+	digestBytes, err := json.Marshal(hashable)
 	if err != nil {
-		digest := sha256.Sum256([]byte(indexConfig.SplitterType + indexConfig.IgnoreDigest))
+		digest := sha256.Sum256([]byte(hashable.SplitterType))
 		return "sha256:" + hex.EncodeToString(digest[:])
 	}
 	digest := sha256.Sum256(digestBytes)

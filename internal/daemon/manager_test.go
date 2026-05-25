@@ -17,6 +17,7 @@ import (
 	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/indexer"
+	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/store"
 )
@@ -24,6 +25,7 @@ import (
 type fakeRunner struct {
 	index      func(context.Context, string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
 	indexFiles func(context.Context, string, []string, model.IndexConfig, func(indexer.Progress)) (indexer.Result, error)
+	indexOne   func(context.Context, string, string, model.IndexConfig) (indexer.OneFileResult, error)
 }
 
 func (runner fakeRunner) Index(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
@@ -35,6 +37,13 @@ func (runner fakeRunner) IndexFiles(ctx context.Context, root string, relativePa
 		return runner.indexFiles(ctx, root, relativePaths, indexConfig, progress)
 	}
 	return runner.index(ctx, root, indexConfig, progress)
+}
+
+func (runner fakeRunner) IndexOne(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+	if runner.indexOne != nil {
+		return runner.indexOne(ctx, root, relativePath, indexConfig)
+	}
+	return indexer.OneFileResult{Skipped: true}, nil
 }
 
 func TestGetIndexNotTrackedReturnsFriendlyStatus(t *testing.T) {
@@ -215,26 +224,19 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 
 	release := make(chan struct{})
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			progress(indexer.Progress{
-				Phase:           "Processing files and generating embeddings...",
-				OverallPercent:  42.5,
-				FilesTotal:      10,
-				FilesProcessed:  4,
-				ChunksGenerated: 1,
-			})
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			<-release
-			return indexer.Result{
-				IndexedFiles: 2,
-				TotalChunks:  1,
+			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{{
 					Content:       "func SearchableThing() {}\n// replacement\n",
-					RelativePath:  "main.go",
+					RelativePath:  relativePath,
 					StartLine:     1,
 					EndLine:       2,
 					Language:      "go",
 					FileExtension: ".go",
 				}},
+				FileHash: hashText("force reindex"),
+				Skipped:  false,
 			}, nil
 		},
 	}
@@ -246,14 +248,14 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 	if reindexJob.ID == initialJob.ID {
 		t.Fatal("force reindex reused the previous job id")
 	}
-	waitForProgress(t, manager, repoPath, 42.5)
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexing)
 
 	server := NewGRPCServer(manager, nil)
 	statusResponse, err := server.GetIndex(context.Background(), &pb.GetIndexRequest{Path: repoPath})
 	if err != nil {
 		t.Fatalf("GetIndex returned error: %v", err)
 	}
-	if !strings.Contains(statusResponse.GetDisplayText(), "42.5%") {
+	if !strings.Contains(statusResponse.GetDisplayText(), "currently being indexed") {
 		t.Fatalf("GetIndex returned unexpected status text: %q", statusResponse.GetDisplayText())
 	}
 
@@ -270,9 +272,6 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 	}
 	if !strings.HasPrefix(searchResponse.GetDisplayText(), "⚠️  **Indexing in Progress**") {
 		t.Fatalf("SearchCode returned unexpected warning text: %q", searchResponse.GetDisplayText())
-	}
-	if !strings.Contains(searchResponse.GetDisplayText(), "42.5%") {
-		t.Fatalf("SearchCode returned unexpected progress text: %q", searchResponse.GetDisplayText())
 	}
 	if !strings.Contains(searchResponse.GetDisplayText(), "🔁 Retry suggestion") {
 		t.Fatalf("SearchCode response missing retry suggestion: %q", searchResponse.GetDisplayText())
@@ -449,20 +448,19 @@ func TestStartIndexStreamingReindexUpgradesSplitterInPlace(t *testing.T) {
 				FileHashes: map[string]string{"main.go": hashText(content)},
 			}, nil
 		},
-		indexFiles: func(ctx context.Context, root string, relativePaths []string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			indexFilesCalls.Add(1)
 			fileMu.Lock()
-			observedFiles = append([]string{}, relativePaths...)
+			observedFiles = append(observedFiles, relativePath)
 			fileMu.Unlock()
 			content := "package main\nfunc main() {}\n"
-			return indexer.Result{
-				IndexedFiles: 1,
-				TotalChunks:  2,
+			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{
-					{Content: content, RelativePath: "main.go", StartLine: 1, EndLine: 1, Language: "go", FileExtension: ".go"},
-					{Content: content, RelativePath: "main.go", StartLine: 2, EndLine: 2, Language: "go", FileExtension: ".go"},
+					{Content: content, RelativePath: relativePath, StartLine: 1, EndLine: 1, Language: "go", FileExtension: ".go"},
+					{Content: content, RelativePath: relativePath, StartLine: 2, EndLine: 2, Language: "go", FileExtension: ".go"},
 				},
-				FileHashes: map[string]string{"main.go": hashText(content)},
+				FileHash: hashText(content),
+				Skipped:  false,
 			}, nil
 		},
 	}
@@ -489,7 +487,7 @@ func TestStartIndexStreamingReindexUpgradesSplitterInPlace(t *testing.T) {
 	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
 
 	if indexFilesCalls.Load() == 0 {
-		t.Fatal("IndexFiles was never called; streaming reindex should walk the codebase via IndexFiles")
+		t.Fatal("IndexOne was never called; streaming reindex should walk the codebase file by file")
 	}
 	fileMu.Lock()
 	finalObservedFiles := append([]string{}, observedFiles...)
@@ -507,6 +505,175 @@ func TestStartIndexStreamingReindexUpgradesSplitterInPlace(t *testing.T) {
 	}
 	if codebase.EffectiveConfig.SplitterType != "ast" {
 		t.Fatalf("EffectiveConfig.SplitterType = %q after streaming reindex, want %q", codebase.EffectiveConfig.SplitterType, "ast")
+	}
+}
+
+// TestRunDeltaSyncCheckpointsPerFile proves the merkle snapshot grows file
+// by file as the streaming reindex makes progress. A daemon crash between
+// any two file embeds leaves a partial snapshot on disk that the next run
+// reads as the resume seed.
+func TestRunDeltaSyncCheckpointsPerFile(t *testing.T) {
+	t.Parallel()
+
+	manager, cfg, repoPath := newTestManager(t)
+	extras := []string{"a.go", "b.go", "c.go", "d.go"}
+	for _, name := range extras {
+		path := filepath.Join(repoPath, name)
+		if err := os.WriteFile(path, []byte("package main\n// "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
+	embedCalls := atomic.Int32{}
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 5,
+				TotalChunks:  5,
+				Chunks: []model.StoredChunk{{
+					Content:       "initial",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: map[string]string{
+					"main.go": hashText("main"),
+					"a.go":    hashText("a.go"),
+					"b.go":    hashText("b.go"),
+					"c.go":    hashText("c.go"),
+					"d.go":    hashText("d.go"),
+				},
+			}, nil
+		},
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			embedCalls.Add(1)
+			content := "package main\n// " + relativePath + "\n"
+			return indexer.OneFileResult{
+				Chunks: []model.StoredChunk{{
+					Content:       content,
+					RelativePath:  relativePath,
+					StartLine:     1,
+					EndLine:       2,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHash: hashText(content),
+				Skipped:  false,
+			}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Force a streaming reindex by passing force=true (matching config).
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), true); err != nil {
+		t.Fatalf("streaming StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil || !found {
+		t.Fatalf("GetIndex returned err=%v found=%v", err, found)
+	}
+	snapshotPath := filepath.Join(cfg.MerkleDir, codebase.ID+".json")
+	snapshot, err := merkle.ReadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatalf("ReadSnapshot returned error: %v", err)
+	}
+	if snapshot.ConfigDigest != codebase.EffectiveConfig.IgnoreDigest {
+		t.Fatalf("snapshot ConfigDigest=%q want=%q", snapshot.ConfigDigest, codebase.EffectiveConfig.IgnoreDigest)
+	}
+	for _, name := range []string{"main.go", "a.go", "b.go", "c.go", "d.go"} {
+		if _, present := snapshot.Files[name]; !present {
+			t.Fatalf("snapshot missing %s; have %v", name, snapshot.Files)
+		}
+	}
+	if got := embedCalls.Load(); got != 5 {
+		t.Fatalf("indexOne calls = %d, want 5", got)
+	}
+}
+
+// TestRunDeltaSyncInvalidatesSnapshotOnConfigChange proves a stale snapshot
+// (different ConfigDigest) is treated as empty so every file gets
+// re-embedded under the new config.
+func TestRunDeltaSyncInvalidatesSnapshotOnConfigChange(t *testing.T) {
+	t.Parallel()
+
+	manager, cfg, repoPath := newTestManager(t)
+	indexedCount := atomic.Int32{}
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 1,
+				TotalChunks:  1,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: map[string]string{"main.go": hashText("main.go")},
+			}, nil
+		},
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			indexedCount.Add(1)
+			content := "package main\nfunc Upgraded() {}\n"
+			return indexer.OneFileResult{
+				Chunks: []model.StoredChunk{{
+					Content:       content,
+					RelativePath:  relativePath,
+					StartLine:     1,
+					EndLine:       2,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHash: hashText(content),
+				Skipped:  false,
+			}, nil
+		},
+	}
+
+	initialConfig := defaultIndexConfig()
+	initialConfig.SplitterType = "langchain"
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), initialConfig, false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil || !found {
+		t.Fatalf("GetIndex returned err=%v found=%v", err, found)
+	}
+	snapshotPath := filepath.Join(cfg.MerkleDir, codebase.ID+".json")
+	firstSnapshot, err := merkle.ReadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatalf("ReadSnapshot returned error: %v", err)
+	}
+	firstDigest := firstSnapshot.ConfigDigest
+
+	upgradedConfig := defaultIndexConfig()
+	upgradedConfig.SplitterType = "ast"
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), upgradedConfig, false); err != nil {
+		t.Fatalf("upgrade StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	secondSnapshot, err := merkle.ReadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatalf("ReadSnapshot returned error: %v", err)
+	}
+	if secondSnapshot.ConfigDigest == firstDigest {
+		t.Fatalf("ConfigDigest did not change after splitter switch: %q", secondSnapshot.ConfigDigest)
+	}
+	if got := indexedCount.Load(); got == 0 {
+		t.Fatal("indexOne was never called; expected the digest mismatch to force re-embed")
 	}
 }
 
@@ -584,35 +751,27 @@ func TestSyncIndexStartsFreshJobForChangedCodebase(t *testing.T) {
 
 	release := make(chan struct{})
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			changedContent := "package main\nfunc SearchableThing() { println(\"changed\") }\n"
-			progress(indexer.Progress{
-				Phase:           "Processing files and generating embeddings...",
-				OverallPercent:  55,
-				FilesTotal:      1,
-				FilesProcessed:  1,
-				ChunksGenerated: 1,
-			})
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			<-release
-			return indexer.Result{
-				IndexedFiles: 1,
-				TotalChunks:  1,
+			changedContent := "package main\nfunc SearchableThing() { println(\"changed\") }\n"
+			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{{
 					Content:       changedContent,
-					RelativePath:  "main.go",
+					RelativePath:  relativePath,
 					StartLine:     1,
 					EndLine:       2,
 					Language:      "go",
 					FileExtension: ".go",
 				}},
-				FileHashes: map[string]string{"main.go": hashText(changedContent)},
+				FileHash: hashText(changedContent),
+				Skipped:  false,
 			}, nil
 		},
 	}
 
 	syncer := NewBackgroundSync(cfg, manager)
 	syncer.runSyncAll(context.Background(), "test")
-	waitForProgress(t, manager, repoPath, 55)
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexing)
 
 	codebase, activeJob, found, err := manager.GetIndex(context.Background(), repoPath)
 	if err != nil {
