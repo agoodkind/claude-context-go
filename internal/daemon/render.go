@@ -93,7 +93,7 @@ func renderGetIndex(requestedPath string, tracked bool, codebase *model.Codebase
 		if codebase.LastSuccessfulRun == nil {
 			return fmt.Sprintf("✅ Codebase '%s' is fully indexed and ready for search.", codebase.CanonicalPath)
 		}
-		return fmt.Sprintf(
+		base := fmt.Sprintf(
 			"✅ Codebase '%s' is fully indexed and ready for search.\n📊 Statistics: %d files, %d chunks\n📅 Status: %s\n🕐 Last updated: %s",
 			codebase.CanonicalPath,
 			codebase.LastSuccessfulRun.IndexedFiles,
@@ -101,6 +101,10 @@ func renderGetIndex(requestedPath string, tracked bool, codebase *model.Codebase
 			orDefault(codebase.LastSuccessfulRun.Status, "completed"),
 			formatLocalTime(codebase.LastSuccessfulRun.CompletedAt),
 		)
+		if skipLine := renderSkippedFiles(codebase.LastSuccessfulRun.SkippedFiles); skipLine != "" {
+			base += "\n" + skipLine
+		}
+		return base
 	case model.CodebaseStatusIndexing:
 		progress := 0.0
 		lastUpdated := codebase.UpdatedAt
@@ -224,6 +228,22 @@ func renderSearch(view searchView) string {
 		return body
 	}
 	return warning + "\n\n" + body + "\n\n" + searchIndexingTip
+}
+
+// renderSkippedFiles formats the per-run skipped-file summary for the
+// human-facing GetIndex view. The first few paths are listed inline so the
+// operator can spot the culprits without grepping the daemon log.
+func renderSkippedFiles(skipped []string) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	const maxPreview = 3
+	previewLimit := min(len(skipped), maxPreview)
+	preview := strings.Join(skipped[:previewLimit], ", ")
+	if len(skipped) > maxPreview {
+		preview += fmt.Sprintf(", ... (+%d more)", len(skipped)-maxPreview)
+	}
+	return fmt.Sprintf("⏭️  Skipped: %d non-UTF-8 file(s): %s", len(skipped), preview)
 }
 
 func progressPhaseSuffix(progress float64) string {

@@ -58,6 +58,7 @@ func ToCodebase(codebase model.Codebase) *pb.Codebase {
 			TotalChunks:  codebase.LastSuccessfulRun.TotalChunks,
 			Status:       codebase.LastSuccessfulRun.Status,
 			CompletedAt:  ts(codebase.LastSuccessfulRun.CompletedAt),
+			SkippedFiles: append([]string{}, codebase.LastSuccessfulRun.SkippedFiles...),
 		}
 	}
 	if codebase.LastFailedRun != nil {

@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 
 	"goodkind.io/claude-context-go/internal/discovery"
 	"goodkind.io/claude-context-go/internal/model"
@@ -22,11 +23,17 @@ type Runner struct {
 }
 
 // Result captures file and chunk totals for one indexing pass.
+//
+// SkippedFiles names files whose bytes are not valid UTF-8. Milvus requires
+// every VarChar field to be valid UTF-8 on the gRPC wire, so embedding such
+// a file marshal-fails and rolls back the entire batch. The indexer reports
+// these paths to the operator.
 type Result struct {
 	IndexedFiles int32
 	TotalChunks  int32
 	Chunks       []model.StoredChunk
 	FileHashes   map[string]string
+	SkippedFiles []string
 }
 
 // Progress describes one visible indexing progress update.
@@ -43,6 +50,42 @@ func NewRunner() *Runner {
 	return &Runner{
 		dispatcher: splitter.NewDispatcher(),
 	}
+}
+
+// processedFile is the per-file output of one splitter pass. Skipped=true
+// means the file's bytes are not valid UTF-8; Chunks and FileHash are then
+// empty and callers add the path to Result.SkippedFiles.
+type processedFile struct {
+	Chunks   []model.StoredChunk
+	FileHash string
+	Skipped  bool
+}
+
+// processFile splits one file into chunks. When the file's bytes are not
+// valid UTF-8 the splitter is skipped and Skipped=true is returned. Milvus
+// rejects non-UTF-8 VarChar payloads at the gRPC marshal boundary, so the
+// skip happens at the indexer boundary.
+func (runner *Runner) processFile(ctx context.Context, fullPath string, relativePath string, data []byte, splitterType string) (processedFile, error) {
+	if !utf8.Valid(data) {
+		slog.WarnContext(ctx, "indexer.skipped_invalid_utf8", "path", relativePath, "bytes", len(data))
+		return processedFile{Chunks: nil, FileHash: "", Skipped: true}, nil
+	}
+	splitResult, err := runner.dispatcher.SplitFileWithType(ctx, fullPath, data, splitterType)
+	if err != nil {
+		return processedFile{}, fmt.Errorf("split source file %s: %w", fullPath, err)
+	}
+	chunks := make([]model.StoredChunk, 0, len(splitResult.Chunks))
+	for _, chunk := range splitResult.Chunks {
+		chunks = append(chunks, model.StoredChunk{
+			Content:       chunk.Content,
+			RelativePath:  relativePath,
+			StartLine:     safeInt32(chunk.StartLine),
+			EndLine:       safeInt32(chunk.EndLine),
+			Language:      chunk.Language,
+			FileExtension: filepath.Ext(relativePath),
+		})
+	}
+	return processedFile{Chunks: chunks, FileHash: digestFileBytes(data), Skipped: false}, nil
 }
 
 // Index walks the codebase and splits files into chunks.
@@ -75,8 +118,10 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 	}
 
 	var totalChunks int32
+	var indexedCount int32
 	storedChunks := make([]model.StoredChunk, 0)
 	fileHashes := make(map[string]string, len(discoveryResult.Files))
+	skippedFiles := []string{}
 	for index, path := range discoveryResult.Files {
 		if err := ctx.Err(); err != nil {
 			slog.ErrorContext(ctx, "indexing cancelled before file read", "path", path, "err", err)
@@ -87,27 +132,23 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 			slog.ErrorContext(ctx, "read source file failed", "path", path, "err", err)
 			return Result{}, fmt.Errorf("read source file %s: %w", path, err)
 		}
-		splitResult, err := runner.dispatcher.SplitFileWithType(ctx, path, data, indexConfig.SplitterType)
-		if err != nil {
-			slog.ErrorContext(ctx, "split source file failed", "path", path, "err", err)
-			return Result{}, fmt.Errorf("split source file %s: %w", path, err)
-		}
-		totalChunks += safeInt32(len(splitResult.Chunks))
 		relativePath, err := filepath.Rel(root, path)
 		if err != nil {
 			slog.ErrorContext(ctx, "compute relative chunk path failed", "root", root, "path", path, "err", err)
 			return Result{}, fmt.Errorf("compute relative chunk path for %s: %w", path, err)
 		}
-		fileHashes[relativePath] = digestFileBytes(data)
-		for _, chunk := range splitResult.Chunks {
-			storedChunks = append(storedChunks, model.StoredChunk{
-				Content:       chunk.Content,
-				RelativePath:  relativePath,
-				StartLine:     safeInt32(chunk.StartLine),
-				EndLine:       safeInt32(chunk.EndLine),
-				Language:      chunk.Language,
-				FileExtension: filepath.Ext(relativePath),
-			})
+		processed, err := runner.processFile(ctx, path, relativePath, data, indexConfig.SplitterType)
+		if err != nil {
+			slog.ErrorContext(ctx, "split source file failed", "path", path, "err", err)
+			return Result{}, err
+		}
+		if processed.Skipped {
+			skippedFiles = append(skippedFiles, relativePath)
+		} else {
+			totalChunks += safeInt32(len(processed.Chunks))
+			indexedCount++
+			fileHashes[relativePath] = processed.FileHash
+			storedChunks = append(storedChunks, processed.Chunks...)
 		}
 		if progress != nil {
 			progress(Progress{
@@ -131,10 +172,11 @@ func (runner *Runner) Index(ctx context.Context, root string, indexConfig model.
 	}
 
 	return Result{
-		IndexedFiles: safeInt32(len(discoveryResult.Files)),
+		IndexedFiles: indexedCount,
 		TotalChunks:  totalChunks,
 		Chunks:       storedChunks,
 		FileHashes:   fileHashes,
+		SkippedFiles: skippedFiles,
 	}, nil
 }
 
@@ -157,8 +199,10 @@ func (runner *Runner) IndexFiles(ctx context.Context, root string, relativePaths
 	}
 
 	var totalChunks int32
+	var indexedCount int32
 	storedChunks := make([]model.StoredChunk, 0)
 	fileHashes := make(map[string]string, len(relativePaths))
+	skippedFiles := []string{}
 	for index, relativePath := range relativePaths {
 		if err := ctx.Err(); err != nil {
 			slog.ErrorContext(ctx, "delta indexing cancelled before file read", "path", relativePath, "err", err)
@@ -170,22 +214,18 @@ func (runner *Runner) IndexFiles(ctx context.Context, root string, relativePaths
 			slog.ErrorContext(ctx, "read changed file failed", "path", fullPath, "err", err)
 			return Result{}, fmt.Errorf("read changed file %s: %w", fullPath, err)
 		}
-		splitResult, err := runner.dispatcher.SplitFileWithType(ctx, fullPath, data, indexConfig.SplitterType)
+		processed, err := runner.processFile(ctx, fullPath, relativePath, data, indexConfig.SplitterType)
 		if err != nil {
 			slog.ErrorContext(ctx, "split changed file failed", "path", fullPath, "err", err)
-			return Result{}, fmt.Errorf("split changed file %s: %w", fullPath, err)
+			return Result{}, err
 		}
-		totalChunks += safeInt32(len(splitResult.Chunks))
-		fileHashes[relativePath] = digestFileBytes(data)
-		for _, chunk := range splitResult.Chunks {
-			storedChunks = append(storedChunks, model.StoredChunk{
-				Content:       chunk.Content,
-				RelativePath:  relativePath,
-				StartLine:     safeInt32(chunk.StartLine),
-				EndLine:       safeInt32(chunk.EndLine),
-				Language:      chunk.Language,
-				FileExtension: filepath.Ext(relativePath),
-			})
+		if processed.Skipped {
+			skippedFiles = append(skippedFiles, relativePath)
+		} else {
+			totalChunks += safeInt32(len(processed.Chunks))
+			indexedCount++
+			fileHashes[relativePath] = processed.FileHash
+			storedChunks = append(storedChunks, processed.Chunks...)
 		}
 		if progress != nil {
 			progress(Progress{
@@ -209,10 +249,11 @@ func (runner *Runner) IndexFiles(ctx context.Context, root string, relativePaths
 	}
 
 	return Result{
-		IndexedFiles: safeInt32(len(relativePaths)),
+		IndexedFiles: indexedCount,
 		TotalChunks:  totalChunks,
 		Chunks:       storedChunks,
 		FileHashes:   fileHashes,
+		SkippedFiles: skippedFiles,
 	}, nil
 }
 

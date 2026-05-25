@@ -29,7 +29,14 @@ corrective pass.
 10. Reindex only when needed and only with user permission. Use splitter: ast
     by default. Use splitter: langchain only as a user-approved diagnostic,
     since it can still produce one-chunk-per-file indexes or reduce coverage.
-11. Treat returned chunks as candidates. Read the cited files before acting
+11. If the existing index is coarse (roughly one chunk per file) and the user
+    wants finer-grained results, call index_codebase again with the desired
+    splitter (typically ast). The daemon replaces chunks file by file through
+    a streaming reindex, so the existing index keeps returning ranked results
+    throughout the upgrade. You do not need to clear the index first, and you
+    do not need force=true unless a job is already in flight with a
+    different config.
+12. Treat returned chunks as candidates. Read the cited files before acting
     because the working tree can be newer than the index.
 
 ## Subagent Instructions
@@ -54,6 +61,10 @@ wants that diagnostic.
 
 - search_code(path, query, limit?, extensionFilter?) returns ranked chunks.
 - get_indexing_status(path) reports status and file or chunk counts.
-- index_codebase(path, force?, splitter?) rebuilds the index.
+- index_codebase(path, force?, splitter?) bootstraps the index when the
+  codebase is not tracked, or runs a streaming reindex against the existing
+  Milvus collection when the codebase is already indexed with a different
+  config or when force=true. The streaming path replaces chunks file by file
+  so search results stay available throughout the upgrade.
 - clear_index(path) removes the index and should only be used when the user
-  explicitly wants a wipe or a splitter swap.
+  explicitly wants a full wipe.

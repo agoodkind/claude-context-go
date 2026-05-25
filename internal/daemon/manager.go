@@ -25,7 +25,25 @@ import (
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/semantic"
 	"goodkind.io/claude-context-go/internal/store"
-	"goodkind.io/claude-context-go/internal/tssnapshot"
+)
+
+// jobOperation tags one daemon job so runJob can route it to the right
+// execution path. The model.Job.Operation field is a plain string for wire
+// compatibility, but the daemon's internal switch uses this named type so
+// staticcheck can verify the dispatch covers every case.
+type jobOperation string
+
+const (
+	// jobOperationIndex runs a full Replace against an empty or
+	// previously-cleared collection.
+	jobOperationIndex jobOperation = "index"
+	// jobOperationSync runs an incremental delta against the existing
+	// merkle snapshot and falls back to full Replace when no snapshot exists.
+	jobOperationSync jobOperation = "sync"
+	// jobOperationStreamingReindex re-walks the entire codebase and
+	// replaces chunks file by file through semantic.Reindex, so the existing
+	// Milvus collection stays searchable across the upgrade.
+	jobOperationStreamingReindex jobOperation = "streaming_reindex"
 )
 
 // Manager coordinates persisted codebase and job state for the daemon.
@@ -93,42 +111,6 @@ func (manager *Manager) load() error {
 	}
 	maps.Copy(manager.jobs, jobs)
 	return nil
-}
-
-// resolveFromTSSnapshot synthesizes an in-memory model.Codebase for paths
-// the Go daemon does not own but that the upstream TS adapter already
-// indexed. The returned record is never persisted, never enters
-// manager.codebases, and is never visible to background sync. The synthesized
-// codebase routes GetIndex and SearchCode at the existing Milvus collection
-// because both adapters derive the collection name from the same MD5(path)
-// scheme; see tshash.PathPrefix.
-func (manager *Manager) resolveFromTSSnapshot(canonicalPath string, aliasPath string) (model.Codebase, bool) {
-	var emptyCodebase model.Codebase
-
-	snapshotPath, err := tssnapshot.Path(manager.config.ContextRoot)
-	if err != nil {
-		return emptyCodebase, false
-	}
-	entries, err := tssnapshot.Load(snapshotPath)
-	if err != nil || len(entries) == 0 {
-		return emptyCodebase, false
-	}
-
-	for _, candidatePath := range []string{canonicalPath, aliasPath} {
-		if candidatePath == "" {
-			continue
-		}
-		entry, found := entries[candidatePath]
-		if !found {
-			continue
-		}
-		codebase := tssnapshot.Synthesize(candidatePath, entry, manager.config.HybridMode)
-		if canonicalPath != "" && canonicalPath != candidatePath {
-			codebase.Aliases = append(codebase.Aliases, canonicalPath)
-		}
-		return codebase, true
-	}
-	return emptyCodebase, false
 }
 
 func (manager *Manager) saveLocked() error {
@@ -286,13 +268,101 @@ func newQueuedJob(
 	}
 }
 
+// startIndexDecision captures one StartIndex call's resolved codebase plus
+// the routing decision derived from the current registry state.
+type startIndexDecision struct {
+	codebase         model.Codebase
+	activeJob        model.Job
+	dedup            bool
+	streamingReindex bool
+	alreadyIndexed   bool
+}
+
+// decideStartIndexLocked resolves the codebase record for a StartIndex call
+// and decides whether to dedupe, refuse with "already indexed", or run a
+// streaming reindex against the existing collection. Caller must hold
+// manager.mu.
+// decideStartIndexLocked resolves the codebase record and routing decision
+// using the registry plus the caller-provided Milvus collection state.
+// Milvus is the source of truth for indexed state, so a registry miss with
+// hasCollection=true promotes the path to an indexed codebase that streams
+// the next reindex into the existing collection. Caller must hold
+// manager.mu.
+func (manager *Manager) decideStartIndexLocked(canonicalPath string, aliasPath string, indexConfig model.IndexConfig, force bool, hasCollection bool) (startIndexDecision, error) {
+	var emptyJob model.Job
+	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
+	if !found {
+		fresh := newCodebaseRecord(canonicalPath)
+		if hasCollection {
+			fresh.Status = model.CodebaseStatusIndexed
+			return startIndexDecision{
+				codebase:         fresh,
+				activeJob:        emptyJob,
+				dedup:            false,
+				streamingReindex: true,
+				alreadyIndexed:   false,
+			}, nil
+		}
+		return startIndexDecision{
+			codebase:         fresh,
+			activeJob:        emptyJob,
+			dedup:            false,
+			streamingReindex: false,
+			alreadyIndexed:   false,
+		}, nil
+	}
+	activeJob, deduplicated, err := manager.activeJobLocked(codebase, canonicalPath, indexConfig)
+	if err != nil {
+		return startIndexDecision{}, err
+	}
+	if deduplicated {
+		return startIndexDecision{
+			codebase:         codebase,
+			activeJob:        activeJob,
+			dedup:            true,
+			streamingReindex: false,
+			alreadyIndexed:   false,
+		}, nil
+	}
+	indexed := codebase.Status == model.CodebaseStatusIndexed || hasCollection
+	if !indexed {
+		return startIndexDecision{
+			codebase:         codebase,
+			activeJob:        emptyJob,
+			dedup:            false,
+			streamingReindex: false,
+			alreadyIndexed:   false,
+		}, nil
+	}
+	// Matching config with force=false maps to a no-op "already indexed"
+	// reply. Every other re-call streams into the existing collection so
+	// search keeps working across the upgrade.
+	if !force && codebase.EffectiveConfig.IgnoreDigest == indexConfig.IgnoreDigest {
+		return startIndexDecision{
+			codebase:         codebase,
+			activeJob:        emptyJob,
+			dedup:            false,
+			streamingReindex: false,
+			alreadyIndexed:   true,
+		}, nil
+	}
+	return startIndexDecision{
+		codebase:         codebase,
+		activeJob:        emptyJob,
+		dedup:            false,
+		streamingReindex: true,
+		alreadyIndexed:   false,
+	}, nil
+}
+
 // StartIndex registers a new indexing job or deduplicates an existing one.
 func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool) (model.Job, model.Codebase, bool, error) {
+	var emptyJob model.Job
+	var emptyCodebase model.Codebase
+
 	canonicalPath, aliasPath, err := canonicalizePath(requestedPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
-		var emptyJob model.Job
-		var emptyCodebase model.Codebase
 		return emptyJob, emptyCodebase, false, fmt.Errorf("canonicalize path %s: %w", requestedPath, err)
 	}
 
@@ -305,38 +375,38 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 
 	if force {
 		if err := manager.cancelActiveJobForPath(ctx, canonicalPath, aliasPath); err != nil {
-			var emptyJob model.Job
-			var emptyCodebase model.Codebase
 			return emptyJob, emptyCodebase, false, err
+		}
+	}
+
+	hasCollection := false
+	if manager.semantic != nil && manager.semantic.Available() {
+		present, hasErr := manager.semantic.HasCollectionForPath(ctx, canonicalPath)
+		if hasErr != nil {
+			slog.WarnContext(ctx, "Milvus HasCollection failed during StartIndex", "path", canonicalPath, "err", hasErr)
+		} else {
+			hasCollection = present
 		}
 	}
 
 	manager.mu.Lock()
 
-	codebase, found := manager.findCodebaseByPathLocked(canonicalPath, aliasPath)
-	if found {
-		activeJob, deduplicated, err := manager.activeJobLocked(codebase, canonicalPath, indexConfig)
-		if err != nil {
-			slog.ErrorContext(ctx, "resolve active job failed", "canonical_path", canonicalPath, "err", err)
-			manager.mu.Unlock()
-			var emptyJob model.Job
-			var emptyCodebase model.Codebase
-			return emptyJob, emptyCodebase, false, err
-		}
-		if deduplicated {
-			manager.mu.Unlock()
-			return activeJob, codebase, true, nil
-		}
-		if !force && codebase.Status == model.CodebaseStatusIndexed {
-			manager.mu.Unlock()
-			var emptyJob model.Job
-			var emptyCodebase model.Codebase
-			return emptyJob, emptyCodebase, false, errors.New("codebase already indexed: " + canonicalPath)
-		}
-	} else {
-		codebase = newCodebaseRecord(canonicalPath)
+	decision, err := manager.decideStartIndexLocked(canonicalPath, aliasPath, indexConfig, force, hasCollection)
+	if err != nil {
+		manager.mu.Unlock()
+		slog.ErrorContext(ctx, "resolve active job failed", "canonical_path", canonicalPath, "err", err)
+		return emptyJob, emptyCodebase, false, err
+	}
+	if decision.dedup {
+		manager.mu.Unlock()
+		return decision.activeJob, decision.codebase, true, nil
+	}
+	if decision.alreadyIndexed {
+		manager.mu.Unlock()
+		return emptyJob, emptyCodebase, false, errors.New("codebase already indexed: " + canonicalPath)
 	}
 
+	codebase := decision.codebase
 	codebase.Aliases = mergeAliases(codebase.Aliases, aliasPath, requestedPath, canonicalPath)
 	codebase.Status = model.CodebaseStatusIndexing
 	codebase.EffectiveConfig = indexConfig
@@ -346,20 +416,20 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 	codebase.UpdatedAt = clock.Now()
 
 	now := clock.Now()
-	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, "index", indexConfig, now)
+	operation := jobOperationIndex
+	if decision.streamingReindex {
+		operation = jobOperationStreamingReindex
+	}
+	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, string(operation), indexConfig, now)
 
 	codebase.ActiveJobID = job.ID
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
 		manager.mu.Unlock()
-		var emptyJob model.Job
-		var emptyCodebase model.Codebase
 		return emptyJob, emptyCodebase, false, err
 	}
 	if err := manager.appendJobLocked("start_index", job); err != nil {
 		manager.mu.Unlock()
-		var emptyJob model.Job
-		var emptyCodebase model.Codebase
 		return emptyJob, emptyCodebase, false, err
 	}
 	manager.mu.Unlock()
@@ -412,7 +482,7 @@ func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, cli
 	codebase.UpdatedAt = clock.Now()
 
 	now := clock.Now()
-	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, "sync", indexConfig, now)
+	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, string(jobOperationSync), indexConfig, now)
 
 	codebase.ActiveJobID = job.ID
 	manager.codebases[codebase.ID] = codebase
@@ -535,7 +605,10 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 	return job, nil
 }
 
-// GetIndex resolves one tracked codebase by canonical path or alias.
+// GetIndex resolves one tracked codebase by canonical path or alias. Milvus
+// is the source of truth for indexed state, so GetIndex returns Indexed for
+// any path whose Milvus collection exists, synthesizing a record when the
+// registry has no entry for it.
 func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (model.Codebase, *model.Job, bool, error) {
 	manager.reconcileIndexedCodebases(ctx)
 
@@ -554,12 +627,34 @@ func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (mod
 	}
 	manager.mu.Unlock()
 
-	if tsCodebase, tsFound := manager.resolveFromTSSnapshot(canonicalPath, aliasPath); tsFound {
-		return tsCodebase, nil, true, nil
+	if manager.semantic != nil && manager.semantic.Available() {
+		hasCollection, hasErr := manager.semantic.HasCollectionForPath(ctx, canonicalPath)
+		if hasErr == nil && hasCollection {
+			return manager.synthesizeUnregisteredCodebase(canonicalPath), nil, true, nil
+		}
+		if hasErr != nil {
+			slog.WarnContext(ctx, "Milvus HasCollection failed during GetIndex", "path", canonicalPath, "err", hasErr)
+		}
 	}
 
 	var emptyCodebase model.Codebase
 	return emptyCodebase, nil, false, nil
+}
+
+// synthesizeUnregisteredCodebase builds an in-memory codebase record from
+// the Milvus collection state for a path with no registry entry. The record
+// stays in-memory and lets GetIndex answer "indexed" from the shared data
+// store alone.
+func (manager *Manager) synthesizeUnregisteredCodebase(canonicalPath string) model.Codebase {
+	collectionName := ""
+	if manager.semantic != nil {
+		collectionName = manager.semantic.CollectionName(canonicalPath)
+	}
+	codebase := newCodebaseRecord(canonicalPath)
+	codebase.Status = model.CodebaseStatusIndexed
+	codebase.CollectionName = collectionName
+	codebase.EffectiveConfig.Hybrid = manager.config.HybridMode
+	return codebase
 }
 
 // ListIndexes returns every tracked codebase in canonical path order.
@@ -615,6 +710,30 @@ func (manager *Manager) Doctor() []string {
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			diagnostics = append(diagnostics, "missing path: "+path)
 		}
+	}
+
+	manager.mu.Lock()
+	codebases := make([]model.Codebase, 0, len(manager.codebases))
+	for _, codebase := range manager.codebases {
+		codebases = append(codebases, codebase)
+	}
+	manager.mu.Unlock()
+	sort.Slice(codebases, func(i int, j int) bool {
+		return codebases[i].CanonicalPath < codebases[j].CanonicalPath
+	})
+	for _, codebase := range codebases {
+		if codebase.LastSuccessfulRun == nil {
+			continue
+		}
+		skipped := len(codebase.LastSuccessfulRun.SkippedFiles)
+		if skipped == 0 {
+			continue
+		}
+		diagnostics = append(diagnostics, fmt.Sprintf(
+			"%s: %d non-UTF-8 file(s) skipped during last indexing run",
+			codebase.CanonicalPath,
+			skipped,
+		))
 	}
 	return diagnostics
 }
@@ -785,8 +904,15 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 
 	manager.updateJobRunning(job)
 
-	if job.Operation == "sync" && manager.runDeltaSync(ctx, job) {
+	switch jobOperation(job.Operation) {
+	case jobOperationSync:
+		if manager.runDeltaSync(ctx, job) {
+			return
+		}
+	case jobOperationStreamingReindex:
+		manager.runDeltaSync(ctx, job)
 		return
+	case jobOperationIndex:
 	}
 
 	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config, func(progress indexer.Progress) {
@@ -812,10 +938,113 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 	manager.updateJobCompleted(job.ID, result)
 }
 
+// deltaPlan packages the file-set decision for one runDeltaSync invocation.
+// fallback=true signals "no usable previous snapshot, route through full
+// Replace instead". handled=true signals the helper already terminated the
+// job (cancellation, snapshot-capture failure, or a no-op completion).
+type deltaPlan struct {
+	diff            merkle.Diff
+	currentSnapshot merkle.Snapshot
+	fallback        bool
+	handled         bool
+}
+
+// planStreamingReindex captures a fresh merkle snapshot and synthesizes a
+// diff where every discovered file counts as "modified". This is the
+// "upgrade splitter granularity without dropping the collection" path.
+func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job) deltaPlan {
+	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+		} else {
+			manager.updateJobFailed(job.ID, fmt.Errorf("capture reindex snapshot: %w", err))
+		}
+		return deltaPlan{
+			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
+			currentSnapshot: merkle.Snapshot{Files: nil},
+			fallback:        false,
+			handled:         true,
+		}
+	}
+	modifiedFiles := make([]string, 0, len(captured.Files))
+	for relativePath := range captured.Files {
+		modifiedFiles = append(modifiedFiles, relativePath)
+	}
+	sort.Strings(modifiedFiles)
+	return deltaPlan{
+		diff:            merkle.Diff{Added: nil, Modified: modifiedFiles, Removed: nil},
+		currentSnapshot: captured,
+		fallback:        false,
+		handled:         false,
+	}
+}
+
+// planSyncDiff reads the previous snapshot, captures the current one, and
+// returns the diff. An empty diff completes the job here as a no-op tagged
+// "already up to date".
+func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
+	snapshotPath := manager.merklePath(codebaseID)
+	previousSnapshot, snapshotErr := merkle.ReadSnapshot(snapshotPath)
+	if snapshotErr != nil {
+		slog.WarnContext(ctx, "no previous merkle snapshot for sync; falling back to full reindex", "path", snapshotPath, "err", snapshotErr)
+		return deltaPlan{
+			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
+			currentSnapshot: merkle.Snapshot{Files: nil},
+			fallback:        true,
+			handled:         false,
+		}
+	}
+	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(job.ID)
+		} else {
+			manager.updateJobFailed(job.ID, fmt.Errorf("capture sync snapshot: %w", err))
+		}
+		return deltaPlan{
+			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
+			currentSnapshot: merkle.Snapshot{Files: nil},
+			fallback:        false,
+			handled:         true,
+		}
+	}
+	diff := merkle.DiffSnapshots(previousSnapshot, captured)
+	if diff.Empty() {
+		manager.updateJobCompleted(job.ID, indexer.Result{
+			IndexedFiles: 0,
+			TotalChunks:  0,
+			Chunks:       nil,
+			FileHashes:   captured.Files,
+			SkippedFiles: nil,
+		})
+		return deltaPlan{
+			diff:            diff,
+			currentSnapshot: captured,
+			fallback:        false,
+			handled:         true,
+		}
+	}
+	return deltaPlan{
+		diff:            diff,
+		currentSnapshot: captured,
+		fallback:        false,
+		handled:         false,
+	}
+}
+
 // runDeltaSync attempts the incremental sync path and returns true when it
 // fully handled the job (success, failure, no-op, or cancellation). It
 // returns false to fall back to the full Replace path when there is no
 // previous snapshot or the semantic collection is gone.
+//
+// Two operations route here. "sync" computes the merkle diff against the
+// previous snapshot and processes only added and modified files; this is the
+// background-sync hot path. "streaming_reindex" skips the diff entirely and
+// treats every discovered file as modified so the agent can upgrade the
+// splitter (for example coarse one-chunk-per-file to ast) without dropping
+// the Milvus collection; the existing index stays searchable file by file as
+// semantic.Reindex deletes and upserts each row.
 func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 	manager.mu.Lock()
 	codebase, codebaseFound := manager.codebases[job.CodebaseID]
@@ -824,33 +1053,20 @@ func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 		return false
 	}
 
-	snapshotPath := manager.merklePath(codebase.ID)
-	previousSnapshot, snapshotErr := merkle.ReadSnapshot(snapshotPath)
-	if snapshotErr != nil {
-		slog.WarnContext(ctx, "no previous merkle snapshot for sync; falling back to full reindex", "path", snapshotPath, "err", snapshotErr)
+	var plan deltaPlan
+	if jobOperation(job.Operation) == jobOperationStreamingReindex {
+		plan = manager.planStreamingReindex(ctx, job)
+	} else {
+		plan = manager.planSyncDiff(ctx, job, codebase.ID)
+	}
+	if plan.fallback {
 		return false
 	}
-
-	currentSnapshot, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
-			return true
-		}
-		manager.updateJobFailed(job.ID, fmt.Errorf("capture sync snapshot: %w", err))
+	if plan.handled {
 		return true
 	}
-
-	diff := merkle.DiffSnapshots(previousSnapshot, currentSnapshot)
-	if diff.Empty() {
-		manager.updateJobCompleted(job.ID, indexer.Result{
-			IndexedFiles: 0,
-			TotalChunks:  0,
-			Chunks:       nil,
-			FileHashes:   currentSnapshot.Files,
-		})
-		return true
-	}
+	diff := plan.diff
+	currentSnapshot := plan.currentSnapshot
 
 	changedFiles := append([]string{}, diff.Added...)
 	changedFiles = append(changedFiles, diff.Modified...)
@@ -997,6 +1213,7 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 		TotalChunks:  result.TotalChunks,
 		Status:       "completed",
 		CompletedAt:  now,
+		SkippedFiles: result.SkippedFiles,
 	}
 	codebase.MerkleSnapshotPath = manager.merklePath(codebase.ID)
 	codebase.UpdatedAt = now

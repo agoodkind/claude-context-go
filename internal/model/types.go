@@ -80,11 +80,17 @@ type JobError struct {
 }
 
 // IndexRunSummary records the last successful indexing run for a codebase.
+//
+// SkippedFiles names files the indexer refused to embed because their bytes
+// are not valid UTF-8 and would fail the Milvus gRPC marshal. The list is
+// persisted in the registry so the operator can audit it without re-walking
+// the daemon logs.
 type IndexRunSummary struct {
 	IndexedFiles int32     `json:"indexed_files"`
 	TotalChunks  int32     `json:"total_chunks"`
 	Status       string    `json:"status"`
 	CompletedAt  time.Time `json:"completed_at"`
+	SkippedFiles []string  `json:"skipped_files,omitempty"`
 }
 
 // IndexRunFailure records the last failed indexing run for a codebase.

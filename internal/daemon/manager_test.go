@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -284,6 +285,65 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
 }
 
+// TestStartIndexPersistsSkippedFiles proves the daemon writes the indexer's
+// skipped-file list into the codebase registry's LastSuccessfulRun. The
+// operator surface (GetIndex display, Doctor output) reads from there.
+func TestStartIndexPersistsSkippedFiles(t *testing.T) {
+	t.Parallel()
+
+	manager, _, repoPath := newTestManager(t)
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 1,
+				TotalChunks:  1,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				SkippedFiles: []string{"binary.bin", "weird-encoding.txt"},
+			}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil {
+		t.Fatalf("GetIndex returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("GetIndex did not find the codebase")
+	}
+	if codebase.LastSuccessfulRun == nil {
+		t.Fatal("LastSuccessfulRun nil after StartIndex completion")
+	}
+	wantSkipped := []string{"binary.bin", "weird-encoding.txt"}
+	if !slices.Equal(codebase.LastSuccessfulRun.SkippedFiles, wantSkipped) {
+		t.Fatalf("LastSuccessfulRun.SkippedFiles = %v, want %v", codebase.LastSuccessfulRun.SkippedFiles, wantSkipped)
+	}
+
+	diagnostics := manager.Doctor()
+	wantSuffix := "2 non-UTF-8 file(s) skipped during last indexing run"
+	foundDiagnostic := false
+	for _, diagnostic := range diagnostics {
+		if strings.Contains(diagnostic, wantSuffix) {
+			foundDiagnostic = true
+			break
+		}
+	}
+	if !foundDiagnostic {
+		t.Fatalf("Doctor diagnostics did not surface skipped-file summary; got %v", diagnostics)
+	}
+}
+
 func TestStartIndexForceDeduplicatesAgainstInFlightJob(t *testing.T) {
 	t.Parallel()
 
@@ -354,6 +414,137 @@ func TestStartIndexForceDeduplicatesAgainstInFlightJob(t *testing.T) {
 	calls := atomic.LoadInt32(&indexCalls)
 	if calls != 1 {
 		t.Fatalf("indexer ran %d times; want exactly 1 (idempotent across %d force callers)", calls, concurrentForceCallers+1)
+	}
+}
+
+// TestStartIndexStreamingReindexUpgradesSplitterInPlace exercises the agent
+// driven granularity upgrade path. After an initial langchain index, calling
+// StartIndex again with the ast splitter (force=false, config differs) must
+// queue a new job that streams replacements through semantic.Reindex rather
+// than dropping the collection. The new EffectiveConfig reflects the
+// requested splitter at job completion.
+func TestStartIndexStreamingReindexUpgradesSplitterInPlace(t *testing.T) {
+	t.Parallel()
+
+	manager, _, repoPath := newTestManager(t)
+	indexCalls := atomic.Int32{}
+	indexFilesCalls := atomic.Int32{}
+	var observedFiles []string
+	var fileMu sync.Mutex
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			indexCalls.Add(1)
+			content := "package main\n"
+			return indexer.Result{
+				IndexedFiles: 1,
+				TotalChunks:  1,
+				Chunks: []model.StoredChunk{{
+					Content:       content,
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: map[string]string{"main.go": hashText(content)},
+			}, nil
+		},
+		indexFiles: func(ctx context.Context, root string, relativePaths []string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			indexFilesCalls.Add(1)
+			fileMu.Lock()
+			observedFiles = append([]string{}, relativePaths...)
+			fileMu.Unlock()
+			content := "package main\nfunc main() {}\n"
+			return indexer.Result{
+				IndexedFiles: 1,
+				TotalChunks:  2,
+				Chunks: []model.StoredChunk{
+					{Content: content, RelativePath: "main.go", StartLine: 1, EndLine: 1, Language: "go", FileExtension: ".go"},
+					{Content: content, RelativePath: "main.go", StartLine: 2, EndLine: 2, Language: "go", FileExtension: ".go"},
+				},
+				FileHashes: map[string]string{"main.go": hashText(content)},
+			}, nil
+		},
+	}
+
+	initialConfig := defaultIndexConfig()
+	initialConfig.SplitterType = "langchain"
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), initialConfig, false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	upgradedConfig := defaultIndexConfig()
+	upgradedConfig.SplitterType = "ast"
+	upgradeJob, _, deduplicated, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), upgradedConfig, false)
+	if err != nil {
+		t.Fatalf("upgrade StartIndex returned error: %v", err)
+	}
+	if deduplicated {
+		t.Fatal("upgrade call was deduplicated; agent-driven splitter upgrade should queue a new job")
+	}
+	if jobOperation(upgradeJob.Operation) != jobOperationStreamingReindex {
+		t.Fatalf("upgrade job Operation = %q, want %q", upgradeJob.Operation, jobOperationStreamingReindex)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	if indexFilesCalls.Load() == 0 {
+		t.Fatal("IndexFiles was never called; streaming reindex should walk the codebase via IndexFiles")
+	}
+	fileMu.Lock()
+	finalObservedFiles := append([]string{}, observedFiles...)
+	fileMu.Unlock()
+	if !slices.Contains(finalObservedFiles, "main.go") {
+		t.Fatalf("streaming reindex did not pass main.go as modified; saw %v", finalObservedFiles)
+	}
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil {
+		t.Fatalf("GetIndex returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("GetIndex did not find the upgraded codebase")
+	}
+	if codebase.EffectiveConfig.SplitterType != "ast" {
+		t.Fatalf("EffectiveConfig.SplitterType = %q after streaming reindex, want %q", codebase.EffectiveConfig.SplitterType, "ast")
+	}
+}
+
+// TestStartIndexRejectsMatchingConfigOnIndexedCodebase confirms that a
+// re-call with the same splitter and no force still returns the friendly
+// "already indexed" error so accidental no-op calls remain cheap.
+func TestStartIndexRejectsMatchingConfigOnIndexedCodebase(t *testing.T) {
+	t.Parallel()
+
+	manager, _, repoPath := newTestManager(t)
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 1,
+				TotalChunks:  1,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+			}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	_, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false)
+	if err == nil {
+		t.Fatal("matching-config re-call should return 'already indexed' error")
+	}
+	if !strings.Contains(err.Error(), "already indexed") {
+		t.Fatalf("expected 'already indexed' error, got %v", err)
 	}
 }
 
@@ -529,57 +720,6 @@ func TestGetIndexMatchesTrackedParentForSubdirectory(t *testing.T) {
 	}
 	if codebase.CanonicalPath != expectedCanonicalPath {
 		t.Fatalf("GetIndex returned canonicalPath=%q", codebase.CanonicalPath)
-	}
-}
-
-func TestGetIndexFallsBackToLegacySnapshot(t *testing.T) {
-	t.Parallel()
-
-	manager, cfg, _ := newTestManager(t)
-
-	legacyPath := "/Users/example/Sites/clyde-dev/clyde"
-	snapshot := `{
-  "formatVersion": "v2",
-  "codebases": {
-    "` + legacyPath + `": {
-      "status": "indexed",
-      "indexedFiles": 877,
-      "totalChunks": 9139,
-      "indexStatus": "completed",
-      "requestSplitter": "ast",
-      "lastUpdated": "2026-05-24T11:28:01.806Z"
-    }
-  },
-  "lastUpdated": "2026-05-25T02:14:06.870Z"
-}`
-	if err := os.MkdirAll(cfg.ContextRoot, 0o755); err != nil {
-		t.Fatalf("MkdirAll returned error: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cfg.ContextRoot, "mcp-codebase-snapshot.json"), []byte(snapshot), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-
-	codebase, activeJob, found, err := manager.GetIndex(context.Background(), legacyPath)
-	if err != nil {
-		t.Fatalf("GetIndex returned error: %v", err)
-	}
-	if !found {
-		t.Fatal("GetIndex did not find the legacy snapshot entry")
-	}
-	if activeJob != nil {
-		t.Fatalf("activeJob = %#v, want nil for legacy entry", activeJob)
-	}
-	if codebase.Status != model.CodebaseStatusIndexed {
-		t.Fatalf("status = %q", codebase.Status)
-	}
-	if codebase.LastSuccessfulRun == nil {
-		t.Fatal("LastSuccessfulRun nil")
-	}
-	if codebase.LastSuccessfulRun.IndexedFiles != 877 {
-		t.Fatalf("IndexedFiles = %d", codebase.LastSuccessfulRun.IndexedFiles)
-	}
-	if codebase.CollectionName == "" {
-		t.Fatal("collection name empty for legacy codebase")
 	}
 }
 

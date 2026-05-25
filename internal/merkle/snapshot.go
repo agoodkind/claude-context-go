@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"unicode/utf8"
 
 	"goodkind.io/claude-context-go/internal/discovery"
 	"goodkind.io/claude-context-go/internal/model"
@@ -67,6 +68,12 @@ func Capture(
 				path,
 				err,
 			)
+		}
+		// Skip files the indexer will also skip so the indexer and merkle
+		// agree on the file set. Otherwise every sync treats the same bad
+		// file as "modified" forever and the delta loop never converges.
+		if !utf8.Valid(data) {
+			continue
 		}
 		files[relativePath] = digestBytes(data)
 	}

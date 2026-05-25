@@ -536,6 +536,7 @@ type IndexRunSummary struct {
 	TotalChunks   int32                  `protobuf:"varint,2,opt,name=total_chunks,json=totalChunks,proto3" json:"total_chunks,omitempty"`
 	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
 	CompletedAt   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+	SkippedFiles  []string               `protobuf:"bytes,5,rep,name=skipped_files,json=skippedFiles,proto3" json:"skipped_files,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -594,6 +595,13 @@ func (x *IndexRunSummary) GetStatus() string {
 func (x *IndexRunSummary) GetCompletedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.CompletedAt
+	}
+	return nil
+}
+
+func (x *IndexRunSummary) GetSkippedFiles() []string {
+	if x != nil {
+		return x.SkippedFiles
 	}
 	return nil
 }
@@ -2429,12 +2437,13 @@ const file_claudecontext_v1_service_proto_rawDesc = "" +
 	"\fheartbeat_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\vheartbeatAt\"B\n" +
 	"\bJobError\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12\x1c\n" +
-	"\tretryable\x18\x02 \x01(\bR\tretryable\"\xb0\x01\n" +
+	"\tretryable\x18\x02 \x01(\bR\tretryable\"\xd5\x01\n" +
 	"\x0fIndexRunSummary\x12#\n" +
 	"\rindexed_files\x18\x01 \x01(\x05R\findexedFiles\x12!\n" +
 	"\ftotal_chunks\x18\x02 \x01(\x05R\vtotalChunks\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x12=\n" +
-	"\fcompleted_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\"\xa0\x01\n" +
+	"\fcompleted_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12#\n" +
+	"\rskipped_files\x18\x05 \x03(\tR\fskippedFiles\"\xa0\x01\n" +
 	"\x0fIndexRunFailure\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12:\n" +
 	"\x19last_attempted_percentage\x18\x02 \x01(\x05R\x17lastAttemptedPercentage\x127\n" +

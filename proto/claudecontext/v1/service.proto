@@ -79,6 +79,7 @@ message IndexRunSummary {
   int32 total_chunks = 2;
   string status = 3;
   google.protobuf.Timestamp completed_at = 4;
+  repeated string skipped_files = 5;
 }
 
 message IndexRunFailure {

@@ -442,6 +442,21 @@ func (service *Service) ListCollections(ctx context.Context) ([]string, error) {
 	return collections, nil
 }
 
+// HasCollectionForPath reports whether Milvus has the collection for the
+// given codebase path. Milvus is the source of truth for indexed state.
+func (service *Service) HasCollectionForPath(ctx context.Context, codebasePath string) (bool, error) {
+	if !service.Available() {
+		return false, ErrUnavailable
+	}
+	collectionName := service.CollectionName(codebasePath)
+	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
+	if err != nil {
+		slog.ErrorContext(ctx, "check Milvus collection presence failed", "collection", collectionName, "err", err)
+		return false, fmt.Errorf("check Milvus collection %s: %w", collectionName, err)
+	}
+	return hasCollection, nil
+}
+
 func (service *Service) dropIfExists(ctx context.Context, collectionName string) error {
 	hasCollection, err := service.milvus.HasCollection(ctx, milvusclient.NewHasCollectionOption(collectionName))
 	if err != nil {
