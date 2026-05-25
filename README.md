@@ -25,10 +25,10 @@ Sources:
 All validation should use the local `go-makefile` checkout:
 
 ```sh
-GO_MK_DEV_DIR=/Users/agoodkind/Sites/go-makefile make check
-GO_MK_DEV_DIR=/Users/agoodkind/Sites/go-makefile make test
-GO_MK_DEV_DIR=/Users/agoodkind/Sites/go-makefile make build
-GO_MK_DEV_DIR=/Users/agoodkind/Sites/go-makefile make staticcheck-extra
+GO_MK_DEV_DIR=$HOME/Sites/go-makefile make check
+GO_MK_DEV_DIR=$HOME/Sites/go-makefile make test
+GO_MK_DEV_DIR=$HOME/Sites/go-makefile make build
+GO_MK_DEV_DIR=$HOME/Sites/go-makefile make staticcheck-extra
 ```
 
 ## Install And Deploy
