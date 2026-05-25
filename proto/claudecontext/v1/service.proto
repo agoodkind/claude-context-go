@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package claudecontext.v1;
 
-option go_package = "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1;claudecontextv1";
+option go_package = "goodkind.io/claude-context-go/gen/go/claudecontext/v1;claudecontextv1";
 
 import "google/protobuf/timestamp.proto";
 
@@ -142,6 +142,7 @@ message StartIndexResponse {
   string state = 3;
   bool deduplicated = 4;
   string canonical_path = 5;
+  string display_text = 6;
 }
 
 message ClearIndexRequest {
@@ -152,6 +153,7 @@ message ClearIndexRequest {
 message ClearIndexResponse {
   string codebase_id = 1;
   bool cleared = 2;
+  string display_text = 3;
 }
 
 message CancelJobRequest {
@@ -162,6 +164,7 @@ message CancelJobRequest {
 message CancelJobResponse {
   string job_id = 1;
   bool cancelled = 2;
+  string display_text = 3;
 }
 
 message SyncIndexRequest {
@@ -173,6 +176,7 @@ message SyncIndexResponse {
   string job_id = 1;
   string codebase_id = 2;
   string state = 3;
+  string display_text = 4;
 }
 
 message GetIndexRequest {
@@ -181,12 +185,16 @@ message GetIndexRequest {
 
 message GetIndexResponse {
   Codebase codebase = 1;
+  Job active_job = 2;
+  bool tracked = 3;
+  string display_text = 4;
 }
 
 message ListIndexesRequest {}
 
 message ListIndexesResponse {
   repeated Codebase indexes = 1;
+  string display_text = 2;
 }
 
 message GetJobRequest {
@@ -195,6 +203,7 @@ message GetJobRequest {
 
 message GetJobResponse {
   Job job = 1;
+  string display_text = 2;
 }
 
 message ListJobsRequest {
@@ -203,6 +212,7 @@ message ListJobsRequest {
 
 message ListJobsResponse {
   repeated Job jobs = 1;
+  string display_text = 2;
 }
 
 message WatchJobsRequest {
@@ -222,6 +232,9 @@ message SearchCodeRequest {
 
 message SearchCodeResponse {
   repeated SearchResult results = 1;
+  Codebase codebase = 2;
+  Job active_job = 3;
+  string display_text = 4;
 }
 
 message Diagnostic {
@@ -235,6 +248,7 @@ message DoctorRequest {}
 
 message DoctorResponse {
   repeated Diagnostic diagnostics = 1;
+  string display_text = 2;
 }
 
 message ShutdownRequest {}

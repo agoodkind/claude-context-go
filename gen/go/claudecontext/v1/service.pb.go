@@ -1105,6 +1105,7 @@ type StartIndexResponse struct {
 	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
 	Deduplicated  bool                   `protobuf:"varint,4,opt,name=deduplicated,proto3" json:"deduplicated,omitempty"`
 	CanonicalPath string                 `protobuf:"bytes,5,opt,name=canonical_path,json=canonicalPath,proto3" json:"canonical_path,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,6,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1174,6 +1175,13 @@ func (x *StartIndexResponse) GetCanonicalPath() string {
 	return ""
 }
 
+func (x *StartIndexResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
+}
+
 type ClearIndexRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
@@ -1230,6 +1238,7 @@ type ClearIndexResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CodebaseId    string                 `protobuf:"bytes,1,opt,name=codebase_id,json=codebaseId,proto3" json:"codebase_id,omitempty"`
 	Cleared       bool                   `protobuf:"varint,2,opt,name=cleared,proto3" json:"cleared,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,3,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1276,6 +1285,13 @@ func (x *ClearIndexResponse) GetCleared() bool {
 		return x.Cleared
 	}
 	return false
+}
+
+func (x *ClearIndexResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type CancelJobRequest struct {
@@ -1334,6 +1350,7 @@ type CancelJobResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	Cancelled     bool                   `protobuf:"varint,2,opt,name=cancelled,proto3" json:"cancelled,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,3,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1380,6 +1397,13 @@ func (x *CancelJobResponse) GetCancelled() bool {
 		return x.Cancelled
 	}
 	return false
+}
+
+func (x *CancelJobResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type SyncIndexRequest struct {
@@ -1439,6 +1463,7 @@ type SyncIndexResponse struct {
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	CodebaseId    string                 `protobuf:"bytes,2,opt,name=codebase_id,json=codebaseId,proto3" json:"codebase_id,omitempty"`
 	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,4,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1494,6 +1519,13 @@ func (x *SyncIndexResponse) GetState() string {
 	return ""
 }
 
+func (x *SyncIndexResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
+}
+
 type GetIndexRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
@@ -1541,6 +1573,9 @@ func (x *GetIndexRequest) GetPath() string {
 type GetIndexResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Codebase      *Codebase              `protobuf:"bytes,1,opt,name=codebase,proto3" json:"codebase,omitempty"`
+	ActiveJob     *Job                   `protobuf:"bytes,2,opt,name=active_job,json=activeJob,proto3" json:"active_job,omitempty"`
+	Tracked       bool                   `protobuf:"varint,3,opt,name=tracked,proto3" json:"tracked,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,4,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1582,6 +1617,27 @@ func (x *GetIndexResponse) GetCodebase() *Codebase {
 	return nil
 }
 
+func (x *GetIndexResponse) GetActiveJob() *Job {
+	if x != nil {
+		return x.ActiveJob
+	}
+	return nil
+}
+
+func (x *GetIndexResponse) GetTracked() bool {
+	if x != nil {
+		return x.Tracked
+	}
+	return false
+}
+
+func (x *GetIndexResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
+}
+
 type ListIndexesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1621,6 +1677,7 @@ func (*ListIndexesRequest) Descriptor() ([]byte, []int) {
 type ListIndexesResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Indexes       []*Codebase            `protobuf:"bytes,1,rep,name=indexes,proto3" json:"indexes,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,2,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1660,6 +1717,13 @@ func (x *ListIndexesResponse) GetIndexes() []*Codebase {
 		return x.Indexes
 	}
 	return nil
+}
+
+func (x *ListIndexesResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type GetJobRequest struct {
@@ -1709,6 +1773,7 @@ func (x *GetJobRequest) GetJobId() string {
 type GetJobResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Job           *Job                   `protobuf:"bytes,1,opt,name=job,proto3" json:"job,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,2,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1748,6 +1813,13 @@ func (x *GetJobResponse) GetJob() *Job {
 		return x.Job
 	}
 	return nil
+}
+
+func (x *GetJobResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type ListJobsRequest struct {
@@ -1797,6 +1869,7 @@ func (x *ListJobsRequest) GetCodebaseId() string {
 type ListJobsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Jobs          []*Job                 `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,2,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1836,6 +1909,13 @@ func (x *ListJobsResponse) GetJobs() []*Job {
 		return x.Jobs
 	}
 	return nil
+}
+
+func (x *ListJobsResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type WatchJobsRequest struct {
@@ -1997,6 +2077,9 @@ func (x *SearchCodeRequest) GetExtensionFilter() []string {
 type SearchCodeResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Results       []*SearchResult        `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	Codebase      *Codebase              `protobuf:"bytes,2,opt,name=codebase,proto3" json:"codebase,omitempty"`
+	ActiveJob     *Job                   `protobuf:"bytes,3,opt,name=active_job,json=activeJob,proto3" json:"active_job,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,4,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2036,6 +2119,27 @@ func (x *SearchCodeResponse) GetResults() []*SearchResult {
 		return x.Results
 	}
 	return nil
+}
+
+func (x *SearchCodeResponse) GetCodebase() *Codebase {
+	if x != nil {
+		return x.Codebase
+	}
+	return nil
+}
+
+func (x *SearchCodeResponse) GetActiveJob() *Job {
+	if x != nil {
+		return x.ActiveJob
+	}
+	return nil
+}
+
+func (x *SearchCodeResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type Diagnostic struct {
@@ -2145,6 +2249,7 @@ func (*DoctorRequest) Descriptor() ([]byte, []int) {
 type DoctorResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Diagnostics   []*Diagnostic          `protobuf:"bytes,1,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
+	DisplayText   string                 `protobuf:"bytes,2,opt,name=display_text,json=displayText,proto3" json:"display_text,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2184,6 +2289,13 @@ func (x *DoctorResponse) GetDiagnostics() []*Diagnostic {
 		return x.Diagnostics
 	}
 	return nil
+}
+
+func (x *DoctorResponse) GetDisplayText() string {
+	if x != nil {
+		return x.DisplayText
+	}
+	return ""
 }
 
 type ShutdownRequest struct {
@@ -2374,51 +2486,62 @@ const file_claudecontext_v1_service_proto_rawDesc = "" +
 	"\bsplitter\x18\x03 \x01(\v2 .claudecontext.v1.SplitterConfigR\bsplitter\x12+\n" +
 	"\x11custom_extensions\x18\x04 \x03(\tR\x10customExtensions\x12'\n" +
 	"\x0fignore_patterns\x18\x05 \x03(\tR\x0eignorePatterns\x124\n" +
-	"\x06client\x18\x06 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"\xad\x01\n" +
+	"\x06client\x18\x06 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"\xd0\x01\n" +
 	"\x12StartIndexResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1f\n" +
 	"\vcodebase_id\x18\x02 \x01(\tR\n" +
 	"codebaseId\x12\x14\n" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\"\n" +
 	"\fdeduplicated\x18\x04 \x01(\bR\fdeduplicated\x12%\n" +
-	"\x0ecanonical_path\x18\x05 \x01(\tR\rcanonicalPath\"]\n" +
+	"\x0ecanonical_path\x18\x05 \x01(\tR\rcanonicalPath\x12!\n" +
+	"\fdisplay_text\x18\x06 \x01(\tR\vdisplayText\"]\n" +
 	"\x11ClearIndexRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x124\n" +
-	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"O\n" +
+	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"r\n" +
 	"\x12ClearIndexResponse\x12\x1f\n" +
 	"\vcodebase_id\x18\x01 \x01(\tR\n" +
 	"codebaseId\x12\x18\n" +
-	"\acleared\x18\x02 \x01(\bR\acleared\"_\n" +
+	"\acleared\x18\x02 \x01(\bR\acleared\x12!\n" +
+	"\fdisplay_text\x18\x03 \x01(\tR\vdisplayText\"_\n" +
 	"\x10CancelJobRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x124\n" +
-	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"H\n" +
+	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"k\n" +
 	"\x11CancelJobResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1c\n" +
-	"\tcancelled\x18\x02 \x01(\bR\tcancelled\"\\\n" +
+	"\tcancelled\x18\x02 \x01(\bR\tcancelled\x12!\n" +
+	"\fdisplay_text\x18\x03 \x01(\tR\vdisplayText\"\\\n" +
 	"\x10SyncIndexRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x124\n" +
-	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"a\n" +
+	"\x06client\x18\x02 \x01(\v2\x1c.claudecontext.v1.ClientInfoR\x06client\"\x84\x01\n" +
 	"\x11SyncIndexResponse\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1f\n" +
 	"\vcodebase_id\x18\x02 \x01(\tR\n" +
 	"codebaseId\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\tR\x05state\"%\n" +
+	"\x05state\x18\x03 \x01(\tR\x05state\x12!\n" +
+	"\fdisplay_text\x18\x04 \x01(\tR\vdisplayText\"%\n" +
 	"\x0fGetIndexRequest\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\"J\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\"\xbd\x01\n" +
 	"\x10GetIndexResponse\x126\n" +
-	"\bcodebase\x18\x01 \x01(\v2\x1a.claudecontext.v1.CodebaseR\bcodebase\"\x14\n" +
-	"\x12ListIndexesRequest\"K\n" +
+	"\bcodebase\x18\x01 \x01(\v2\x1a.claudecontext.v1.CodebaseR\bcodebase\x124\n" +
+	"\n" +
+	"active_job\x18\x02 \x01(\v2\x15.claudecontext.v1.JobR\tactiveJob\x12\x18\n" +
+	"\atracked\x18\x03 \x01(\bR\atracked\x12!\n" +
+	"\fdisplay_text\x18\x04 \x01(\tR\vdisplayText\"\x14\n" +
+	"\x12ListIndexesRequest\"n\n" +
 	"\x13ListIndexesResponse\x124\n" +
-	"\aindexes\x18\x01 \x03(\v2\x1a.claudecontext.v1.CodebaseR\aindexes\"&\n" +
+	"\aindexes\x18\x01 \x03(\v2\x1a.claudecontext.v1.CodebaseR\aindexes\x12!\n" +
+	"\fdisplay_text\x18\x02 \x01(\tR\vdisplayText\"&\n" +
 	"\rGetJobRequest\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"9\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\\\n" +
 	"\x0eGetJobResponse\x12'\n" +
-	"\x03job\x18\x01 \x01(\v2\x15.claudecontext.v1.JobR\x03job\"2\n" +
+	"\x03job\x18\x01 \x01(\v2\x15.claudecontext.v1.JobR\x03job\x12!\n" +
+	"\fdisplay_text\x18\x02 \x01(\tR\vdisplayText\"2\n" +
 	"\x0fListJobsRequest\x12\x1f\n" +
 	"\vcodebase_id\x18\x01 \x01(\tR\n" +
-	"codebaseId\"=\n" +
+	"codebaseId\"`\n" +
 	"\x10ListJobsResponse\x12)\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x15.claudecontext.v1.JobR\x04jobs\"+\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x15.claudecontext.v1.JobR\x04jobs\x12!\n" +
+	"\fdisplay_text\x18\x02 \x01(\tR\vdisplayText\"+\n" +
 	"\x10WatchJobsRequest\x12\x17\n" +
 	"\ajob_ids\x18\x01 \x03(\tR\x06jobIds\"<\n" +
 	"\x11WatchJobsResponse\x12'\n" +
@@ -2427,18 +2550,23 @@ const file_claudecontext_v1_service_proto_rawDesc = "" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
 	"\x05query\x18\x02 \x01(\tR\x05query\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x05R\x05limit\x12)\n" +
-	"\x10extension_filter\x18\x04 \x03(\tR\x0fextensionFilter\"N\n" +
+	"\x10extension_filter\x18\x04 \x03(\tR\x0fextensionFilter\"\xdf\x01\n" +
 	"\x12SearchCodeResponse\x128\n" +
-	"\aresults\x18\x01 \x03(\v2\x1e.claudecontext.v1.SearchResultR\aresults\"n\n" +
+	"\aresults\x18\x01 \x03(\v2\x1e.claudecontext.v1.SearchResultR\aresults\x126\n" +
+	"\bcodebase\x18\x02 \x01(\v2\x1a.claudecontext.v1.CodebaseR\bcodebase\x124\n" +
+	"\n" +
+	"active_job\x18\x03 \x01(\v2\x15.claudecontext.v1.JobR\tactiveJob\x12!\n" +
+	"\fdisplay_text\x18\x04 \x01(\tR\vdisplayText\"n\n" +
 	"\n" +
 	"Diagnostic\x12\x1a\n" +
 	"\bseverity\x18\x01 \x01(\tR\bseverity\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\asummary\x18\x03 \x01(\tR\asummary\x12\x16\n" +
 	"\x06detail\x18\x04 \x01(\tR\x06detail\"\x0f\n" +
-	"\rDoctorRequest\"P\n" +
+	"\rDoctorRequest\"s\n" +
 	"\x0eDoctorResponse\x12>\n" +
-	"\vdiagnostics\x18\x01 \x03(\v2\x1c.claudecontext.v1.DiagnosticR\vdiagnostics\"\x11\n" +
+	"\vdiagnostics\x18\x01 \x03(\v2\x1c.claudecontext.v1.DiagnosticR\vdiagnostics\x12!\n" +
+	"\fdisplay_text\x18\x02 \x01(\tR\vdisplayText\"\x11\n" +
 	"\x0fShutdownRequest\".\n" +
 	"\x10ShutdownResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted2\xea\b\n" +
@@ -2458,7 +2586,7 @@ const file_claudecontext_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"SearchCode\x12#.claudecontext.v1.SearchCodeRequest\x1a$.claudecontext.v1.SearchCodeResponse\x12K\n" +
 	"\x06Doctor\x12\x1f.claudecontext.v1.DoctorRequest\x1a .claudecontext.v1.DoctorResponse\x12Q\n" +
-	"\bShutdown\x12!.claudecontext.v1.ShutdownRequest\x1a\".claudecontext.v1.ShutdownResponseBQZOgithub.com/zilliztech/claude-context-go/gen/go/claudecontext/v1;claudecontextv1b\x06proto3"
+	"\bShutdown\x12!.claudecontext.v1.ShutdownRequest\x1a\".claudecontext.v1.ShutdownResponseBGZEgoodkind.io/claude-context-go/gen/go/claudecontext/v1;claudecontextv1b\x06proto3"
 
 var (
 	file_claudecontext_v1_service_proto_rawDescOnce sync.Once
@@ -2535,43 +2663,46 @@ var file_claudecontext_v1_service_proto_depIdxs = []int32{
 	2,  // 18: claudecontext.v1.CancelJobRequest.client:type_name -> claudecontext.v1.ClientInfo
 	2,  // 19: claudecontext.v1.SyncIndexRequest.client:type_name -> claudecontext.v1.ClientInfo
 	9,  // 20: claudecontext.v1.GetIndexResponse.codebase:type_name -> claudecontext.v1.Codebase
-	9,  // 21: claudecontext.v1.ListIndexesResponse.indexes:type_name -> claudecontext.v1.Codebase
-	10, // 22: claudecontext.v1.GetJobResponse.job:type_name -> claudecontext.v1.Job
-	10, // 23: claudecontext.v1.ListJobsResponse.jobs:type_name -> claudecontext.v1.Job
-	10, // 24: claudecontext.v1.WatchJobsResponse.job:type_name -> claudecontext.v1.Job
-	11, // 25: claudecontext.v1.SearchCodeResponse.results:type_name -> claudecontext.v1.SearchResult
-	32, // 26: claudecontext.v1.DoctorResponse.diagnostics:type_name -> claudecontext.v1.Diagnostic
-	0,  // 27: claudecontext.v1.ClaudeContextDaemonService.Version:input_type -> claudecontext.v1.VersionRequest
-	12, // 28: claudecontext.v1.ClaudeContextDaemonService.StartIndex:input_type -> claudecontext.v1.StartIndexRequest
-	14, // 29: claudecontext.v1.ClaudeContextDaemonService.ClearIndex:input_type -> claudecontext.v1.ClearIndexRequest
-	16, // 30: claudecontext.v1.ClaudeContextDaemonService.CancelJob:input_type -> claudecontext.v1.CancelJobRequest
-	18, // 31: claudecontext.v1.ClaudeContextDaemonService.SyncIndex:input_type -> claudecontext.v1.SyncIndexRequest
-	20, // 32: claudecontext.v1.ClaudeContextDaemonService.GetIndex:input_type -> claudecontext.v1.GetIndexRequest
-	22, // 33: claudecontext.v1.ClaudeContextDaemonService.ListIndexes:input_type -> claudecontext.v1.ListIndexesRequest
-	24, // 34: claudecontext.v1.ClaudeContextDaemonService.GetJob:input_type -> claudecontext.v1.GetJobRequest
-	26, // 35: claudecontext.v1.ClaudeContextDaemonService.ListJobs:input_type -> claudecontext.v1.ListJobsRequest
-	28, // 36: claudecontext.v1.ClaudeContextDaemonService.WatchJobs:input_type -> claudecontext.v1.WatchJobsRequest
-	30, // 37: claudecontext.v1.ClaudeContextDaemonService.SearchCode:input_type -> claudecontext.v1.SearchCodeRequest
-	33, // 38: claudecontext.v1.ClaudeContextDaemonService.Doctor:input_type -> claudecontext.v1.DoctorRequest
-	35, // 39: claudecontext.v1.ClaudeContextDaemonService.Shutdown:input_type -> claudecontext.v1.ShutdownRequest
-	1,  // 40: claudecontext.v1.ClaudeContextDaemonService.Version:output_type -> claudecontext.v1.VersionResponse
-	13, // 41: claudecontext.v1.ClaudeContextDaemonService.StartIndex:output_type -> claudecontext.v1.StartIndexResponse
-	15, // 42: claudecontext.v1.ClaudeContextDaemonService.ClearIndex:output_type -> claudecontext.v1.ClearIndexResponse
-	17, // 43: claudecontext.v1.ClaudeContextDaemonService.CancelJob:output_type -> claudecontext.v1.CancelJobResponse
-	19, // 44: claudecontext.v1.ClaudeContextDaemonService.SyncIndex:output_type -> claudecontext.v1.SyncIndexResponse
-	21, // 45: claudecontext.v1.ClaudeContextDaemonService.GetIndex:output_type -> claudecontext.v1.GetIndexResponse
-	23, // 46: claudecontext.v1.ClaudeContextDaemonService.ListIndexes:output_type -> claudecontext.v1.ListIndexesResponse
-	25, // 47: claudecontext.v1.ClaudeContextDaemonService.GetJob:output_type -> claudecontext.v1.GetJobResponse
-	27, // 48: claudecontext.v1.ClaudeContextDaemonService.ListJobs:output_type -> claudecontext.v1.ListJobsResponse
-	29, // 49: claudecontext.v1.ClaudeContextDaemonService.WatchJobs:output_type -> claudecontext.v1.WatchJobsResponse
-	31, // 50: claudecontext.v1.ClaudeContextDaemonService.SearchCode:output_type -> claudecontext.v1.SearchCodeResponse
-	34, // 51: claudecontext.v1.ClaudeContextDaemonService.Doctor:output_type -> claudecontext.v1.DoctorResponse
-	36, // 52: claudecontext.v1.ClaudeContextDaemonService.Shutdown:output_type -> claudecontext.v1.ShutdownResponse
-	40, // [40:53] is the sub-list for method output_type
-	27, // [27:40] is the sub-list for method input_type
-	27, // [27:27] is the sub-list for extension type_name
-	27, // [27:27] is the sub-list for extension extendee
-	0,  // [0:27] is the sub-list for field type_name
+	10, // 21: claudecontext.v1.GetIndexResponse.active_job:type_name -> claudecontext.v1.Job
+	9,  // 22: claudecontext.v1.ListIndexesResponse.indexes:type_name -> claudecontext.v1.Codebase
+	10, // 23: claudecontext.v1.GetJobResponse.job:type_name -> claudecontext.v1.Job
+	10, // 24: claudecontext.v1.ListJobsResponse.jobs:type_name -> claudecontext.v1.Job
+	10, // 25: claudecontext.v1.WatchJobsResponse.job:type_name -> claudecontext.v1.Job
+	11, // 26: claudecontext.v1.SearchCodeResponse.results:type_name -> claudecontext.v1.SearchResult
+	9,  // 27: claudecontext.v1.SearchCodeResponse.codebase:type_name -> claudecontext.v1.Codebase
+	10, // 28: claudecontext.v1.SearchCodeResponse.active_job:type_name -> claudecontext.v1.Job
+	32, // 29: claudecontext.v1.DoctorResponse.diagnostics:type_name -> claudecontext.v1.Diagnostic
+	0,  // 30: claudecontext.v1.ClaudeContextDaemonService.Version:input_type -> claudecontext.v1.VersionRequest
+	12, // 31: claudecontext.v1.ClaudeContextDaemonService.StartIndex:input_type -> claudecontext.v1.StartIndexRequest
+	14, // 32: claudecontext.v1.ClaudeContextDaemonService.ClearIndex:input_type -> claudecontext.v1.ClearIndexRequest
+	16, // 33: claudecontext.v1.ClaudeContextDaemonService.CancelJob:input_type -> claudecontext.v1.CancelJobRequest
+	18, // 34: claudecontext.v1.ClaudeContextDaemonService.SyncIndex:input_type -> claudecontext.v1.SyncIndexRequest
+	20, // 35: claudecontext.v1.ClaudeContextDaemonService.GetIndex:input_type -> claudecontext.v1.GetIndexRequest
+	22, // 36: claudecontext.v1.ClaudeContextDaemonService.ListIndexes:input_type -> claudecontext.v1.ListIndexesRequest
+	24, // 37: claudecontext.v1.ClaudeContextDaemonService.GetJob:input_type -> claudecontext.v1.GetJobRequest
+	26, // 38: claudecontext.v1.ClaudeContextDaemonService.ListJobs:input_type -> claudecontext.v1.ListJobsRequest
+	28, // 39: claudecontext.v1.ClaudeContextDaemonService.WatchJobs:input_type -> claudecontext.v1.WatchJobsRequest
+	30, // 40: claudecontext.v1.ClaudeContextDaemonService.SearchCode:input_type -> claudecontext.v1.SearchCodeRequest
+	33, // 41: claudecontext.v1.ClaudeContextDaemonService.Doctor:input_type -> claudecontext.v1.DoctorRequest
+	35, // 42: claudecontext.v1.ClaudeContextDaemonService.Shutdown:input_type -> claudecontext.v1.ShutdownRequest
+	1,  // 43: claudecontext.v1.ClaudeContextDaemonService.Version:output_type -> claudecontext.v1.VersionResponse
+	13, // 44: claudecontext.v1.ClaudeContextDaemonService.StartIndex:output_type -> claudecontext.v1.StartIndexResponse
+	15, // 45: claudecontext.v1.ClaudeContextDaemonService.ClearIndex:output_type -> claudecontext.v1.ClearIndexResponse
+	17, // 46: claudecontext.v1.ClaudeContextDaemonService.CancelJob:output_type -> claudecontext.v1.CancelJobResponse
+	19, // 47: claudecontext.v1.ClaudeContextDaemonService.SyncIndex:output_type -> claudecontext.v1.SyncIndexResponse
+	21, // 48: claudecontext.v1.ClaudeContextDaemonService.GetIndex:output_type -> claudecontext.v1.GetIndexResponse
+	23, // 49: claudecontext.v1.ClaudeContextDaemonService.ListIndexes:output_type -> claudecontext.v1.ListIndexesResponse
+	25, // 50: claudecontext.v1.ClaudeContextDaemonService.GetJob:output_type -> claudecontext.v1.GetJobResponse
+	27, // 51: claudecontext.v1.ClaudeContextDaemonService.ListJobs:output_type -> claudecontext.v1.ListJobsResponse
+	29, // 52: claudecontext.v1.ClaudeContextDaemonService.WatchJobs:output_type -> claudecontext.v1.WatchJobsResponse
+	31, // 53: claudecontext.v1.ClaudeContextDaemonService.SearchCode:output_type -> claudecontext.v1.SearchCodeResponse
+	34, // 54: claudecontext.v1.ClaudeContextDaemonService.Doctor:output_type -> claudecontext.v1.DoctorResponse
+	36, // 55: claudecontext.v1.ClaudeContextDaemonService.Shutdown:output_type -> claudecontext.v1.ShutdownResponse
+	43, // [43:56] is the sub-list for method output_type
+	30, // [30:43] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_claudecontext_v1_service_proto_init() }

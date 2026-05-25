@@ -4,21 +4,25 @@ package pbconv
 import (
 	"time"
 
-	pb "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1"
-	"github.com/zilliztech/claude-context-go/internal/model"
+	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
+	"goodkind.io/claude-context-go/internal/model"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // FromStartIndexConfig maps a gRPC start-index request into daemon config.
 func FromStartIndexConfig(request *pb.StartIndexRequest) model.IndexConfig {
 	config := model.IndexConfig{
-		SplitterType:      "ast",
-		SplitterChunkSize: 2500,
-		SplitterOverlap:   300,
-		Extensions:        append([]string{}, request.GetCustomExtensions()...),
-		IgnorePatterns:    append([]string{}, request.GetIgnorePatterns()...),
-		VectorBackend:     "milvus",
-		Hybrid:            true,
+		SplitterType:       "ast",
+		SplitterChunkSize:  2500,
+		SplitterOverlap:    300,
+		Extensions:         append([]string{}, request.GetCustomExtensions()...),
+		IgnorePatterns:     append([]string{}, request.GetIgnorePatterns()...),
+		IgnoreDigest:       "",
+		EmbeddingProvider:  "",
+		EmbeddingModel:     "",
+		EmbeddingDimension: 0,
+		VectorBackend:      "milvus",
+		Hybrid:             true,
 	}
 	if request.GetSplitter() != nil {
 		if request.GetSplitter().GetType() != "" {
@@ -104,6 +108,14 @@ func ToJob(job model.Job) *pb.Job {
 		}
 	}
 	return result
+}
+
+// ToJobPointer converts an optional daemon job into protobuf form.
+func ToJobPointer(job *model.Job) *pb.Job {
+	if job == nil {
+		return nil
+	}
+	return ToJob(*job)
 }
 
 func toIndexConfig(config model.IndexConfig) *pb.IndexConfig {

@@ -13,7 +13,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/zilliztech/claude-context-go/internal/model"
+	"goodkind.io/claude-context-go/internal/model"
 )
 
 type legacyStatus string
@@ -71,20 +71,30 @@ func ImportLegacySnapshot(path string) ([]model.Codebase, []model.Job, error) {
 		codebaseID := legacyCodebaseID(absolutePath)
 		updatedAt := parseTimestamp(legacy.LastUpdated)
 		codebase := model.Codebase{
-			ID:            codebaseID,
-			CanonicalPath: absolutePath,
-			Aliases:       []string{absolutePath},
-			UpdatedAt:     updatedAt,
+			ID:                codebaseID,
+			CanonicalPath:     absolutePath,
+			Aliases:           []string{absolutePath},
+			Status:            model.CodebaseStatusNotIndexed,
+			ActiveJobID:       "",
+			LastSuccessfulRun: nil,
+			LastFailedRun:     nil,
+			UpdatedAt:         updatedAt,
 			EffectiveConfig: model.IndexConfig{
-				SplitterType:      defaultIfEmpty(legacy.RequestSplitter, "ast"),
-				SplitterChunkSize: 2500,
-				SplitterOverlap:   300,
-				Extensions:        append([]string{}, legacy.RequestCustomExtensions...),
-				IgnorePatterns:    append([]string{}, legacy.RequestIgnorePatterns...),
-				VectorBackend:     "milvus",
-				Hybrid:            true,
+				SplitterType:       defaultIfEmpty(legacy.RequestSplitter, "ast"),
+				SplitterChunkSize:  2500,
+				SplitterOverlap:    300,
+				Extensions:         append([]string{}, legacy.RequestCustomExtensions...),
+				IgnorePatterns:     append([]string{}, legacy.RequestIgnorePatterns...),
+				IgnoreDigest:       "",
+				EmbeddingProvider:  "",
+				EmbeddingModel:     "",
+				EmbeddingDimension: 0,
+				VectorBackend:      "milvus",
+				Hybrid:             true,
 			},
-			CollectionName: legacyCollectionName(absolutePath, true),
+			CollectionName:        legacyCollectionName(absolutePath, true),
+			LegacyCollectionNames: nil,
+			MerkleSnapshotPath:    "",
 		}
 
 		switch legacyStatus(legacy.Status) {
@@ -149,14 +159,22 @@ func legacyFailedJob(codebase model.Codebase, legacy legacyCodebase, timestamp t
 		CanonicalPath: codebase.CanonicalPath,
 		Client: model.ClientInfo{
 			Name: "legacy-migration",
+			PID:  0,
 		},
 		Operation: "index",
 		State:     model.JobStateFailed,
 		Progress: model.Progress{
-			Phase:          "failed",
-			OverallPercent: legacy.IndexingPercentage,
-			LastEventAt:    timestamp,
-			HeartbeatAt:    timestamp,
+			Phase:                     "failed",
+			PhasePercent:              0,
+			OverallPercent:            legacy.IndexingPercentage,
+			FilesTotal:                0,
+			FilesProcessed:            0,
+			ChunksGenerated:           0,
+			EmbeddingBatchesTotal:     0,
+			EmbeddingBatchesCompleted: 0,
+			CollectionRowsWritten:     0,
+			LastEventAt:               timestamp,
+			HeartbeatAt:               timestamp,
 		},
 		Config:      codebase.EffectiveConfig,
 		StartedAt:   timestamp,

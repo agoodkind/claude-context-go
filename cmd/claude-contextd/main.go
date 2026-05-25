@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"syscall"
 
-	pb "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1"
-	"github.com/zilliztech/claude-context-go/internal/config"
-	"github.com/zilliztech/claude-context-go/internal/daemon"
-	"github.com/zilliztech/claude-context-go/internal/store"
+	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
+	"goodkind.io/claude-context-go/internal/config"
+	"goodkind.io/claude-context-go/internal/daemon"
+	"goodkind.io/claude-context-go/internal/store"
 	"google.golang.org/grpc"
 )
 
@@ -77,6 +77,10 @@ func run() error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
+	runtimeContext, cancelRuntime := context.WithCancel(context.Background())
+	defer cancelRuntime()
+	daemon.NewBackgroundSync(cfg, manager).Start(runtimeContext)
+
 	server := grpc.NewServer()
 	shutdownCh := make(chan struct{}, 1)
 	pb.RegisterClaudeContextDaemonServiceServer(server, daemon.NewGRPCServer(manager, func() {
@@ -98,12 +102,14 @@ func run() error {
 
 	select {
 	case err := <-serveErrCh:
+		cancelRuntime()
 		server.Stop()
 		return err
 	case <-signalCh:
 	case <-shutdownCh:
 	}
 
+	cancelRuntime()
 	server.GracefulStop()
 	return nil
 }

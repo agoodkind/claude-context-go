@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"net"
 
-	pb "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1"
+	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

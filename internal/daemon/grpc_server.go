@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"strings"
 
-	pb "github.com/zilliztech/claude-context-go/gen/go/claudecontext/v1"
-	"github.com/zilliztech/claude-context-go/internal/model"
-	"github.com/zilliztech/claude-context-go/internal/pbconv"
-	"github.com/zilliztech/claude-context-go/internal/version"
+	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
+	"goodkind.io/claude-context-go/internal/model"
+	"goodkind.io/claude-context-go/internal/pbconv"
+	"goodkind.io/claude-context-go/internal/version"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -55,19 +55,21 @@ func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndex
 		State:         string(job.State),
 		Deduplicated:  deduplicated,
 		CanonicalPath: codebase.CanonicalPath,
+		DisplayText:   renderStartIndex(request.GetPath(), codebase, job, deduplicated),
 	}, nil
 }
 
 // ClearIndex removes a tracked codebase from daemon state.
 func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndexRequest) (*pb.ClearIndexResponse, error) {
-	_ = ctx
-	codebase, err := server.manager.ClearIndex(request.GetPath(), pbClient(request.GetClient()))
+	codebase, err := server.manager.ClearIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
 	if err != nil {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
+	indexedCount, indexingCount := countCodebaseStates(server.manager.ListIndexes(ctx))
 	return &pb.ClearIndexResponse{
-		CodebaseId: codebase.ID,
-		Cleared:    true,
+		CodebaseId:  codebase.ID,
+		Cleared:     true,
+		DisplayText: renderClearIndex(codebase, indexedCount, indexingCount),
 	}, nil
 }
 
@@ -79,15 +81,22 @@ func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRe
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 	return &pb.CancelJobResponse{
-		JobId:     job.ID,
-		Cancelled: job.State == "cancelled",
+		JobId:       job.ID,
+		Cancelled:   job.State == "cancelled",
+		DisplayText: renderCancelJob(job),
 	}, nil
 }
 
 // SyncIndex registers a sync request against an existing codebase.
 func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRequest) (*pb.SyncIndexResponse, error) {
-	job, codebase, deduplicated, err := server.manager.StartIndex(ctx, request.GetPath(), pbClient(request.GetClient()), pbconv.FromStartIndexConfig(&pb.StartIndexRequest{Path: request.GetPath()}), false)
+	job, codebase, deduplicated, err := server.manager.SyncIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
 	if err != nil {
+		if strings.Contains(err.Error(), "conflicting active job") {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		if strings.Contains(err.Error(), "codebase not tracked") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	operation := "sync"
@@ -98,36 +107,42 @@ func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRe
 		job.Operation = operation
 	}
 	return &pb.SyncIndexResponse{
-		JobId:      job.ID,
-		CodebaseId: codebase.ID,
-		State:      string(job.State),
+		JobId:       job.ID,
+		CodebaseId:  codebase.ID,
+		State:       string(job.State),
+		DisplayText: renderSyncIndex(codebase, job, deduplicated),
 	}, nil
 }
 
 // GetIndex resolves one tracked codebase by alias or canonical path.
 func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequest) (*pb.GetIndexResponse, error) {
-	_ = ctx
-	codebase, found, err := server.manager.GetIndex(request.GetPath())
+	codebase, activeJob, found, err := server.manager.GetIndex(ctx, request.GetPath())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if !found {
-		return nil, status.Error(codes.NotFound, "codebase not tracked: "+request.GetPath())
+	response := &pb.GetIndexResponse{
+		Tracked:     found,
+		DisplayText: renderGetIndex(request.GetPath(), found, codebasePointer(found, codebase), activeJob),
 	}
-	return &pb.GetIndexResponse{Codebase: pbconv.ToCodebase(codebase)}, nil
+	if found {
+		response.Codebase = pbconv.ToCodebase(codebase)
+		response.ActiveJob = pbconv.ToJobPointer(activeJob)
+	}
+	return response, nil
 }
 
 // ListIndexes returns all tracked codebases.
 func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndexesRequest) (*pb.ListIndexesResponse, error) {
 	_ = ctx
 	_ = request
-	codebases := server.manager.ListIndexes()
+	codebases := server.manager.ListIndexes(ctx)
 	response := &pb.ListIndexesResponse{
 		Indexes: make([]*pb.Codebase, 0, len(codebases)),
 	}
 	for _, codebase := range codebases {
 		response.Indexes = append(response.Indexes, pbconv.ToCodebase(codebase))
 	}
+	response.DisplayText = renderListIndexes(codebases)
 	return response, nil
 }
 
@@ -138,7 +153,10 @@ func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest)
 	if !found {
 		return nil, status.Error(codes.NotFound, "job not found: "+request.GetJobId())
 	}
-	return &pb.GetJobResponse{Job: pbconv.ToJob(job)}, nil
+	return &pb.GetJobResponse{
+		Job:         pbconv.ToJob(job),
+		DisplayText: renderGetJob(&job),
+	}, nil
 }
 
 // ListJobs returns all tracked jobs, optionally filtered by codebase id.
@@ -151,6 +169,7 @@ func (server *GRPCServer) ListJobs(ctx context.Context, request *pb.ListJobsRequ
 	for _, job := range jobs {
 		response.Jobs = append(response.Jobs, pbconv.ToJob(job))
 	}
+	response.DisplayText = renderListJobs(jobs)
 	return response, nil
 }
 
@@ -171,14 +190,32 @@ func (server *GRPCServer) WatchJobs(request *pb.WatchJobsRequest, stream pb.Clau
 
 // SearchCode is the future search RPC surface for semantic lookups.
 func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCodeRequest) (*pb.SearchCodeResponse, error) {
-	results, err := server.manager.SearchCode(request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
+	outcome, err := server.manager.SearchCode(ctx, request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
 	if err != nil {
+		if strings.Contains(err.Error(), "codebase not tracked") {
+			return nil, status.Error(codes.NotFound, fmt.Sprintf("Error: Codebase '%s' is not indexed. Please index it first using the index_codebase tool.", request.GetPath()))
+		}
+		if strings.Contains(err.Error(), "invalid file extensions in extensionFilter") {
+			return nil, status.Error(codes.InvalidArgument, "Error: "+err.Error())
+		}
+		if strings.Contains(err.Error(), "index data for '") {
+			return nil, status.Error(codes.InvalidArgument, "Error: "+err.Error())
+		}
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	response := &pb.SearchCodeResponse{
-		Results: make([]*pb.SearchResult, 0, len(results)),
+		Results:   make([]*pb.SearchResult, 0, len(outcome.Results)),
+		Codebase:  pbconv.ToCodebase(outcome.Codebase),
+		ActiveJob: pbconv.ToJobPointer(outcome.ActiveJob),
+		DisplayText: renderSearch(searchView{
+			RequestedPath: request.GetPath(),
+			Query:         request.GetQuery(),
+			Codebase:      outcome.Codebase,
+			ActiveJob:     outcome.ActiveJob,
+			Results:       outcome.Results,
+		}),
 	}
-	for _, result := range results {
+	for _, result := range outcome.Results {
 		response.Results = append(response.Results, &pb.SearchResult{
 			RelativePath: result.RelativePath,
 			StartLine:    result.StartLine,
@@ -207,6 +244,7 @@ func (server *GRPCServer) Doctor(ctx context.Context, request *pb.DoctorRequest)
 			Detail:   diagnostic,
 		})
 	}
+	response.DisplayText = renderDoctor(diagnostics)
 	return response, nil
 }
 
@@ -235,10 +273,33 @@ func (server *GRPCServer) Shutdown(ctx context.Context, request *pb.ShutdownRequ
 
 func pbClient(client *pb.ClientInfo) model.ClientInfo {
 	if client == nil {
-		return model.ClientInfo{}
+		return model.ClientInfo{Name: "", PID: 0}
 	}
 	return model.ClientInfo{
 		Name: client.GetName(),
 		PID:  client.GetPid(),
 	}
+}
+
+func codebasePointer(found bool, codebase model.Codebase) *model.Codebase {
+	if !found {
+		return nil
+	}
+	return &codebase
+}
+
+func countCodebaseStates(codebases []model.Codebase) (int, int) {
+	indexedCount := 0
+	indexingCount := 0
+	for _, codebase := range codebases {
+		switch codebase.Status {
+		case model.CodebaseStatusIndexed:
+			indexedCount++
+		case model.CodebaseStatusIndexing:
+			indexingCount++
+		case model.CodebaseStatusNotIndexed, model.CodebaseStatusFailed, model.CodebaseStatusStale:
+		default:
+		}
+	}
+	return indexedCount, indexingCount
 }

@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/zilliztech/claude-context-go/internal/model"
+	"goodkind.io/claude-context-go/internal/model"
 )
 
 // EnsureDir creates a directory tree when it is missing.
@@ -180,6 +180,15 @@ func WriteChunks(path string, chunks []model.StoredChunk) error {
 	if err := os.Rename(tempPath, path); err != nil {
 		slog.Error("rename temp chunk file failed", "from", tempPath, "to", path, "err", err)
 		return fmt.Errorf("rename temp chunk file %s to %s: %w", tempPath, path, err)
+	}
+	return nil
+}
+
+// RemoveFile deletes one persisted daemon file when it exists.
+func RemoveFile(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Error("remove persisted file failed", "path", path, "err", err)
+		return fmt.Errorf("remove persisted file %s: %w", path, err)
 	}
 	return nil
 }
