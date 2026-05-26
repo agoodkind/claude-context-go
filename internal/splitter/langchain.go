@@ -2,6 +2,7 @@ package splitter
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 // langchainLanguage is the normalized key used to look up separator tables.
@@ -223,9 +224,18 @@ func splitOnSeparator(content string, separator string) []string {
 
 func hardSplit(content string, chunkSize int) []string {
 	out := make([]string, 0, (len(content)+chunkSize-1)/chunkSize)
-	for start := 0; start < len(content); start += chunkSize {
+	start := 0
+	for start < len(content) {
 		end := min(start+chunkSize, len(content))
+		if end < len(content) {
+			end = alignDownToRuneStart(content, end)
+			if end <= start {
+				_, size := utf8.DecodeRuneInString(content[start:])
+				end = start + size
+			}
+		}
 		out = append(out, content[start:end])
+		start = end
 	}
 	return out
 }

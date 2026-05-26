@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_csharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
@@ -320,21 +321,53 @@ func addOverlap(chunks []Chunk, overlap int) []Chunk {
 		return chunks
 	}
 	result := make([]Chunk, 0, len(chunks))
-	for index, chunk := range chunks {
-		if index == 0 {
-			result = append(result, chunk)
-			continue
-		}
+	result = append(result, chunks[0])
+	for index := 1; index < len(chunks); index++ {
+		chunk := chunks[index]
 		previousChunk := chunks[index-1]
 		overlapText := previousChunk.Content
 		if len(overlapText) > overlap {
-			overlapText = overlapText[len(overlapText)-overlap:]
+			cut := alignToRuneStart(overlapText, len(overlapText)-overlap)
+			overlapText = overlapText[cut:]
 		}
 		chunk.Content = overlapText + "\n" + chunk.Content
 		chunk.StartLine = max(1, chunk.StartLine-lineCount(overlapText))
 		result = append(result, chunk)
 	}
 	return result
+}
+
+// alignToRuneStart returns the smallest index >= offset where s[i] starts a
+// valid UTF-8 codepoint. Byte-offset slicing into UTF-8 strings without this
+// alignment can yield chunk content that begins with a continuation byte,
+// which Milvus rejects at the gRPC marshal boundary for VarChar fields.
+func alignToRuneStart(s string, offset int) int {
+	if offset <= 0 {
+		return 0
+	}
+	if offset >= len(s) {
+		return len(s)
+	}
+	for offset < len(s) && !utf8.RuneStart(s[offset]) {
+		offset++
+	}
+	return offset
+}
+
+// alignDownToRuneStart returns the largest index <= offset where s[i] is the
+// start of a codepoint (or i == 0). Used to trim a chunk's tail back to the
+// last whole codepoint before a byte-offset boundary.
+func alignDownToRuneStart(s string, offset int) int {
+	if offset <= 0 {
+		return 0
+	}
+	if offset >= len(s) {
+		return len(s)
+	}
+	for offset > 0 && !utf8.RuneStart(s[offset]) {
+		offset--
+	}
+	return offset
 }
 
 func grammarForLanguage(language string) (*tree_sitter.Language, bool) {
