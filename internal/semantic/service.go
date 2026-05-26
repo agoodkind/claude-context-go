@@ -151,6 +151,7 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 	if len(chunks) == 0 {
 		return nil
 	}
+	chunks = service.guardrailExpand(ctx, codebasePath, chunks, "replace")
 
 	collectionName := service.CollectionName(codebasePath)
 	if err := service.dropIfExists(ctx, collectionName); err != nil {
@@ -243,6 +244,7 @@ func (service *Service) Reindex(ctx context.Context, codebasePath string, addedO
 	if len(addedOrModifiedChunks) == 0 {
 		return nil
 	}
+	addedOrModifiedChunks = service.guardrailExpand(ctx, codebasePath, addedOrModifiedChunks, "reindex")
 
 	batchSize := service.cfg.EmbeddingBatchSize
 	if batchSize <= 0 {
@@ -703,6 +705,90 @@ func sanitizeUTF8(value string) (string, bool) {
 		return value, false
 	}
 	return strings.ToValidUTF8(value, "�"), true
+}
+
+// milvusVarcharMaxBytes mirrors the schema's WithMaxLength(65535) for VarChar
+// fields. Chunks longer than this fail the Milvus insert with "length of
+// varchar field content exceeds max length". The splitter is supposed to
+// keep every chunk under chunk_size (default 2500), so an oversize chunk
+// at insert time signals a splitter regression. The expansion in
+// expandOversizeChunks turns the splitter regression into multiple rows
+// rather than a dropped insert, so no content is lost.
+const milvusVarcharMaxBytes = 65000
+
+// guardrailExpand wraps expandOversizeChunks with logging. Each oversize
+// chunk hitting this path signals an upstream splitter regression that
+// emitted content longer than chunk_size. The log carries the codebase
+// path, the operation that requested the embed, and the relative path of
+// the offending file so the regression can be diagnosed without losing
+// the data.
+func (service *Service) guardrailExpand(ctx context.Context, codebasePath string, chunks []model.StoredChunk, operation string) []model.StoredChunk {
+	expanded, changed := expandOversizeChunks(chunks)
+	if !changed {
+		return chunks
+	}
+	offenders := make([]string, 0)
+	for _, chunk := range chunks {
+		if len(chunk.Content) > milvusVarcharMaxBytes {
+			offenders = append(offenders, fmt.Sprintf("%s:%d-%d (%d bytes)", chunk.RelativePath, chunk.StartLine, chunk.EndLine, len(chunk.Content)))
+		}
+	}
+	slog.WarnContext(ctx, "semantic.expanded_oversize_chunks", "codebase_path", codebasePath, "operation", operation, "expanded_from", len(chunks), "expanded_to", len(expanded), "max_bytes", milvusVarcharMaxBytes, "offenders", offenders)
+	return expanded
+}
+
+// expandOversizeChunks returns a list where any chunk over
+// milvusVarcharMaxBytes has been split into multiple chunks aligned to
+// codepoint boundaries. The boolean reports whether any expansion
+// happened so the caller can log the upstream regression.
+func expandOversizeChunks(chunks []model.StoredChunk) ([]model.StoredChunk, bool) {
+	expanded := false
+	for _, chunk := range chunks {
+		if len(chunk.Content) > milvusVarcharMaxBytes {
+			expanded = true
+			break
+		}
+	}
+	if !expanded {
+		return chunks, false
+	}
+	out := make([]model.StoredChunk, 0, len(chunks))
+	for _, chunk := range chunks {
+		if len(chunk.Content) <= milvusVarcharMaxBytes {
+			out = append(out, chunk)
+			continue
+		}
+		for _, piece := range splitForVarchar(chunk.Content) {
+			child := chunk
+			child.Content = piece
+			out = append(out, child)
+		}
+	}
+	return out, true
+}
+
+// splitForVarchar cuts value into sub-strings of at most
+// milvusVarcharMaxBytes bytes, each ending on a UTF-8 codepoint boundary.
+func splitForVarchar(value string) []string {
+	out := make([]string, 0, (len(value)+milvusVarcharMaxBytes-1)/milvusVarcharMaxBytes)
+	start := 0
+	for start < len(value) {
+		end := start + milvusVarcharMaxBytes
+		if end >= len(value) {
+			out = append(out, value[start:])
+			break
+		}
+		for end > start && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		if end == start {
+			_, size := utf8.DecodeRuneInString(value[start:])
+			end = start + size
+		}
+		out = append(out, value[start:end])
+		start = end
+	}
+	return out
 }
 
 // generateID matches the TS chunk-ID format at packages/core/src/context.ts:1067.

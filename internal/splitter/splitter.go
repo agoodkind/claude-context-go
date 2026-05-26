@@ -235,20 +235,48 @@ func (dispatcher *Dispatcher) splitLargeChunk(chunk Chunk, chunkSize int) []Chun
 	currentStartLine := chunk.StartLine
 	currentLineCount := 0
 
+	flush := func() {
+		if strings.TrimSpace(currentChunk) == "" {
+			return
+		}
+		subChunks = append(subChunks, Chunk{
+			Content:   strings.TrimSpace(currentChunk),
+			StartLine: currentStartLine,
+			EndLine:   currentStartLine + currentLineCount - 1,
+			Language:  chunk.Language,
+			FilePath:  chunk.FilePath,
+		})
+	}
+
 	for i, line := range lines {
 		lineWithNewline := line
 		if i < len(lines)-1 {
 			lineWithNewline += "\n"
 		}
 
+		// A single line longer than chunkSize needs mid-line hard-splits;
+		// minified JS, generated code, and JSON dumps routinely produce
+		// these. Without this branch the AST chunk stays oversize and
+		// Milvus rejects it for exceeding the VarChar max length.
+		if len(lineWithNewline) > chunkSize {
+			flush()
+			currentChunk = ""
+			currentLineCount = 0
+			for _, piece := range hardSplit(lineWithNewline, chunkSize) {
+				subChunks = append(subChunks, Chunk{
+					Content:   strings.TrimSpace(piece),
+					StartLine: chunk.StartLine + i,
+					EndLine:   chunk.StartLine + i,
+					Language:  chunk.Language,
+					FilePath:  chunk.FilePath,
+				})
+			}
+			currentStartLine = chunk.StartLine + i + 1
+			continue
+		}
+
 		if len(currentChunk)+len(lineWithNewline) > chunkSize && currentChunk != "" {
-			subChunks = append(subChunks, Chunk{
-				Content:   strings.TrimSpace(currentChunk),
-				StartLine: currentStartLine,
-				EndLine:   currentStartLine + currentLineCount - 1,
-				Language:  chunk.Language,
-				FilePath:  chunk.FilePath,
-			})
+			flush()
 			currentChunk = lineWithNewline
 			currentStartLine = chunk.StartLine + i
 			currentLineCount = 1
@@ -259,15 +287,7 @@ func (dispatcher *Dispatcher) splitLargeChunk(chunk Chunk, chunkSize int) []Chun
 		currentLineCount++
 	}
 
-	if strings.TrimSpace(currentChunk) != "" {
-		subChunks = append(subChunks, Chunk{
-			Content:   strings.TrimSpace(currentChunk),
-			StartLine: currentStartLine,
-			EndLine:   currentStartLine + currentLineCount - 1,
-			Language:  chunk.Language,
-			FilePath:  chunk.FilePath,
-		})
-	}
+	flush()
 	return subChunks
 }
 
@@ -278,21 +298,48 @@ func (dispatcher *Dispatcher) characterSplit(content string, language string, pa
 	currentStartLine := 1
 	currentLineCount := 0
 
+	flush := func() {
+		if strings.TrimSpace(currentChunk) == "" {
+			return
+		}
+		chunks = append(chunks, Chunk{
+			Content:   currentChunk,
+			StartLine: currentStartLine,
+			EndLine:   currentStartLine + currentLineCount - 1,
+			Language:  language,
+			FilePath:  path,
+		})
+	}
+
 	for i, line := range lines {
 		lineWithNewline := line
 		if i < len(lines)-1 {
 			lineWithNewline += "\n"
 		}
 
-		if len(currentChunk)+len(lineWithNewline) > chunkSize && currentChunk != "" {
-			chunks = append(chunks, Chunk{
-				Content:   currentChunk,
-				StartLine: currentStartLine,
-				EndLine:   currentStartLine + currentLineCount - 1,
-				Language:  language,
-				FilePath:  path,
-			})
+		// Mid-line hard-split for lines longer than chunkSize keeps
+		// minified or single-line generated files within the per-chunk
+		// byte budget. Without it the line stays a single oversize
+		// chunk that Milvus refuses to accept.
+		if len(lineWithNewline) > chunkSize {
+			flush()
+			currentChunk = ""
+			currentLineCount = 0
+			for _, piece := range hardSplit(lineWithNewline, chunkSize) {
+				chunks = append(chunks, Chunk{
+					Content:   piece,
+					StartLine: i + 1,
+					EndLine:   i + 1,
+					Language:  language,
+					FilePath:  path,
+				})
+			}
+			currentStartLine = i + 2
+			continue
+		}
 
+		if len(currentChunk)+len(lineWithNewline) > chunkSize && currentChunk != "" {
+			flush()
 			currentChunk = lineWithNewline
 			currentStartLine = i + 1
 			currentLineCount = 1
@@ -303,15 +350,7 @@ func (dispatcher *Dispatcher) characterSplit(content string, language string, pa
 		currentLineCount++
 	}
 
-	if strings.TrimSpace(currentChunk) != "" {
-		chunks = append(chunks, Chunk{
-			Content:   currentChunk,
-			StartLine: currentStartLine,
-			EndLine:   currentStartLine + currentLineCount - 1,
-			Language:  language,
-			FilePath:  path,
-		})
-	}
+	flush()
 
 	return addOverlap(chunks, overlap)
 }
