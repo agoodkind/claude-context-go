@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/milvus-io/milvus/client/v2/entity"
 	"github.com/milvus-io/milvus/client/v2/index"
@@ -555,14 +556,26 @@ func (service *Service) insertBatch(ctx context.Context, collectionName string, 
 	fileExtensions := make([]string, 0, len(chunks))
 	metadataValues := make([]string, 0, len(chunks))
 
+	sanitizedCount := 0
 	for index, chunk := range chunks {
+		content, contentChanged := sanitizeUTF8(chunk.Content)
+		relativePath, pathChanged := sanitizeUTF8(chunk.RelativePath)
+		fileExtension, extChanged := sanitizeUTF8(chunk.FileExtension)
+		metadataValue, metaChanged := sanitizeUTF8(encodeMetadata(chunk))
+		if contentChanged || pathChanged || extChanged || metaChanged {
+			sanitizedCount++
+			slog.WarnContext(ctx, "semantic.sanitized_invalid_utf8", "relative_path", chunk.RelativePath, "start_line", chunk.StartLine, "end_line", chunk.EndLine, "content_changed", contentChanged, "path_changed", pathChanged, "extension_changed", extChanged, "metadata_changed", metaChanged)
+		}
 		ids = append(ids, generateID(chunk, index))
-		contents = append(contents, chunk.Content)
-		relativePaths = append(relativePaths, chunk.RelativePath)
+		contents = append(contents, content)
+		relativePaths = append(relativePaths, relativePath)
 		startLines = append(startLines, int64(chunk.StartLine))
 		endLines = append(endLines, int64(chunk.EndLine))
-		fileExtensions = append(fileExtensions, chunk.FileExtension)
-		metadataValues = append(metadataValues, encodeMetadata(chunk))
+		fileExtensions = append(fileExtensions, fileExtension)
+		metadataValues = append(metadataValues, metadataValue)
+	}
+	if sanitizedCount > 0 {
+		slog.WarnContext(ctx, "semantic.insertBatch sanitized chunks before Milvus marshal", "collection", collectionName, "sanitized", sanitizedCount, "batch_size", len(chunks))
 	}
 
 	insertOption = insertOption.
@@ -676,6 +689,20 @@ func decodeMetadataLanguage(metadata string) string {
 		return ""
 	}
 	return parsed.Language
+}
+
+// sanitizeUTF8 returns a copy of value with invalid UTF-8 byte sequences
+// replaced by the Unicode replacement character. Milvus rejects VarChar
+// payloads with invalid UTF-8 at the gRPC marshal boundary, so any chunk
+// content that survives the file-level skip but still slices through a
+// multi-byte codepoint (for example from a tree-sitter byte-offset
+// boundary) gets repaired here. The second return value reports whether
+// the input needed repair so callers can log the event.
+func sanitizeUTF8(value string) (string, bool) {
+	if utf8.ValidString(value) {
+		return value, false
+	}
+	return strings.ToValidUTF8(value, "�"), true
 }
 
 // generateID matches the TS chunk-ID format at packages/core/src/context.ts:1067.
