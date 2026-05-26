@@ -598,6 +598,159 @@ func TestRunDeltaSyncCheckpointsPerFile(t *testing.T) {
 	}
 }
 
+// TestRunDeltaSyncReportsCodebaseTotalsAfterSync proves the registry's
+// LastSuccessfulRun describes the codebase as a whole after an incremental
+// sync rather than the delta of files touched in that one run. The test
+// indexes five files, modifies one, runs a sync via the background-sync
+// harness, and asserts IndexedFiles == 5.
+func TestRunDeltaSyncReportsCodebaseTotalsAfterSync(t *testing.T) {
+	t.Parallel()
+
+	manager, cfg, repoPath := newTestManager(t)
+	extras := []string{"a.go", "b.go", "c.go", "d.go"}
+	for _, name := range extras {
+		path := filepath.Join(repoPath, name)
+		if err := os.WriteFile(path, []byte("package main\n// "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
+	initialHashes := map[string]string{
+		"main.go": hashText("package main\n"),
+		"a.go":    hashText("package main\n// a.go\n"),
+		"b.go":    hashText("package main\n// b.go\n"),
+		"c.go":    hashText("package main\n// c.go\n"),
+		"d.go":    hashText("package main\n// d.go\n"),
+	}
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 5,
+				TotalChunks:  5,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: initialHashes,
+			}, nil
+		},
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			content := "package main\n// " + relativePath + " edited\n"
+			return indexer.OneFileResult{
+				Chunks: []model.StoredChunk{{
+					Content:       content,
+					RelativePath:  relativePath,
+					StartLine:     1,
+					EndLine:       2,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHash: hashText(content),
+				Skipped:  false,
+			}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	mainPath := filepath.Join(repoPath, "main.go")
+	if err := os.WriteFile(mainPath, []byte("package main\nfunc Edited() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	syncer := NewBackgroundSync(cfg, manager)
+	syncer.runSyncAll(context.Background(), "test")
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil || !found {
+		t.Fatalf("GetIndex returned err=%v found=%v", err, found)
+	}
+	if codebase.LastSuccessfulRun == nil {
+		t.Fatal("LastSuccessfulRun is nil after sync")
+	}
+	if codebase.LastSuccessfulRun.IndexedFiles != 5 {
+		t.Fatalf("LastSuccessfulRun.IndexedFiles = %d, want 5 (codebase total, not delta)", codebase.LastSuccessfulRun.IndexedFiles)
+	}
+}
+
+// TestRunDeltaSyncEmptyDiffPreservesCodebaseTotals proves the empty-diff
+// fast path no longer re-zeros LastSuccessfulRun.IndexedFiles every time a
+// background sync runs against an unchanged codebase. The test indexes
+// five files, runs a no-op sync, and asserts IndexedFiles still reports 5.
+func TestRunDeltaSyncEmptyDiffPreservesCodebaseTotals(t *testing.T) {
+	t.Parallel()
+
+	manager, _, repoPath := newTestManager(t)
+	extras := []string{"a.go", "b.go", "c.go", "d.go"}
+	for _, name := range extras {
+		path := filepath.Join(repoPath, name)
+		if err := os.WriteFile(path, []byte("package main\n// "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
+	initialHashes := map[string]string{
+		"main.go": hashText("package main\n"),
+		"a.go":    hashText("package main\n// a.go\n"),
+		"b.go":    hashText("package main\n// b.go\n"),
+		"c.go":    hashText("package main\n// c.go\n"),
+		"d.go":    hashText("package main\n// d.go\n"),
+	}
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 5,
+				TotalChunks:  5,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: initialHashes,
+			}, nil
+		},
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			t.Fatalf("indexOne should not run on empty-diff sync; got %s", relativePath)
+			return indexer.OneFileResult{Skipped: true}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Call SyncIndex directly so the planSyncDiff empty-diff fast path
+	// runs even though the background-sync pre-check would have skipped
+	// this unchanged codebase.
+	if _, _, _, err := manager.SyncIndex(context.Background(), repoPath, model.ClientInfo{Name: "test-sync"}); err != nil {
+		t.Fatalf("SyncIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil || !found {
+		t.Fatalf("GetIndex returned err=%v found=%v", err, found)
+	}
+	if codebase.LastSuccessfulRun == nil {
+		t.Fatal("LastSuccessfulRun is nil after no-op sync")
+	}
+	if codebase.LastSuccessfulRun.IndexedFiles != 5 {
+		t.Fatalf("LastSuccessfulRun.IndexedFiles = %d, want 5 (empty-diff should preserve totals)", codebase.LastSuccessfulRun.IndexedFiles)
+	}
+}
+
 // TestRunDeltaSyncInvalidatesSnapshotOnConfigChange proves a stale snapshot
 // (different ConfigDigest) is treated as empty so every file gets
 // re-embedded under the new config.

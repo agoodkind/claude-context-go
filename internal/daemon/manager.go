@@ -1109,9 +1109,10 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 	}
 	diff := merkle.DiffSnapshots(seed, captured)
 	if diff.Empty() {
+		fileCount, chunkCount := manager.codebaseTotals(ctx, job.CanonicalPath, captured.Files, 0)
 		manager.updateJobCompleted(job.ID, indexer.Result{
-			IndexedFiles: 0,
-			TotalChunks:  0,
+			IndexedFiles: fileCount,
+			TotalChunks:  chunkCount,
 			Chunks:       nil,
 			FileHashes:   captured.Files,
 			SkippedFiles: nil,
@@ -1207,8 +1208,35 @@ func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 	}
 
 	result.FileHashes = state.working
+	fileCount, chunkCount := manager.codebaseTotals(ctx, job.CanonicalPath, state.working, result.TotalChunks)
+	result.IndexedFiles = fileCount
+	result.TotalChunks = chunkCount
 	manager.updateJobCompleted(job.ID, result)
 	return true
+}
+
+// codebaseTotals reports the file and chunk totals that represent the
+// codebase as a whole at the moment a delta sync completes, so the
+// registry's LastSuccessfulRun describes current state rather than the
+// per-run delta. fileCount is the size of the working merkle set, which
+// matches the codebase under the active config digest. chunkCount comes
+// from semantic.Service.Count when the backend is available; on
+// unavailability or any error it falls back to fallbackChunks, which the
+// caller passes as either the loop's running TotalChunks (incremental
+// path) or zero (empty-diff fast path).
+func (manager *Manager) codebaseTotals(ctx context.Context, canonicalPath string, working map[string]string, fallbackChunks int32) (int32, int32) {
+	fileCount := safeInt32(len(working))
+	if manager.semantic == nil || !manager.semantic.Available() {
+		return fileCount, fallbackChunks
+	}
+	count, err := manager.semantic.Count(ctx, canonicalPath)
+	if err != nil {
+		if !errors.Is(err, semantic.ErrUnavailable) {
+			slog.WarnContext(ctx, "semantic count failed; using fallback chunk total", "path", canonicalPath, "err", err)
+		}
+		return fileCount, fallbackChunks
+	}
+	return fileCount, count
 }
 
 func (manager *Manager) computeDeltaPlan(ctx context.Context, job model.Job, codebaseID string, streamingReindex bool) deltaPlan {
