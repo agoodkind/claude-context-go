@@ -112,7 +112,7 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 			mcp.WithBoolean("wait", mcp.Description("block this tool call until the indexing job reaches a terminal state (completed, failed, or cancelled)")),
 			mcp.WithNumber("wait_timeout_seconds", mcp.Description("max seconds to wait when wait=true; on timeout the daemon job keeps running and the tool returns the current progress (default 300)")),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("index_codebase", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			startRequest := &pb.StartIndexRequest{
 				Path:             req.GetString("path", ""),
 				Force:            req.GetBool("force", false),
@@ -131,7 +131,7 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 				timeoutSeconds = defaultIndexWaitSeconds
 			}
 			return callDaemonIndexAndWait(ctx, socketPath, outputMode, startRequest, time.Duration(timeoutSeconds)*time.Second)
-		},
+		}),
 	)
 }
 
@@ -142,14 +142,14 @@ func registerClearTool(mcpServer *server.MCPServer, socketPath string, outputMod
 			mcp.WithDescription("Clear a tracked codebase index through the daemon"),
 			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("clear_index", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.ClearIndex(ctx, &pb.ClearIndexRequest{
 					Path:   req.GetString("path", ""),
 					Client: &pb.ClientInfo{Name: "mcp"},
 				})
 			})
-		},
+		}),
 	)
 }
 
@@ -160,11 +160,11 @@ func registerStatusTool(mcpServer *server.MCPServer, socketPath string, outputMo
 			mcp.WithDescription("Get the current indexing status of one codebase path"),
 			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("get_indexing_status", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.GetIndex(ctx, &pb.GetIndexRequest{Path: req.GetString("path", "")})
 			})
-		},
+		}),
 	)
 }
 
@@ -174,11 +174,11 @@ func registerListIndexesTool(mcpServer *server.MCPServer, socketPath string, out
 			"list_indexing_statuses",
 			mcp.WithDescription("List every tracked codebase and its current indexing status"),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("list_indexing_statuses", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.ListIndexes(ctx, &pb.ListIndexesRequest{})
 			})
-		},
+		}),
 	)
 }
 
@@ -189,11 +189,11 @@ func registerListJobsTool(mcpServer *server.MCPServer, socketPath string, output
 			mcp.WithDescription("List active and historical indexing jobs"),
 			mcp.WithString("codebase_id", mcp.Description("optional codebase id to filter jobs")),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("list_indexing_jobs", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.ListJobs(ctx, &pb.ListJobsRequest{CodebaseId: req.GetString("codebase_id", "")})
 			})
-		},
+		}),
 	)
 }
 
@@ -204,11 +204,11 @@ func registerGetJobTool(mcpServer *server.MCPServer, socketPath string, outputMo
 			mcp.WithDescription("Get one indexing job by id"),
 			mcp.WithString("job_id", mcp.Description("job id to inspect")),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("get_indexing_job", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.GetJob(ctx, &pb.GetJobRequest{JobId: req.GetString("job_id", "")})
 			})
-		},
+		}),
 	)
 }
 
@@ -218,11 +218,11 @@ func registerDoctorTool(mcpServer *server.MCPServer, socketPath string, outputMo
 			"doctor_indexing",
 			mcp.WithDescription("Inspect local daemon indexing health and diagnostics"),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("doctor_indexing", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.Doctor(ctx, &pb.DoctorRequest{})
 			})
-		},
+		}),
 	)
 }
 
@@ -236,7 +236,7 @@ func registerSearchTool(mcpServer *server.MCPServer, socketPath string, outputMo
 			mcp.WithNumber("limit", mcp.Description("maximum number of results")),
 			mcp.WithArray("extensionFilter", mcp.Description("optional file extensions filter"), mcp.WithStringItems()),
 		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		wrapTool("search_code", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.SearchCode(ctx, &pb.SearchCodeRequest{
 					Path:            req.GetString("path", ""),
@@ -245,7 +245,7 @@ func registerSearchTool(mcpServer *server.MCPServer, socketPath string, outputMo
 					ExtensionFilter: req.GetStringSlice("extensionFilter", []string{}),
 				})
 			})
-		},
+		}),
 	)
 }
 
@@ -268,7 +268,8 @@ func callDaemonIndexAndWait(ctx context.Context, socketPath string, outputMode r
 	}
 	defer connection.Close()
 
-	startResponse, err := client.StartIndex(ctx, startRequest)
+	outgoingCtx := grpcutil.WithCorrelation(ctx)
+	startResponse, err := client.StartIndex(outgoingCtx, startRequest)
 	if err != nil {
 		slog.ErrorContext(ctx, "start index for wait failed", "path", startRequest.GetPath(), "err", err)
 		return toolErrorResult(rpcErrorText(err)), nil
@@ -279,7 +280,7 @@ func callDaemonIndexAndWait(ctx context.Context, socketPath string, outputMode r
 		return renderToolResponse(outputMode, startResponse)
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	waitCtx, cancel := context.WithTimeout(outgoingCtx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(indexWaitPollInterval)
 	defer ticker.Stop()
@@ -287,7 +288,7 @@ func callDaemonIndexAndWait(ctx context.Context, socketPath string, outputMode r
 	for {
 		jobResponse, err := client.GetJob(waitCtx, &pb.GetJobRequest{JobId: jobID})
 		if err == nil && isTerminalJobState(jobResponse.GetJob().GetState()) {
-			indexResponse, err := client.GetIndex(ctx, &pb.GetIndexRequest{Path: startRequest.GetPath()})
+			indexResponse, err := client.GetIndex(outgoingCtx, &pb.GetIndexRequest{Path: startRequest.GetPath()})
 			if err != nil {
 				slog.ErrorContext(ctx, "get index after wait failed", "path", startRequest.GetPath(), "err", err)
 				return renderToolResponse(outputMode, jobResponse)
@@ -297,7 +298,7 @@ func callDaemonIndexAndWait(ctx context.Context, socketPath string, outputMode r
 
 		select {
 		case <-waitCtx.Done():
-			indexResponse, err := client.GetIndex(ctx, &pb.GetIndexRequest{Path: startRequest.GetPath()})
+			indexResponse, err := client.GetIndex(outgoingCtx, &pb.GetIndexRequest{Path: startRequest.GetPath()})
 			if err != nil {
 				slog.ErrorContext(ctx, "get index after wait timeout failed", "path", startRequest.GetPath(), "err", err)
 				return renderToolResponse(outputMode, startResponse)
@@ -331,7 +332,7 @@ func callDaemonTool(ctx context.Context, socketPath string, outputMode response.
 	}
 	defer connection.Close()
 
-	result, err := call(ctx, client)
+	result, err := call(grpcutil.WithCorrelation(ctx), client)
 	if err != nil {
 		slog.ErrorContext(ctx, "daemon RPC failed", "socket_path", socketPath, "err", err)
 		return toolErrorResult(rpcErrorText(err)), nil

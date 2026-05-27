@@ -2,18 +2,79 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
+	"goodkind.io/claude-context-go/internal/adapterr"
+	"goodkind.io/claude-context-go/internal/clock"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/pbconv"
 	"goodkind.io/claude-context-go/internal/version"
-	"google.golang.org/grpc/codes"
+	"goodkind.io/gklog/correlation"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
+
+// beginRPC opens the per-RPC correlation span, emits daemon.rpc.started,
+// and returns the derived context plus a deferred completion function
+// that recovers panics through [adapterr.Respond] and emits
+// daemon.rpc.completed with status code and duration.
+func beginRPC(ctx context.Context, method string) (context.Context, func(*error)) {
+	corr := correlation.FromIncomingMetadata(ctx).Child()
+	ctx = correlation.WithContext(ctx, corr)
+	started := clock.Now()
+	slog.InfoContext(ctx, "daemon.rpc.started", "method", method)
+	return ctx, func(errPtr *error) {
+		if recovered := recover(); recovered != nil {
+			*errPtr = status.Error(adapterr.Respond(ctx, adapterr.NewInternal("daemon panic", fmt.Errorf("panic: %v", recovered))))
+		}
+		logRPCDone(ctx, method, started, *errPtr)
+	}
+}
+
+func logRPCDone(ctx context.Context, method string, started time.Time, err error) {
+	level := slog.LevelInfo
+	code := "OK"
+	if err != nil {
+		level = slog.LevelWarn
+		code = status.Code(err).String()
+	}
+	slog.LogAttrs(ctx, level, "daemon.rpc.completed",
+		slog.String("method", method),
+		slog.String("status", code),
+		slog.Int64("duration_ms", clock.Now().Sub(started).Milliseconds()),
+	)
+}
+
+// classifyManagerError promotes a raw manager error into a typed
+// [adapterr.AdapterError] based on the message substrings the
+// manager layer uses today. Unrecognized errors pass through; the
+// boundary wraps them as [adapterr.ClassInternal].
+func classifyManagerError(path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var adapterErr *adapterr.AdapterError
+	if errors.As(err, &adapterErr) {
+		return err
+	}
+	text := err.Error()
+	switch {
+	case strings.Contains(text, "conflicting active job"):
+		return adapterr.NewConflictingJob(text, err)
+	case strings.Contains(text, "codebase not tracked"):
+		return adapterr.NewNotIndexed(path, err)
+	case strings.Contains(text, "invalid file extensions in extensionFilter"):
+		return adapterr.NewInvalidPath(text, err)
+	case strings.Contains(text, "index data for '"):
+		return adapterr.NewInvalidPath(text, err)
+	}
+	return err
+}
 
 // GRPCServer exposes the daemon manager through the generated gRPC service.
 type GRPCServer struct {
@@ -30,9 +91,11 @@ func NewGRPCServer(manager *Manager, shutdown func()) *GRPCServer {
 }
 
 // Version reports daemon build metadata.
-func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionRequest) (*pb.VersionResponse, error) {
-	_ = ctx
+func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionRequest) (resp *pb.VersionResponse, err error) {
+	ctx, done := beginRPC(ctx, "Version")
+	defer done(&err)
 	_ = request
+	_ = ctx
 	return &pb.VersionResponse{
 		Version:   version.Version,
 		Commit:    version.Commit,
@@ -41,13 +104,12 @@ func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionReques
 }
 
 // StartIndex registers a new indexing request with the daemon.
-func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndexRequest) (*pb.StartIndexResponse, error) {
-	job, codebase, deduplicated, err := server.manager.StartIndex(ctx, request.GetPath(), pbClient(request.GetClient()), pbconv.FromStartIndexConfig(request), request.GetForce())
-	if err != nil {
-		if strings.Contains(err.Error(), "conflicting active job") {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
-		}
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndexRequest) (resp *pb.StartIndexResponse, err error) {
+	ctx, done := beginRPC(ctx, "StartIndex")
+	defer done(&err)
+	job, codebase, deduplicated, callErr := server.manager.StartIndex(ctx, request.GetPath(), pbClient(request.GetClient()), pbconv.FromStartIndexConfig(request), request.GetForce())
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
 	}
 	return &pb.StartIndexResponse{
 		JobId:         job.ID,
@@ -60,10 +122,12 @@ func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndex
 }
 
 // ClearIndex removes a tracked codebase from daemon state.
-func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndexRequest) (*pb.ClearIndexResponse, error) {
-	codebase, err := server.manager.ClearIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
-	if err != nil {
-		return nil, status.Error(codes.NotFound, err.Error())
+func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndexRequest) (resp *pb.ClearIndexResponse, err error) {
+	ctx, done := beginRPC(ctx, "ClearIndex")
+	defer done(&err)
+	codebase, callErr := server.manager.ClearIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
 	}
 	indexedCount, indexingCount := countCodebaseStates(server.manager.ListIndexes(ctx))
 	return &pb.ClearIndexResponse{
@@ -74,11 +138,13 @@ func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndex
 }
 
 // CancelJob cancels a tracked daemon job.
-func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRequest) (*pb.CancelJobResponse, error) {
+func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRequest) (resp *pb.CancelJobResponse, err error) {
+	ctx, done := beginRPC(ctx, "CancelJob")
+	defer done(&err)
 	_ = ctx
-	job, err := server.manager.CancelJob(request.GetJobId())
-	if err != nil {
-		return nil, status.Error(codes.NotFound, err.Error())
+	job, callErr := server.manager.CancelJob(request.GetJobId())
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewJobNotFound(request.GetJobId())))
 	}
 	return &pb.CancelJobResponse{
 		JobId:       job.ID,
@@ -88,16 +154,12 @@ func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRe
 }
 
 // SyncIndex registers a sync request against an existing codebase.
-func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRequest) (*pb.SyncIndexResponse, error) {
-	job, codebase, deduplicated, err := server.manager.SyncIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
-	if err != nil {
-		if strings.Contains(err.Error(), "conflicting active job") {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
-		}
-		if strings.Contains(err.Error(), "codebase not tracked") {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRequest) (resp *pb.SyncIndexResponse, err error) {
+	ctx, done := beginRPC(ctx, "SyncIndex")
+	defer done(&err)
+	job, codebase, deduplicated, callErr := server.manager.SyncIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
 	}
 	operation := "sync"
 	if deduplicated {
@@ -115,10 +177,12 @@ func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRe
 }
 
 // GetIndex resolves one tracked codebase by alias or canonical path.
-func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequest) (*pb.GetIndexResponse, error) {
-	codebase, activeJob, found, err := server.manager.GetIndex(ctx, request.GetPath())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequest) (resp *pb.GetIndexResponse, err error) {
+	ctx, done := beginRPC(ctx, "GetIndex")
+	defer done(&err)
+	codebase, activeJob, found, callErr := server.manager.GetIndex(ctx, request.GetPath())
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
 	}
 	response := &pb.GetIndexResponse{
 		Tracked:     found,
@@ -132,8 +196,9 @@ func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequ
 }
 
 // ListIndexes returns all tracked codebases.
-func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndexesRequest) (*pb.ListIndexesResponse, error) {
-	_ = ctx
+func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndexesRequest) (resp *pb.ListIndexesResponse, err error) {
+	ctx, done := beginRPC(ctx, "ListIndexes")
+	defer done(&err)
 	_ = request
 	codebases := server.manager.ListIndexes(ctx)
 	response := &pb.ListIndexesResponse{
@@ -147,11 +212,13 @@ func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndex
 }
 
 // GetJob resolves one tracked job by id.
-func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest) (*pb.GetJobResponse, error) {
+func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest) (resp *pb.GetJobResponse, err error) {
+	ctx, done := beginRPC(ctx, "GetJob")
+	defer done(&err)
 	_ = ctx
 	job, found := server.manager.GetJob(request.GetJobId())
 	if !found {
-		return nil, status.Error(codes.NotFound, "job not found: "+request.GetJobId())
+		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewJobNotFound(request.GetJobId())))
 	}
 	return &pb.GetJobResponse{
 		Job:         pbconv.ToJob(job),
@@ -160,7 +227,9 @@ func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest)
 }
 
 // ListJobs returns all tracked jobs, optionally filtered by codebase id.
-func (server *GRPCServer) ListJobs(ctx context.Context, request *pb.ListJobsRequest) (*pb.ListJobsResponse, error) {
+func (server *GRPCServer) ListJobs(ctx context.Context, request *pb.ListJobsRequest) (resp *pb.ListJobsResponse, err error) {
+	ctx, done := beginRPC(ctx, "ListJobs")
+	defer done(&err)
 	_ = ctx
 	jobs := server.manager.ListJobs(request.GetCodebaseId())
 	response := &pb.ListJobsResponse{
@@ -174,34 +243,29 @@ func (server *GRPCServer) ListJobs(ctx context.Context, request *pb.ListJobsRequ
 }
 
 // WatchJobs streams the latest visible state for requested jobs.
-func (server *GRPCServer) WatchJobs(request *pb.WatchJobsRequest, stream pb.ClaudeContextDaemonService_WatchJobsServer) error {
+func (server *GRPCServer) WatchJobs(request *pb.WatchJobsRequest, stream pb.ClaudeContextDaemonService_WatchJobsServer) (err error) {
+	ctx, done := beginRPC(stream.Context(), "WatchJobs")
+	defer done(&err)
 	for _, jobID := range request.GetJobIds() {
 		job, found := server.manager.GetJob(jobID)
 		if !found {
 			continue
 		}
-		if err := stream.Send(&pb.WatchJobsResponse{Job: pbconv.ToJob(job)}); err != nil {
-			slog.Error("send watch jobs event failed", "job_id", jobID, "err", err)
-			return fmt.Errorf("send watch jobs event for %s: %w", jobID, err)
+		if sendErr := stream.Send(&pb.WatchJobsResponse{Job: pbconv.ToJob(job)}); sendErr != nil {
+			slog.ErrorContext(ctx, "send watch jobs event failed", "job_id", jobID, "err", sendErr)
+			return fmt.Errorf("send watch jobs event for %s: %w", jobID, sendErr)
 		}
 	}
 	return nil
 }
 
 // SearchCode is the future search RPC surface for semantic lookups.
-func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCodeRequest) (*pb.SearchCodeResponse, error) {
-	outcome, err := server.manager.SearchCode(ctx, request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
-	if err != nil {
-		if strings.Contains(err.Error(), "codebase not tracked") {
-			return nil, status.Error(codes.NotFound, fmt.Sprintf("Error: Codebase '%s' is not indexed. Please index it first using the index_codebase tool.", request.GetPath()))
-		}
-		if strings.Contains(err.Error(), "invalid file extensions in extensionFilter") {
-			return nil, status.Error(codes.InvalidArgument, "Error: "+err.Error())
-		}
-		if strings.Contains(err.Error(), "index data for '") {
-			return nil, status.Error(codes.InvalidArgument, "Error: "+err.Error())
-		}
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCodeRequest) (resp *pb.SearchCodeResponse, err error) {
+	ctx, done := beginRPC(ctx, "SearchCode")
+	defer done(&err)
+	outcome, callErr := server.manager.SearchCode(ctx, request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
+	if callErr != nil {
+		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
 	}
 	response := &pb.SearchCodeResponse{
 		Results:   make([]*pb.SearchResult, 0, len(outcome.Results)),
@@ -229,7 +293,9 @@ func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCode
 }
 
 // Doctor reports daemon-local diagnostics.
-func (server *GRPCServer) Doctor(ctx context.Context, request *pb.DoctorRequest) (*pb.DoctorResponse, error) {
+func (server *GRPCServer) Doctor(ctx context.Context, request *pb.DoctorRequest) (resp *pb.DoctorResponse, err error) {
+	ctx, done := beginRPC(ctx, "Doctor")
+	defer done(&err)
 	_ = ctx
 	_ = request
 	diagnostics := server.manager.Doctor()
@@ -249,8 +315,9 @@ func (server *GRPCServer) Doctor(ctx context.Context, request *pb.DoctorRequest)
 }
 
 // Shutdown requests a graceful daemon shutdown.
-func (server *GRPCServer) Shutdown(ctx context.Context, request *pb.ShutdownRequest) (*pb.ShutdownResponse, error) {
-	_ = ctx
+func (server *GRPCServer) Shutdown(ctx context.Context, request *pb.ShutdownRequest) (resp *pb.ShutdownResponse, err error) {
+	ctx, done := beginRPC(ctx, "Shutdown")
+	defer done(&err)
 	_ = request
 	peerInfo, found := peer.FromContext(ctx)
 	if found && peerInfo.Addr != nil {

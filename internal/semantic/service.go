@@ -19,9 +19,11 @@ import (
 	"github.com/milvus-io/milvus/client/v2/entity"
 	"github.com/milvus-io/milvus/client/v2/index"
 	"github.com/milvus-io/milvus/client/v2/milvusclient"
+	"goodkind.io/claude-context-go/internal/adapterr"
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/embedding"
 	"goodkind.io/claude-context-go/internal/model"
+	"goodkind.io/claude-context-go/internal/spans"
 	"goodkind.io/claude-context-go/internal/tshash"
 )
 
@@ -144,7 +146,10 @@ func (service *Service) CollectionName(codebasePath string) string {
 }
 
 // Replace drops and rebuilds one codebase collection from chunk data.
-func (service *Service) Replace(ctx context.Context, codebasePath string, chunks []model.StoredChunk, progress func(Progress)) error {
+func (service *Service) Replace(ctx context.Context, codebasePath string, chunks []model.StoredChunk, progress func(Progress)) (err error) {
+	ctx, done := spans.Open(ctx, "semantic.replace")
+	defer done(&err)
+
 	if !service.Available() {
 		return nil
 	}
@@ -180,7 +185,7 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
 		if err != nil {
 			slog.ErrorContext(ctx, "embed batch failed", "err", err)
-			return fmt.Errorf("embed batch: %w", err)
+			return adapterr.NewEmbedderUnreachable(err)
 		}
 		if len(vectors) != len(chunkBatch) {
 			slog.ErrorContext(ctx, "embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
@@ -220,7 +225,10 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 // inserted in the same batched flow Replace uses. Reindex returns
 // ErrCollectionMissing if the collection no longer exists so callers can
 // fall back to a full Replace.
-func (service *Service) Reindex(ctx context.Context, codebasePath string, addedOrModifiedChunks []model.StoredChunk, removedOrModifiedRelativePaths []string, progress func(Progress)) error {
+func (service *Service) Reindex(ctx context.Context, codebasePath string, addedOrModifiedChunks []model.StoredChunk, removedOrModifiedRelativePaths []string, progress func(Progress)) (err error) {
+	ctx, done := spans.Open(ctx, "semantic.reindex")
+	defer done(&err)
+
 	if !service.Available() {
 		return nil
 	}
@@ -266,7 +274,7 @@ func (service *Service) Reindex(ctx context.Context, codebasePath string, addedO
 		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
 		if err != nil {
 			slog.ErrorContext(ctx, "embed reindex batch failed", "err", err)
-			return fmt.Errorf("embed reindex batch: %w", err)
+			return adapterr.NewEmbedderUnreachable(err)
 		}
 		if len(vectors) != len(chunkBatch) {
 			slog.ErrorContext(ctx, "reindex embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
@@ -547,7 +555,10 @@ func (service *Service) createCollection(ctx context.Context, collectionName str
 	return nil
 }
 
-func (service *Service) insertBatch(ctx context.Context, collectionName string, chunks []model.StoredChunk, vectors [][]float32) error {
+func (service *Service) insertBatch(ctx context.Context, collectionName string, chunks []model.StoredChunk, vectors [][]float32) (err error) {
+	ctx, done := spans.Open(ctx, "semantic.insertBatch")
+	defer done(&err)
+
 	insertOption := milvusclient.NewColumnBasedInsertOption(collectionName)
 
 	ids := make([]string, 0, len(chunks))
@@ -723,6 +734,9 @@ const milvusVarcharMaxBytes = 65000
 // the offending file so the regression can be diagnosed without losing
 // the data.
 func (service *Service) guardrailExpand(ctx context.Context, codebasePath string, chunks []model.StoredChunk, operation string) []model.StoredChunk {
+	ctx, done := spans.Open(ctx, "semantic.guardrailExpand")
+	defer done(nil)
+
 	expanded, changed := expandOversizeChunks(chunks)
 	if !changed {
 		return chunks
@@ -839,18 +853,6 @@ func maxInt(values ...int) int {
 	}
 	return currentMax
 }
-
-// ErrUnavailable reports that the semantic backend is not configured.
-var ErrUnavailable = errors.New("semantic backend is unavailable")
-
-// ErrCollectionMissing reports that the semantic collection does not exist yet.
-var ErrCollectionMissing = errors.New("semantic collection is missing")
-
-// ErrCollectionNotReady reports that the semantic collection exists but cannot be searched yet.
-var ErrCollectionNotReady = errors.New("semantic collection is not ready")
-
-// ErrSearchResultIncomplete reports that Milvus returned a result set without the requested fields.
-var ErrSearchResultIncomplete = errors.New("semantic search result is incomplete")
 
 // ValidateExtensionFilter returns the normalized extension list or an error if any entry is invalid.
 func ValidateExtensionFilter(extensionFilter []string) ([]string, error) {

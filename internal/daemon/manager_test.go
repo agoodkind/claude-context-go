@@ -1075,7 +1075,7 @@ func newTestManager(t *testing.T) (*Manager, config.Config, string) {
 		t.Fatalf("WriteRegistry returned error: %v", err)
 	}
 
-	manager, err := NewManager(cfg)
+	manager, err := NewManager(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewManager returned error: %v", err)
 	}

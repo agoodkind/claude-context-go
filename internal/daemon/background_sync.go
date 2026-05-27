@@ -11,11 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"goodkind.io/claude-context-go/internal/adapterr"
 	"goodkind.io/claude-context-go/internal/clock"
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/store"
+	"goodkind.io/gklog/correlation"
 )
 
 const (
@@ -147,6 +149,17 @@ func (syncer *BackgroundSync) runSyncAll(ctx context.Context, source string) {
 		return
 	}
 
+	rootCorr := correlation.New("").WithIdentityAttributes(
+		correlation.IdentityAttribute{Key: "origin", Value: "sync-" + source},
+	)
+	ctx = correlation.WithContext(ctx, rootCorr)
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			_, _ = adapterr.Respond(ctx, adapterr.NewInternal("background sync panic", fmt.Errorf("panic: %v", recovered)))
+		}
+	}()
+
 	if !syncer.beginSync(ctx, source) {
 		return
 	}
@@ -161,9 +174,15 @@ func (syncer *BackgroundSync) runSyncAll(ctx context.Context, source string) {
 			continue
 		}
 
-		changed, err := syncer.codebaseChanged(ctx, codebase)
+		syntheticJobID := fmt.Sprintf("sync-%s-%d", codebase.ID, clock.Now().Unix())
+		iterCtx := correlation.WithContext(ctx, correlation.FromContext(ctx).Child().WithIdentityAttributes(
+			correlation.IdentityAttribute{Key: "codebase_id", Value: codebase.ID},
+			correlation.IdentityAttribute{Key: "job_id", Value: syntheticJobID},
+		))
+
+		changed, err := syncer.codebaseChanged(iterCtx, codebase)
 		if err != nil {
-			slog.ErrorContext(ctx, "check sync state failed", "path", codebase.CanonicalPath, "err", err)
+			slog.ErrorContext(iterCtx, "check sync state failed", "path", codebase.CanonicalPath, "err", err)
 			continue
 		}
 		if !changed {
@@ -171,7 +190,7 @@ func (syncer *BackgroundSync) runSyncAll(ctx context.Context, source string) {
 		}
 
 		_, _, _, err = syncer.manager.SyncIndex(
-			ctx,
+			iterCtx,
 			codebase.CanonicalPath,
 			model.ClientInfo{Name: "daemon-sync", PID: 0},
 		)
@@ -179,7 +198,7 @@ func (syncer *BackgroundSync) runSyncAll(ctx context.Context, source string) {
 			if syncConflictError(err) {
 				continue
 			}
-			slog.ErrorContext(ctx, "start sync job failed", "path", codebase.CanonicalPath, "err", err)
+			slog.ErrorContext(iterCtx, "start sync job failed", "path", codebase.CanonicalPath, "err", err)
 		}
 	}
 }
