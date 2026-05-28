@@ -1,32 +1,7 @@
 name: CI
-
-on:
-  push:
-  pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-permissions:
-  contents: read
-
+on: [push, pull_request]
 jobs:
   ci:
-    name: build + test (linux)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: make build
-        run: make build
-
-      - name: make test
-        run: make test
+    uses: agoodkind/go-makefile/.github/workflows/_ci.yml@main
+    permissions:
+      contents: read
