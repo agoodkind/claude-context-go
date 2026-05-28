@@ -126,7 +126,7 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 		slog.Error("write chunk cache failed", "job_id", jobID, "err", err)
 	}
 	if len(result.FileHashes) != 0 {
-		snapshot := merkle.Snapshot{ConfigDigest: codebase.EffectiveConfig.IgnoreDigest, Files: result.FileHashes}
+		snapshot := merkle.Snapshot{ConfigDigest: codebase.EffectiveConfig.IgnoreDigest, Files: result.FileHashes, Inodes: nil}
 		if err := merkle.WriteSnapshot(codebase.MerkleSnapshotPath, snapshot); err != nil {
 			slog.Error("write Merkle snapshot failed", "job_id", jobID, "err", err)
 		}

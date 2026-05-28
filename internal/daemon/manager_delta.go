@@ -65,7 +65,7 @@ func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job,
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
-			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil},
+			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil, Inodes: nil},
 			seedSnapshot:    seed,
 			configDigest:    configDigest,
 			fallback:        false,
@@ -106,7 +106,7 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
-			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil},
+			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil, Inodes: nil},
 			seedSnapshot:    seed,
 			configDigest:    configDigest,
 			fallback:        false,
@@ -339,7 +339,7 @@ func (manager *Manager) classifyReindexErr(ctx context.Context, job model.Job, e
 }
 
 func (manager *Manager) writeCheckpoint(ctx context.Context, state deltaState, label string) {
-	snapshot := merkle.Snapshot{ConfigDigest: state.plan.configDigest, Files: state.working}
+	snapshot := merkle.Snapshot{ConfigDigest: state.plan.configDigest, Files: state.working, Inodes: nil}
 	if err := merkle.WriteSnapshot(state.snapshotPath, snapshot); err != nil {
 		slog.ErrorContext(ctx, "checkpoint write failed", "path", state.snapshotPath, "label", label, "err", err)
 	}

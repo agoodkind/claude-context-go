@@ -19,13 +19,76 @@ import (
 	"goodkind.io/claude-context-go/internal/store"
 )
 
+// InodeRef captures the host filesystem identifiers for one snapshot file.
+// Device is the operating system's device id rendered as a base-10 string
+// for the same comparable-token reason the daemon's inodeIdentity uses;
+// Inode is the inode number from Stat_t.Ino. When both fields are zero the
+// snapshot entry predates inode capture and the caller must fall back to
+// path-only identity for that file.
+type InodeRef struct {
+	Device string `json:"d,omitempty"`
+	Inode  uint64 `json:"i,omitempty"`
+}
+
+// IsZero reports whether the ref carries no usable identifier. An entry
+// without a device or inode value is treated as path-only by callers.
+func (ref InodeRef) IsZero() bool {
+	return ref.Device == "" && ref.Inode == 0
+}
+
 // Snapshot stores one content hash per relative file path. ConfigDigest
 // records the IgnoreDigest of the request that produced these hashes so a
 // resuming run can detect when a config change has invalidated the
 // checkpoint and trigger a fresh embed pass.
+//
+// Inodes is the optional per-path (device, inode) sidecar that lets the
+// converge decision table detect renames and hardlinks without
+// re-embedding. A path missing from Inodes is treated as path-only by
+// LookupByInode; that branch falls through to the normal embed path.
 type Snapshot struct {
-	ConfigDigest string            `json:"config_digest,omitempty"`
-	Files        map[string]string `json:"files"`
+	ConfigDigest string              `json:"config_digest,omitempty"`
+	Files        map[string]string   `json:"files"`
+	Inodes       map[string]InodeRef `json:"inodes,omitempty"`
+}
+
+// LookupByInode returns every recorded path whose (device, inode) matches
+// the supplied reference. An empty result means the inode has not been
+// observed under another path in this codebase.
+func (snapshot *Snapshot) LookupByInode(ref InodeRef) []string {
+	if ref.IsZero() || len(snapshot.Inodes) == 0 {
+		return nil
+	}
+	matches := make([]string, 0)
+	for path, recorded := range snapshot.Inodes {
+		if recorded == ref {
+			matches = append(matches, path)
+		}
+	}
+	return matches
+}
+
+// RecordInode stamps the (device, inode) sidecar entry for relativePath,
+// allocating the sidecar map on first use. A zero ref clears the entry.
+func (snapshot *Snapshot) RecordInode(relativePath string, ref InodeRef) {
+	if ref.IsZero() {
+		if snapshot.Inodes != nil {
+			delete(snapshot.Inodes, relativePath)
+		}
+		return
+	}
+	if snapshot.Inodes == nil {
+		snapshot.Inodes = map[string]InodeRef{}
+	}
+	snapshot.Inodes[relativePath] = ref
+}
+
+// ForgetInode drops the (device, inode) sidecar entry for relativePath.
+// Safe to call when the entry does not exist.
+func (snapshot *Snapshot) ForgetInode(relativePath string) {
+	if snapshot.Inodes == nil {
+		return
+	}
+	delete(snapshot.Inodes, relativePath)
 }
 
 // Capture walks a codebase and records content hashes for the tracked files.
@@ -83,7 +146,7 @@ func Capture(
 		files[relativePath] = digestBytes(data)
 	}
 
-	return Snapshot{ConfigDigest: "", Files: files}, nil
+	return Snapshot{ConfigDigest: "", Files: files, Inodes: nil}, nil
 }
 
 // WriteSnapshot persists a snapshot atomically.
@@ -144,7 +207,7 @@ func WriteSnapshot(path string, snapshot Snapshot) error {
 // legacy digest matches the request, the snapshot is treated as valid
 // and returned with the request digest stamped in memory.
 func LoadSnapshotForConfig(path string, configDigest string, legacyAcceptDigest string) Snapshot {
-	empty := Snapshot{ConfigDigest: configDigest, Files: map[string]string{}}
+	empty := Snapshot{ConfigDigest: configDigest, Files: map[string]string{}, Inodes: nil}
 	snapshot, err := ReadSnapshot(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
