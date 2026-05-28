@@ -7,8 +7,8 @@ require (
 	github.com/milvus-io/milvus/client/v2 v2.6.4
 	github.com/openai/openai-go/v2 v2.7.1
 	github.com/rjeczalik/notify v0.9.3
-	github.com/tree-sitter/go-tree-sitter v0.25.0
-	github.com/tree-sitter/tree-sitter-c v0.24.2
+	github.com/tree-sitter/go-tree-sitter v0.24.1-0.20251112183152-c9492002f76e
+	github.com/tree-sitter/tree-sitter-c v0.24.0
 	github.com/tree-sitter/tree-sitter-cpp v0.23.4
 	github.com/tree-sitter/tree-sitter-go v0.25.0
 	github.com/tree-sitter/tree-sitter-java v0.23.5
