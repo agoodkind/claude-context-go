@@ -66,6 +66,7 @@ func (syncer *BackgroundSync) Start(ctx context.Context) {
 			syncer.convergeViaWatcher(ctx, codebaseID, relativePaths)
 		})
 		syncer.watcher = NewWatcher(syncer.manager, syncer.queue)
+		syncer.manager.SetCodebaseLifecycleHook(syncer.watcher)
 		go func() {
 			defer func() {
 				if recovered := recover(); recovered != nil {
