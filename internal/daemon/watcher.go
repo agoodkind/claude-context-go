@@ -15,9 +15,9 @@ import (
 const watcherEventBuffer = 4096
 
 type watchRoot struct {
-	codebaseID     string
-	root           string
-	ignorePatterns []string
+	codebaseID string
+	root       string
+	rules      discovery.IgnoreRules
 }
 
 // Watcher converts filesystem events under tracked codebases into per-path
@@ -74,12 +74,12 @@ func (watcher *Watcher) resolveRoots(ctx context.Context) []watchRoot {
 	codebases := watcher.manager.ListIndexes(ctx)
 	roots := make([]watchRoot, 0, len(codebases))
 	for _, codebase := range codebases {
-		patterns, err := discovery.EffectiveIgnorePatterns(ctx, codebase.CanonicalPath, codebase.EffectiveConfig.IgnorePatterns)
+		rules, err := discovery.EffectiveIgnorePatterns(ctx, codebase.CanonicalPath, codebase.EffectiveConfig.IgnorePatterns)
 		if err != nil {
 			slog.ErrorContext(ctx, "watcher.ignore_resolve_failed", "component", "daemon", "subcomponent", "watcher", "root", codebase.CanonicalPath, "err", err)
 			continue
 		}
-		roots = append(roots, watchRoot{codebaseID: codebase.ID, root: codebase.CanonicalPath, ignorePatterns: patterns})
+		roots = append(roots, watchRoot{codebaseID: codebase.ID, root: codebase.CanonicalPath, rules: rules})
 	}
 	// Longest root first so a codebase nested inside another wins the match.
 	sort.Slice(roots, func(first int, second int) bool {
@@ -107,7 +107,7 @@ func (watcher *Watcher) dispatch(event notify.EventInfo) {
 		// the contained files raise their own events.
 		return
 	}
-	if discovery.PathIgnored(relativePath, root.ignorePatterns) {
+	if excluded, _, _ := discovery.PathIgnored(relativePath, root.rules); excluded {
 		return
 	}
 	watcher.queue.Enqueue(root.codebaseID, relativePath)
@@ -119,5 +119,5 @@ func (watcher *Watcher) ownerOf(path string) (watchRoot, bool) {
 			return root, true
 		}
 	}
-	return watchRoot{codebaseID: "", root: "", ignorePatterns: nil}, false
+	return watchRoot{codebaseID: "", root: "", rules: discovery.IgnoreRules{Nodes: nil}}, false
 }

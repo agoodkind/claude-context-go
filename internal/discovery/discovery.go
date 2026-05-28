@@ -146,6 +146,14 @@ var defaultIgnorePatterns = []string{
 	"go.sum",
 }
 
+// Constant labels for the source field on a pattern; surface in PathIgnored
+// output so callers can name the matched pattern's origin.
+const (
+	patternSourceBuiltin  = "<built-in>"
+	patternSourceOverride = "<override>"
+	patternSourceGlobal   = "<global>"
+)
+
 // Result is one discovery pass over a codebase root.
 type Result struct {
 	Files          []string
@@ -159,28 +167,62 @@ type Result struct {
 // files, the global ~/.context/.contextignore, and any user overrides. The
 // resulting rules are then evaluated with PathIgnored.
 //
-// Nodes maps a directory relative path (slash-separated, root is "") to the
-// ignore patterns declared directly in that directory's .gitignore. The
-// flattened Patterns slice carries the root-level effective patterns so
-// callers that still expect a flat denylist (the discovery walk, the
-// indexer-time ignore digest) keep working without a tree walk.
+// Each entry in Nodes maps a directory relative path (slash-separated, root
+// is "") to the patterns declared directly in that directory's .gitignore
+// (or, for the root entry, the merged defaults and overrides). Patterns
+// inside a node are stored in declaration order so last-match-wins is
+// preserved.
 type IgnoreRules struct {
-	Patterns []string
-	Nodes    map[string][]string
+	// Nodes is the per-directory pattern table. The key is the directory
+	// path relative to the codebase root; the empty key holds the root
+	// node's patterns.
+	Nodes map[string][]ignorePattern
 }
 
-// Flatten returns the flat union of every node's patterns in declaration
-// order so callers that want a single deduplicated denylist can fold the
-// tree without losing any rule.
+// ignorePattern is one parsed entry from a .gitignore-style source. Pattern
+// is the raw text (including any leading '!' for negation); Negation is
+// true when the entry starts with '!'; Source names the file the pattern
+// came from so PathIgnored can surface it.
+type ignorePattern struct {
+	Pattern  string
+	Negation bool
+	Source   string
+}
+
+// Patterns returns the root-node pattern list as a slice of plain strings
+// so legacy callers that consume a flat denylist still work.
+func (rules IgnoreRules) Patterns() []string {
+	if len(rules.Nodes) == 0 {
+		return nil
+	}
+	root := rules.Nodes[""]
+	patterns := make([]string, 0, len(root))
+	for _, entry := range root {
+		patterns = append(patterns, entry.Pattern)
+	}
+	return patterns
+}
+
+// Flatten returns every pattern in the rules tree as a single deduplicated
+// list. The flat list is used by callers (notably the indexer's discovery
+// pass and the merkle config digest) that need a stable denylist before
+// the per-directory tree walk is available.
 func (rules IgnoreRules) Flatten() []string {
 	if len(rules.Nodes) == 0 {
-		return append([]string{}, rules.Patterns...)
+		return nil
 	}
-	merged := append([]string{}, rules.Patterns...)
-	for _, patterns := range rules.Nodes {
-		merged = append(merged, patterns...)
+	merged := make([]string, 0)
+	for _, entries := range rules.Nodes {
+		for _, entry := range entries {
+			merged = append(merged, entry.Pattern)
+		}
 	}
 	return dedupStrings(merged)
+}
+
+// IsEmpty reports whether the rule tree has no nodes.
+func (rules IgnoreRules) IsEmpty() bool {
+	return len(rules.Nodes) == 0
 }
 
 // Discover walks a codebase root and returns every file that survives the
@@ -194,41 +236,133 @@ func Discover(ctx context.Context, root string, additionalIgnorePatterns []strin
 		return Result{}, fmt.Errorf("resolve absolute root %s: %w", root, err)
 	}
 
-	effectiveIgnorePatterns, err := loadIgnorePatterns(ctx, absoluteRoot, additionalIgnorePatterns)
+	rules, err := EffectiveIgnorePatterns(ctx, absoluteRoot, additionalIgnorePatterns)
 	if err != nil {
 		return Result{}, err
 	}
 	effectiveExtensions := normalizeExtensions(additionalExtensions)
 
 	files := []string{}
-	if err := walkFiles(ctx, absoluteRoot, absoluteRoot, effectiveIgnorePatterns, &files); err != nil {
+	if err := walkFiles(ctx, absoluteRoot, absoluteRoot, rules, &files); err != nil {
 		return Result{}, err
 	}
 	slices.Sort(files)
 
 	return Result{
 		Files:          files,
-		IgnorePatterns: effectiveIgnorePatterns,
+		IgnorePatterns: rules.Flatten(),
 		Extensions:     effectiveExtensions,
 	}, nil
 }
 
-// EffectiveIgnorePatterns resolves the ignore denylist for root the same way
-// Discover does (built-in defaults plus repo and global ignore files). A
-// caller that watches the tree resolves this once per codebase and matches
-// live events against it with PathIgnored.
-func EffectiveIgnorePatterns(ctx context.Context, root string, additionalIgnorePatterns []string) ([]string, error) {
-	return loadIgnorePatterns(ctx, root, additionalIgnorePatterns)
+// EffectiveIgnorePatterns resolves the ignore rule tree for root by reading
+// every nested .gitignore file, the built-in defaults, repo-level ignore
+// files at the root, the global ~/.context/.contextignore, and any
+// user-supplied overrides. The returned tree is evaluated by PathIgnored.
+func EffectiveIgnorePatterns(ctx context.Context, root string, additionalIgnorePatterns []string) (IgnoreRules, error) {
+	nodes := map[string][]ignorePattern{}
+	rootPatterns := make([]ignorePattern, 0, len(defaultIgnorePatterns)+len(additionalIgnorePatterns))
+	for _, pattern := range defaultIgnorePatterns {
+		rootPatterns = append(rootPatterns, parsePattern(pattern, patternSourceBuiltin))
+	}
+	for _, pattern := range additionalIgnorePatterns {
+		rootPatterns = append(rootPatterns, parsePattern(pattern, patternSourceOverride))
+	}
+
+	if err := walkGitignore(ctx, root, "", nodes); err != nil {
+		return IgnoreRules{}, err
+	}
+
+	// Repo-level .gitignore at the root is folded into rootPatterns rather
+	// than into a "" node entry from the walk so the digest of the root
+	// node stays stable across reloads.
+	if existing, found := nodes[""]; found {
+		rootPatterns = append(rootPatterns, existing...)
+		delete(nodes, "")
+	}
+
+	if globalPatterns, err := loadGlobalContextIgnore(ctx); err == nil {
+		rootPatterns = append(rootPatterns, globalPatterns...)
+	}
+
+	nodes[""] = rootPatterns
+
+	return IgnoreRules{Nodes: nodes}, nil
 }
 
-// PathIgnored reports whether relativePath is excluded by patterns. It matches
-// the inclusion decision Discover makes, so a watcher and a full scan agree on
-// which paths belong in the index.
-func PathIgnored(relativePath string, patterns []string) bool {
-	return shouldIgnore(relativePath, patterns)
+// PathIgnored reports whether relativePath is excluded by the ignore rule
+// tree. The first return is the verdict. The second return is the matched
+// pattern (raw, including any leading '!') when excluded. The third return
+// is the source label (the .gitignore file's path within the codebase, the
+// global ignore path, or one of the built-in/override labels).
+//
+// Evaluation walks rules from the root node down through every ancestor
+// directory of the file, applying last-match-wins inside each node. Git's
+// directory-exclusion rule applies: a negation pattern on a file cannot
+// re-include the file when any ancestor directory was excluded by a
+// non-negation match.
+func PathIgnored(relativePath string, rules IgnoreRules) (bool, string, string) {
+	normalized := strings.Trim(strings.ReplaceAll(relativePath, "\\", "/"), "/")
+	if normalized == "" || rules.IsEmpty() {
+		return false, "", ""
+	}
+	parts := strings.Split(normalized, "/")
+
+	var lastExcluded bool
+	var lastPattern, lastSource string
+	var ancestorExcluded bool
+	var ancestorPattern, ancestorSource string
+
+	visit := func(scopeDir string, entries []ignorePattern) {
+		pathInScope := normalized
+		if scopeDir != "" {
+			pathInScope = strings.TrimPrefix(normalized, scopeDir+"/")
+		}
+		if pathInScope == "" || (pathInScope == normalized && scopeDir != "") {
+			return
+		}
+		for _, entry := range entries {
+			cleaned := entry.Pattern
+			if entry.Negation {
+				cleaned = strings.TrimPrefix(cleaned, "!")
+			}
+			if cleaned == "" {
+				continue
+			}
+			if patternMatchesFile(pathInScope, cleaned) {
+				lastExcluded = !entry.Negation
+				lastPattern = entry.Pattern
+				lastSource = entry.Source
+				continue
+			}
+			if !entry.Negation && patternMatchesAncestor(pathInScope, cleaned) {
+				ancestorExcluded = true
+				ancestorPattern = entry.Pattern
+				ancestorSource = entry.Source
+			}
+		}
+	}
+
+	visit("", rules.Nodes[""])
+	for index := range parts[:len(parts)-1] {
+		dirRel := strings.Join(parts[:index+1], "/")
+		entries, found := rules.Nodes[dirRel]
+		if !found {
+			continue
+		}
+		visit(dirRel, entries)
+	}
+
+	if lastExcluded {
+		return true, lastPattern, lastSource
+	}
+	if ancestorExcluded {
+		return true, ancestorPattern, ancestorSource
+	}
+	return false, "", ""
 }
 
-func walkFiles(ctx context.Context, root string, current string, ignorePatterns []string, files *[]string) error {
+func walkFiles(ctx context.Context, root string, current string, rules IgnoreRules, files *[]string) error {
 	if err := ctx.Err(); err != nil {
 		slog.ErrorContext(ctx, "walk cancelled", "path", current, "err", err)
 		return fmt.Errorf("walk cancelled at %s: %w", current, err)
@@ -247,12 +381,12 @@ func walkFiles(ctx context.Context, root string, current string, ignorePatterns 
 			slog.ErrorContext(ctx, "compute relative path failed", "root", root, "path", fullPath, "err", err)
 			return fmt.Errorf("compute relative path for %s: %w", fullPath, err)
 		}
-		if shouldIgnore(relativePath, ignorePatterns) {
+		if excluded, _, _ := PathIgnored(relativePath, rules); excluded {
 			continue
 		}
 
 		if entry.IsDir() {
-			if err := walkFiles(ctx, root, fullPath, ignorePatterns, files); err != nil {
+			if err := walkFiles(ctx, root, fullPath, rules, files); err != nil {
 				return err
 			}
 			continue
@@ -263,45 +397,80 @@ func walkFiles(ctx context.Context, root string, current string, ignorePatterns 
 	return nil
 }
 
-func loadIgnorePatterns(ctx context.Context, root string, additionalIgnorePatterns []string) ([]string, error) {
-	ignorePatterns := append([]string{}, defaultIgnorePatterns...)
-	ignorePatterns = append(ignorePatterns, additionalIgnorePatterns...)
-
-	ignoreFiles, err := os.ReadDir(root)
+// walkGitignore reads every .gitignore file under root (recursively) and
+// records its patterns in the per-directory node table.
+func walkGitignore(ctx context.Context, root string, relativeDir string, nodes map[string][]ignorePattern) error {
+	currentDir := filepath.Join(root, relativeDir)
+	entries, err := os.ReadDir(currentDir)
 	if err != nil {
-		slog.ErrorContext(ctx, "read root directory for ignore files failed", "root", root, "err", err)
-		return nil, fmt.Errorf("read root directory %s: %w", root, err)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		slog.ErrorContext(ctx, "read directory for ignore walk failed", "path", currentDir, "err", err)
+		return fmt.Errorf("read directory %s: %w", currentDir, err)
 	}
-	for _, entry := range ignoreFiles {
+	for _, entry := range entries {
+		name := entry.Name()
 		if entry.IsDir() {
+			// Cheap default-pruning so the gitignore walk does not
+			// recurse into vendor/, node_modules/, .git/, etc. The
+			// PathIgnored evaluator still has the authoritative tree;
+			// this is only a discovery-time speedup.
+			if isDefaultExcludedDir(name) {
+				continue
+			}
+			nextRelative := name
+			if relativeDir != "" {
+				nextRelative = filepath.ToSlash(filepath.Join(relativeDir, name))
+			}
+			if err := walkGitignore(ctx, root, nextRelative, nodes); err != nil {
+				return err
+			}
 			continue
 		}
-		name := entry.Name()
 		if !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, "ignore") {
 			continue
 		}
-		patterns, err := readIgnoreFile(ctx, filepath.Join(root, name))
-		if err != nil {
-			return nil, err
+		full := filepath.Join(currentDir, name)
+		raw, readErr := readIgnoreFile(ctx, full)
+		if readErr != nil {
+			return readErr
 		}
-		ignorePatterns = append(ignorePatterns, patterns...)
+		source := name
+		if relativeDir != "" {
+			source = filepath.ToSlash(filepath.Join(relativeDir, name))
+		}
+		parsed := make([]ignorePattern, 0, len(raw))
+		for _, pattern := range raw {
+			parsed = append(parsed, parsePattern(pattern, source))
+		}
+		nodes[relativeDir] = append(nodes[relativeDir], parsed...)
 	}
+	return nil
+}
 
+func loadGlobalContextIgnore(ctx context.Context) ([]ignorePattern, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		slog.ErrorContext(ctx, "resolve user home directory failed", "err", err)
 		return nil, fmt.Errorf("resolve user home directory: %w", err)
 	}
-	globalIgnorePath := filepath.Join(homeDir, ".context", ".contextignore")
-	if _, err := os.Stat(globalIgnorePath); err == nil {
-		patterns, readErr := readIgnoreFile(ctx, globalIgnorePath)
-		if readErr != nil {
-			return nil, readErr
+	globalPath := filepath.Join(homeDir, ".context", ".contextignore")
+	if _, statErr := os.Stat(globalPath); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			slog.WarnContext(ctx, "stat global contextignore failed; ignoring", "path", globalPath, "err", statErr)
 		}
-		ignorePatterns = append(ignorePatterns, patterns...)
+		return nil, nil
 	}
-
-	return dedupStrings(ignorePatterns), nil
+	raw, readErr := readIgnoreFile(ctx, globalPath)
+	if readErr != nil {
+		return nil, readErr
+	}
+	parsed := make([]ignorePattern, 0, len(raw))
+	for _, pattern := range raw {
+		parsed = append(parsed, parsePattern(pattern, patternSourceGlobal))
+	}
+	return parsed, nil
 }
 
 func readIgnoreFile(ctx context.Context, path string) ([]string, error) {
@@ -323,54 +492,101 @@ func readIgnoreFile(ctx context.Context, path string) ([]string, error) {
 	return patterns, nil
 }
 
-func shouldIgnore(relativePath string, ignorePatterns []string) bool {
-	normalizedPath := strings.Trim(strings.ReplaceAll(relativePath, "\\", "/"), "/")
-	if normalizedPath == "" {
-		return false
-	}
-	for _, pattern := range ignorePatterns {
-		if patternMatch(normalizedPath, pattern) {
-			return true
-		}
-	}
-	return false
+func parsePattern(raw string, source string) ignorePattern {
+	negation := strings.HasPrefix(raw, "!")
+	return ignorePattern{Pattern: raw, Negation: negation, Source: source}
 }
 
-func patternMatch(path string, pattern string) bool {
-	cleanPath := strings.Trim(strings.ReplaceAll(path, "\\", "/"), "/")
+// patternMatchesFile reports whether pattern matches the file at
+// pathInScope as a direct match (not an ancestor-directory match). A
+// directory pattern (one ending in "/") never matches a file directly; it
+// only matches the file's ancestor directories, so this returns false for
+// directory patterns.
+func patternMatchesFile(pathInScope string, pattern string) bool {
 	normalizedPattern := strings.ReplaceAll(pattern, "\\", "/")
+	if strings.HasSuffix(normalizedPattern, "/") {
+		return false
+	}
 	cleanPattern := strings.Trim(normalizedPattern, "/")
-	isRootAnchored := strings.HasPrefix(normalizedPattern, "/")
-	isDirectoryPattern := strings.HasSuffix(normalizedPattern, "/")
-
+	cleanPath := strings.Trim(strings.ReplaceAll(pathInScope, "\\", "/"), "/")
 	if cleanPath == "" || cleanPattern == "" {
 		return false
 	}
-
-	if isDirectoryPattern {
-		if isRootAnchored {
-			return simpleGlobMatch(cleanPath, cleanPattern) || strings.HasPrefix(cleanPath, cleanPattern+"/")
-		}
-		return matchesDirectoryPattern(cleanPath, cleanPattern)
-	}
-
-	if isRootAnchored || strings.Contains(cleanPattern, "/") {
+	if strings.HasPrefix(normalizedPattern, "/") || strings.Contains(cleanPattern, "/") {
 		return simpleGlobMatch(cleanPath, cleanPattern)
 	}
-
 	return simpleGlobMatch(filepath.Base(cleanPath), cleanPattern)
 }
 
-func matchesDirectoryPattern(path string, pattern string) bool {
-	pathParts := strings.Split(path, "/")
-	dirPartCount := len(strings.Split(pattern, "/"))
-	for i := 0; i <= len(pathParts)-dirPartCount; i++ {
-		candidate := strings.Join(pathParts[i:i+dirPartCount], "/")
-		if simpleGlobMatch(candidate, pattern) {
+// patternMatchesAncestor reports whether pattern matches any ancestor
+// directory of pathInScope. Directory patterns and base-name patterns both
+// route through this helper; the equality decides whether an ancestor was
+// excluded for Git's directory-exclusion rule.
+func patternMatchesAncestor(pathInScope string, pattern string) bool {
+	normalizedPattern := strings.ReplaceAll(pattern, "\\", "/")
+	cleanPattern := strings.Trim(normalizedPattern, "/")
+	cleanPath := strings.Trim(strings.ReplaceAll(pathInScope, "\\", "/"), "/")
+	if cleanPath == "" || cleanPattern == "" {
+		return false
+	}
+	parts := strings.Split(cleanPath, "/")
+	if len(parts) <= 1 {
+		return false
+	}
+	containsSlash := strings.Contains(cleanPattern, "/")
+	isRootAnchored := strings.HasPrefix(normalizedPattern, "/")
+	for index := 1; index < len(parts); index++ {
+		ancestorPath := strings.Join(parts[:index], "/")
+		if isRootAnchored || containsSlash {
+			if simpleGlobMatch(ancestorPath, cleanPattern) {
+				return true
+			}
+			continue
+		}
+		if simpleGlobMatch(parts[index-1], cleanPattern) {
 			return true
 		}
 	}
 	return false
+}
+
+// defaultExcludedDirs lets the gitignore walker skip well-known dependency
+// and tooling directories without consulting the full ignore rules. The
+// PathIgnored evaluator still has the authoritative tree; this is only a
+// discovery-time speedup so a 50k-file node_modules does not blow up the
+// recursive read.
+var defaultExcludedDirs = map[string]struct{}{
+	".git":          {},
+	".hg":           {},
+	".svn":          {},
+	"node_modules":  {},
+	"vendor":        {},
+	"dist":          {},
+	"build":         {},
+	"out":           {},
+	"target":        {},
+	".cache":        {},
+	".next":         {},
+	".nuxt":         {},
+	".turbo":        {},
+	".parcel-cache": {},
+	".pnpm-store":   {},
+	".yarn":         {},
+	".gradle":       {},
+	".terraform":    {},
+	".direnv":       {},
+	"__pycache__":   {},
+	".pytest_cache": {},
+	".mypy_cache":   {},
+	".ruff_cache":   {},
+	".tox":          {},
+	".venv":         {},
+	"venv":          {},
+}
+
+func isDefaultExcludedDir(name string) bool {
+	_, found := defaultExcludedDirs[name]
+	return found
 }
 
 func simpleGlobMatch(text string, pattern string) bool {

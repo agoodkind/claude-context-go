@@ -300,7 +300,7 @@ func newCodebaseRecord(canonicalPath string) model.Codebase {
 		LegacyCollectionNames: nil,
 		MerkleSnapshotPath:    "",
 		InodeTrackingDisabled: false,
-		ResolvedIgnoreRules:   discovery.IgnoreRules{Patterns: nil, Nodes: nil},
+		ResolvedIgnoreRules:   discovery.IgnoreRules{Nodes: nil},
 		UpdatedAt:             clock.Now(),
 	}
 }
