@@ -183,6 +183,21 @@ func Discover(ctx context.Context, root string, additionalIgnorePatterns []strin
 	}, nil
 }
 
+// EffectiveIgnorePatterns resolves the ignore denylist for root the same way
+// Discover does (built-in defaults plus repo and global ignore files). A
+// caller that watches the tree resolves this once per codebase and matches
+// live events against it with PathIgnored.
+func EffectiveIgnorePatterns(ctx context.Context, root string, additionalIgnorePatterns []string) ([]string, error) {
+	return loadIgnorePatterns(ctx, root, additionalIgnorePatterns)
+}
+
+// PathIgnored reports whether relativePath is excluded by patterns. It matches
+// the inclusion decision Discover makes, so a watcher and a full scan agree on
+// which paths belong in the index.
+func PathIgnored(relativePath string, patterns []string) bool {
+	return shouldIgnore(relativePath, patterns)
+}
+
 func walkFiles(ctx context.Context, root string, current string, ignorePatterns []string, files *[]string) error {
 	if err := ctx.Err(); err != nil {
 		slog.ErrorContext(ctx, "walk cancelled", "path", current, "err", err)

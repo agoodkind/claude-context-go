@@ -109,3 +109,58 @@ func TestIndexFilesSkipsInvalidUTF8File(t *testing.T) {
 		t.Fatalf("SkippedFiles = %v, want to contain invalid.go", result.SkippedFiles)
 	}
 }
+
+// TestIndexOneReportsRemovedForMissingFile proves the per-file converge leaf
+// treats a file that is absent on disk as a removal rather than a fatal
+// error, so a delete that lands while a run is in flight cannot abort the job.
+func TestIndexOneReportsRemovedForMissingFile(t *testing.T) {
+	t.Parallel()
+
+	tempDirectory := t.TempDir()
+	runner := NewRunner()
+	result, err := runner.IndexOne(context.Background(), tempDirectory, "gone.go", model.IndexConfig{
+		SplitterType:      "langchain",
+		SplitterChunkSize: 1000,
+		SplitterOverlap:   200,
+	})
+	if err != nil {
+		t.Fatalf("IndexOne returned error for a missing file: %v", err)
+	}
+	if !result.Removed {
+		t.Fatal("Removed = false, want true for a file absent on disk")
+	}
+	if result.Skipped {
+		t.Fatal("Skipped = true, want false; an absent file is a removal, not a skip")
+	}
+	if len(result.Chunks) != 0 {
+		t.Fatalf("Chunks = %d, want 0 for a removal", len(result.Chunks))
+	}
+}
+
+// TestIndexFilesExcludesMissingFile proves the full-walk path drops a file
+// that vanished before it was read instead of failing the whole pass. The
+// rebuild it feeds is a full overwrite, so excluding the file removes it.
+func TestIndexFilesExcludesMissingFile(t *testing.T) {
+	t.Parallel()
+
+	tempDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tempDirectory, "valid.go"), []byte("package main\nfunc example() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	runner := NewRunner()
+	result, err := runner.IndexFiles(context.Background(), tempDirectory, []string{"valid.go", "gone.go"}, model.IndexConfig{
+		SplitterType:      "langchain",
+		SplitterChunkSize: 1000,
+		SplitterOverlap:   200,
+	}, nil)
+	if err != nil {
+		t.Fatalf("IndexFiles returned error: %v", err)
+	}
+	if result.IndexedFiles != 1 {
+		t.Fatalf("IndexedFiles = %d, want 1", result.IndexedFiles)
+	}
+	if _, found := result.FileHashes["gone.go"]; found {
+		t.Fatal("FileHashes contains gone.go; a vanished file must not be recorded as indexed")
+	}
+}

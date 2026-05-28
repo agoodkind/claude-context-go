@@ -33,6 +33,7 @@ import (
 // because that is what the TS adapter wrote.
 const (
 	maxCollectionNameLength = 255
+	stagingCollectionSuffix = "_stg"
 	denseVectorFieldName    = "vector"
 	sparseVectorFieldName   = "sparse_vector"
 	contentFieldName        = "content"
@@ -159,7 +160,10 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 	chunks = service.guardrailExpand(ctx, codebasePath, chunks, "replace")
 
 	collectionName := service.CollectionName(codebasePath)
-	if err := service.dropIfExists(ctx, collectionName); err != nil {
+	stagingName := stagingCollectionName(collectionName)
+	// Drop any staging collection left by a crashed rebuild so the build
+	// starts clean. The live collection is untouched until the swap below.
+	if err := service.dropIfExists(ctx, stagingName); err != nil {
 		return err
 	}
 
@@ -194,13 +198,13 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 
 		if !collectionReady {
 			dimension := len(vectors[0])
-			if err := service.createCollection(ctx, collectionName, dimension); err != nil {
+			if err := service.createCollection(ctx, stagingName, dimension); err != nil {
 				return err
 			}
 			collectionReady = true
 		}
 
-		if err := service.insertBatch(ctx, collectionName, chunkBatch, vectors); err != nil {
+		if err := service.insertBatch(ctx, stagingName, chunkBatch, vectors); err != nil {
 			return err
 		}
 
@@ -214,6 +218,32 @@ func (service *Service) Replace(ctx context.Context, codebasePath string, chunks
 				CollectionRowsWritten:     writtenRows,
 			})
 		}
+	}
+
+	// The staging collection is fully built. Swap it onto the live name: drop
+	// the old collection then rename staging onto it. A failure anywhere above
+	// returns before this point, leaving the previous collection serving
+	// queries; only these two metadata operations replace it.
+	if err := service.dropIfExists(ctx, collectionName); err != nil {
+		return err
+	}
+	return service.renameCollection(ctx, stagingName, collectionName)
+}
+
+// stagingCollectionName derives the transient rebuild collection name, kept
+// within the Milvus name-length cap.
+func stagingCollectionName(collectionName string) string {
+	maxBase := maxCollectionNameLength - len(stagingCollectionSuffix)
+	if len(collectionName) > maxBase {
+		collectionName = collectionName[:maxBase]
+	}
+	return collectionName + stagingCollectionSuffix
+}
+
+func (service *Service) renameCollection(ctx context.Context, oldName string, newName string) error {
+	if err := service.milvus.RenameCollection(ctx, milvusclient.NewRenameCollectionOption(oldName, newName)); err != nil {
+		slog.ErrorContext(ctx, "rename Milvus collection failed", "from", oldName, "to", newName, "err", err)
+		return fmt.Errorf("rename Milvus collection %s to %s: %w", oldName, newName, err)
 	}
 	return nil
 }

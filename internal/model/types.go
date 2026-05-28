@@ -73,10 +73,14 @@ type Progress struct {
 	HeartbeatAt               time.Time `json:"heartbeat_at"`
 }
 
-// JobError records job-level failure details.
+// JobError records job-level failure details. TraceID and JobID tie the
+// failure to the daemon's structured logs so an operator can grep for the
+// full context behind a reported error.
 type JobError struct {
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
+	TraceID   string `json:"trace_id,omitempty"`
+	JobID     string `json:"job_id,omitempty"`
 }
 
 // IndexRunSummary records the last successful indexing run for a codebase.
@@ -94,10 +98,14 @@ type IndexRunSummary struct {
 }
 
 // IndexRunFailure records the last failed indexing run for a codebase.
+// TraceID and JobID tie the failure to the daemon's structured logs so the
+// reported error resolves to the full context by a log lookup.
 type IndexRunFailure struct {
 	Message                 string    `json:"message"`
 	LastAttemptedPercentage int32     `json:"last_attempted_percentage"`
 	FailedAt                time.Time `json:"failed_at"`
+	TraceID                 string    `json:"trace_id,omitempty"`
+	JobID                   string    `json:"job_id,omitempty"`
 }
 
 // Codebase records one canonical indexed codebase and its aliases.

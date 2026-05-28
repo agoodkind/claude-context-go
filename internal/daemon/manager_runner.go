@@ -69,10 +69,10 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 			return
 		}
-		manager.updateJobFailed(job.ID, err)
+		manager.updateJobFailed(ctx, job.ID, err)
 		return
 	}
 	if manager.semantic != nil && manager.semantic.Available() {
@@ -80,7 +80,7 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 			manager.updateJobSemanticProgress(job.ID, progress)
 		})
 		if err != nil {
-			manager.updateJobFailed(job.ID, err)
+			manager.updateJobFailed(ctx, job.ID, err)
 			return
 		}
 	}

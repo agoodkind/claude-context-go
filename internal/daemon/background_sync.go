@@ -27,7 +27,10 @@ const (
 	minimumSyncIntervalMS    = 1000
 )
 
-// BackgroundSync owns daemon-driven periodic and trigger-based sync checks.
+// BackgroundSync owns daemon-driven file-watch, periodic, and trigger-based
+// sync. The file watcher is the steady-state driver: it converges changed
+// paths within the debounce window. The periodic sweep is the anti-entropy
+// backstop that repairs drift from missed events or downtime.
 type BackgroundSync struct {
 	cfg     config.Config
 	manager *Manager
@@ -36,6 +39,9 @@ type BackgroundSync struct {
 	syncing      bool
 	triggerTimer *time.Timer
 	lastTrigger  time.Time
+
+	queue   *EventQueue
+	watcher *Watcher
 }
 
 // NewBackgroundSync constructs the daemon background sync coordinator.
@@ -47,11 +53,28 @@ func NewBackgroundSync(cfg config.Config, manager *Manager) *BackgroundSync {
 		syncing:      false,
 		triggerTimer: nil,
 		lastTrigger:  time.Time{},
+		queue:        nil,
+		watcher:      nil,
 	}
 }
 
-// Start launches periodic and trigger-driven sync loops.
+// Start launches the file watcher plus the periodic and trigger-driven sync
+// loops.
 func (syncer *BackgroundSync) Start(ctx context.Context) {
+	if syncer.cfg.FileWatcherEnabled {
+		syncer.queue = NewEventQueue(defaultTriggerDebounce, func(codebaseID string, relativePaths []string) {
+			syncer.convergeViaWatcher(ctx, codebaseID, relativePaths)
+		})
+		syncer.watcher = NewWatcher(syncer.manager, syncer.queue)
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.ErrorContext(ctx, "background sync loop panic", "loop", "watcher", "err", recovered)
+				}
+			}()
+			syncer.watcher.Run(ctx)
+		}()
+	}
 	if syncer.cfg.TriggerWatcherEnabled {
 		go func() {
 			defer func() {
@@ -200,6 +223,35 @@ func (syncer *BackgroundSync) runSyncAll(ctx context.Context, source string) {
 			}
 			slog.ErrorContext(iterCtx, "start sync job failed", "path", codebase.CanonicalPath, "err", err)
 		}
+	}
+}
+
+// convergeViaWatcher runs a per-path converge for the debounced path set from
+// the file watcher, serialized against the periodic sweep through the same
+// single-flight guard. When a sweep already holds the guard, the paths are
+// requeued so the change is not lost.
+func (syncer *BackgroundSync) convergeViaWatcher(ctx context.Context, codebaseID string, relativePaths []string) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	corr := correlation.New("").WithIdentityAttributes(
+		correlation.IdentityAttribute{Key: "origin", Value: "watcher"},
+		correlation.IdentityAttribute{Key: "codebase_id", Value: codebaseID},
+		correlation.IdentityAttribute{Key: "job_id", Value: fmt.Sprintf("watch-%s-%d", codebaseID, clock.Now().Unix())},
+	)
+	ctx = correlation.WithContext(ctx, corr)
+
+	if !syncer.beginSync(ctx, "watcher") {
+		for _, relativePath := range relativePaths {
+			syncer.queue.Enqueue(codebaseID, relativePath)
+		}
+		return
+	}
+	defer syncer.endSync(ctx, "watcher")
+
+	if err := syncer.manager.ConvergePaths(ctx, codebaseID, relativePaths); err != nil {
+		slog.ErrorContext(ctx, "watcher.converge_failed", "component", "daemon", "subcomponent", "watcher", "codebase_id", codebaseID, "err", err)
 	}
 }
 

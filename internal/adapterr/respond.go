@@ -23,7 +23,7 @@ func Respond(ctx context.Context, err error) (codes.Code, string) {
 	adapterErr := classify(err)
 	logRespond(ctx, adapterErr)
 	if adapterErr.SafeForClient {
-		return CodeFor(adapterErr.Class), formatKnown(adapterErr)
+		return CodeFor(adapterErr.Class), formatKnown(adapterErr, ctx)
 	}
 	return CodeFor(adapterErr.Class), formatUnknown(ctx)
 }
@@ -40,7 +40,7 @@ func RespondMCP(ctx context.Context, err error) error {
 	corr := correlation.FromContext(ctx)
 	message := formatUnknown(ctx)
 	if adapterErr.SafeForClient {
-		message = formatKnown(adapterErr)
+		message = formatKnown(adapterErr, ctx)
 	}
 	return &MCPError{
 		Class:   adapterErr.Class,
@@ -59,14 +59,29 @@ func classify(err error) *AdapterError {
 	return NewInternal(err.Error(), err)
 }
 
-func formatKnown(adapterErr *AdapterError) string {
-	if adapterErr.Hint == "" {
-		return adapterErr.Message
+func formatKnown(adapterErr *AdapterError, ctx context.Context) string {
+	base := adapterErr.Message
+	if adapterErr.Hint != "" {
+		base = adapterErr.Message + "; " + adapterErr.Hint
 	}
-	return adapterErr.Message + "; " + adapterErr.Hint
+	if refs := formatDiagRefs(ctx); refs != "" {
+		return base + " " + refs
+	}
+	return base
 }
 
 func formatUnknown(ctx context.Context) string {
+	if refs := formatDiagRefs(ctx); refs != "" {
+		return "internal error; see daemon logs " + refs
+	}
+	return "internal error"
+}
+
+// formatDiagRefs renders the correlation refs from ctx as "[trace_id=… job_id=…]"
+// so error messages carry a greppable handle to the daemon log. Returns "" when
+// no ids are available. The MCP client layer relies on the daemon embedding
+// these in the message so it can stay a pure relay.
+func formatDiagRefs(ctx context.Context) string {
 	corr := correlation.FromContext(ctx)
 	refs := make([]string, 0, 2)
 	if corr.TraceID != "" {
@@ -76,9 +91,9 @@ func formatUnknown(ctx context.Context) string {
 		refs = append(refs, "job_id="+jobID)
 	}
 	if len(refs) == 0 {
-		return "internal error"
+		return ""
 	}
-	return "internal error; see daemon logs with " + strings.Join(refs, " ")
+	return "[" + strings.Join(refs, " ") + "]"
 }
 
 func logRespond(ctx context.Context, adapterErr *AdapterError) {

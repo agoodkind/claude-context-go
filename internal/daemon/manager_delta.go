@@ -59,9 +59,9 @@ func (manager *Manager) planStreamingReindex(ctx context.Context, job model.Job,
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 		} else {
-			manager.updateJobFailed(job.ID, fmt.Errorf("capture reindex snapshot: %w", err))
+			manager.updateJobFailed(ctx, job.ID, fmt.Errorf("capture reindex snapshot: %w", err))
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
@@ -100,9 +100,9 @@ func (manager *Manager) planSyncDiff(ctx context.Context, job model.Job, codebas
 	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 		} else {
-			manager.updateJobFailed(job.ID, fmt.Errorf("capture sync snapshot: %w", err))
+			manager.updateJobFailed(ctx, job.ID, fmt.Errorf("capture sync snapshot: %w", err))
 		}
 		return deltaPlan{
 			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
@@ -270,7 +270,7 @@ func (manager *Manager) applyDeltaChanges(ctx context.Context, job model.Job, st
 	}
 	for index, relativePath := range changed {
 		if err := ctx.Err(); err != nil {
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 			return result, deltaOutcome{fallback: false, handled: true}
 		}
 		if seedHash, present := state.plan.seedSnapshot.Files[relativePath]; present && seedHash == state.plan.currentSnapshot.Files[relativePath] {
@@ -292,11 +292,21 @@ func (manager *Manager) handleChangedFile(ctx context.Context, job model.Job, st
 	fileResult, err := manager.runner.IndexOne(ctx, job.CanonicalPath, relativePath, job.Config)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 		} else {
-			manager.updateJobFailed(job.ID, err)
+			manager.updateJobFailed(ctx, job.ID, err)
 		}
 		return deltaOutcome{fallback: false, handled: true}
+	}
+	if fileResult.Removed {
+		slog.InfoContext(ctx, "converge.remove", "component", "daemon", "subcomponent", "delta", "path", relativePath, "semantic", state.semantic)
+		if state.semantic {
+			if rmErr := manager.semantic.Reindex(ctx, job.CanonicalPath, nil, []string{relativePath}, nil); rmErr != nil {
+				return manager.classifyReindexErr(ctx, job, rmErr, "per-file removal")
+			}
+		}
+		delete(state.working, relativePath)
+		return deltaOutcome{fallback: false, handled: false}
 	}
 	if fileResult.Skipped {
 		result.SkippedFiles = append(result.SkippedFiles, relativePath)
@@ -320,10 +330,10 @@ func (manager *Manager) classifyReindexErr(ctx context.Context, job model.Job, e
 		slog.WarnContext(ctx, "semantic collection missing; falling back to full reindex", "job_id", job.ID, "phase", phase)
 		return deltaOutcome{fallback: true, handled: false}
 	case errors.Is(err, context.Canceled):
-		manager.updateJobCancelled(job.ID)
+		manager.updateJobCancelled(ctx, job.ID)
 		return deltaOutcome{fallback: false, handled: true}
 	default:
-		manager.updateJobFailed(job.ID, err)
+		manager.updateJobFailed(ctx, job.ID, err)
 		return deltaOutcome{fallback: false, handled: true}
 	}
 }
@@ -354,12 +364,12 @@ func (manager *Manager) pruneAfterStreaming(ctx context.Context, job model.Job, 
 	if err := manager.semantic.PruneToCurrent(ctx, job.CanonicalPath, currentPaths); err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
-			manager.updateJobCancelled(job.ID)
+			manager.updateJobCancelled(ctx, job.ID)
 			return deltaOutcome{fallback: false, handled: true}
 		case errors.Is(err, semantic.ErrCollectionMissing):
 			slog.WarnContext(ctx, "semantic collection missing during streaming prune", "job_id", job.ID)
 		default:
-			manager.updateJobFailed(job.ID, err)
+			manager.updateJobFailed(ctx, job.ID, err)
 			return deltaOutcome{fallback: false, handled: true}
 		}
 	}

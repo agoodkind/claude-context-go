@@ -45,9 +45,11 @@ MCP_INSTALL_BIN := $(INSTALL_DIR)/$(MCP_BINARY)
 build-clients:
 	@mkdir -p "$(DIST_DIR)"
 	go build $(GO_BUILD_FLAGS) -o "$(CLI_DIST_BIN)" $(CLI_CMD)
-	go build $(GO_BUILD_FLAGS) -o "$(MCP_DIST_BIN)" $(MCP_CMD)
 	@echo "built: $(CLI_DIST_BIN)"
+	$(call codesign_binary,$(CLI_DIST_BIN))
+	go build $(GO_BUILD_FLAGS) -o "$(MCP_DIST_BIN)" $(MCP_CMD)
 	@echo "built: $(MCP_DIST_BIN)"
+	$(call codesign_binary,$(MCP_DIST_BIN))
 
 install-clients: build-clients
 	@printf 'install: installing %s to %s\n' '$(CLI_BINARY)' '$(CLI_INSTALL_BIN)'

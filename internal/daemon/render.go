@@ -142,18 +142,37 @@ func renderIndexingActive(codebase *model.Codebase, activeJob *model.Job) string
 }
 
 // renderHistoricalFailure reads as past tense so callers do not mistake an
-// old failure record for a live one.
+// old failure record for a live one. When the failure carries correlation
+// ids it appends a diagnostics line so the operator can grep the daemon log.
 func renderHistoricalFailure(codebase *model.Codebase) string {
 	if codebase.LastFailedRun == nil {
 		return fmt.Sprintf("❌ Codebase '%s' last indexing attempt failed. Call index_codebase to retry.", codebase.CanonicalPath)
 	}
 	return fmt.Sprintf(
-		"❌ Codebase '%s' last indexing attempt failed at %s (%.1f%% complete).\n🚨 Previous error: %s\n💡 Call index_codebase to retry; the previous failure no longer blocks new attempts.",
+		"❌ Codebase '%s' last indexing attempt failed at %s (%.1f%% complete).\n🚨 Previous error: %s\n💡 Call index_codebase to retry; the previous failure no longer blocks new attempts.%s",
 		codebase.CanonicalPath,
 		formatLocalTime(codebase.LastFailedRun.FailedAt),
 		float64(codebase.LastFailedRun.LastAttemptedPercentage),
 		orDefault(codebase.LastFailedRun.Message, "unknown error"),
+		renderFailureDiagnostics(codebase.LastFailedRun),
 	)
+}
+
+// renderFailureDiagnostics returns a leading-newline diagnostics line naming
+// the correlation ids behind a failure, or an empty string when none are
+// recorded. The ids resolve against the daemon's structured logs.
+func renderFailureDiagnostics(failure *model.IndexRunFailure) string {
+	refs := make([]string, 0, 2)
+	if failure.TraceID != "" {
+		refs = append(refs, "trace_id="+failure.TraceID)
+	}
+	if failure.JobID != "" {
+		refs = append(refs, "job_id="+failure.JobID)
+	}
+	if len(refs) == 0 {
+		return ""
+	}
+	return "\n🔎 Diagnostics: " + strings.Join(refs, " ")
 }
 
 func renderListIndexes(codebases []model.Codebase) string {
@@ -221,7 +240,7 @@ func renderSearch(view searchView) string {
 		if warning == "" {
 			return noResults
 		}
-		return warning + "\n\n" + noResults + "\n\n" + noResultsIndexingTip
+		return noResults + "\n\n" + warning + "\n\n" + noResultsIndexingTip
 	}
 
 	formatted := make([]string, 0, len(view.Results))
@@ -241,12 +260,15 @@ func renderSearch(view searchView) string {
 		))
 	}
 
+	// Lead with the result count and the results themselves so a client that
+	// shows only the first line or truncates long output still surfaces the
+	// answer. The in-progress warning and tip trail the results.
 	header := fmt.Sprintf("Found %d results for query: %q in codebase '%s'", len(view.Results), view.Query, view.Codebase.CanonicalPath)
 	body := header + "\n\n" + strings.Join(formatted, "\n\n")
 	if warning == "" {
 		return body
 	}
-	return warning + "\n\n" + body + "\n\n" + searchIndexingTip
+	return body + "\n\n" + warning + "\n\n" + searchIndexingTip
 }
 
 // renderSkippedFiles formats the per-run skipped-file summary for the

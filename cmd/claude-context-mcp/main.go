@@ -36,7 +36,7 @@ func installCorrelationLogger(origin string) context.Context {
 	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	handler := correlation.SlogHandler(jsonHandler, correlation.HandlerOptions{
 		Strict:   true,
-		Required: []string{"trace_id", "span_id", "job_id", "codebase_id"},
+		Required: []string{"trace_id", "span_id"},
 	})
 	slog.SetDefault(slog.New(handler))
 	rootCorrelation := correlation.New("").WithIdentityAttributes(

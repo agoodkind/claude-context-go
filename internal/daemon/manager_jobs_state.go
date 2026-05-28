@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"log/slog"
 
 	"goodkind.io/claude-context-go/internal/clock"
@@ -9,6 +10,7 @@ import (
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/semantic"
 	"goodkind.io/claude-context-go/internal/store"
+	"goodkind.io/gklog/correlation"
 )
 
 func (manager *Manager) updateJobRunning(job model.Job) {
@@ -134,7 +136,7 @@ func (manager *Manager) updateJobCompleted(jobID string, result indexer.Result) 
 	}
 }
 
-func (manager *Manager) updateJobFailed(jobID string, runErr error) {
+func (manager *Manager) updateJobFailed(ctx context.Context, jobID string, runErr error) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -143,6 +145,7 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 		return
 	}
 
+	traceID := string(correlation.FromContext(ctx).TraceID)
 	now := clock.Now()
 	job.State = model.JobStateFailed
 	job.UpdatedAt = now
@@ -153,9 +156,12 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 	job.Error = &model.JobError{
 		Message:   runErr.Error(),
 		Retryable: false,
+		TraceID:   traceID,
+		JobID:     jobID,
 	}
+	slog.ErrorContext(ctx, "job.failed", "component", "daemon", "subcomponent", "jobs", "job_id", jobID, "trace_id", traceID, "err", runErr)
 	if err := manager.appendJobLocked("job_failed", job); err != nil {
-		slog.Error("append failed job event failed", "job_id", jobID, "err", err)
+		slog.ErrorContext(ctx, "append failed job event failed", "job_id", jobID, "err", err)
 	}
 
 	codebase, found := manager.codebases[job.CodebaseID]
@@ -168,15 +174,17 @@ func (manager *Manager) updateJobFailed(jobID string, runErr error) {
 		Message:                 runErr.Error(),
 		LastAttemptedPercentage: 0,
 		FailedAt:                now,
+		TraceID:                 traceID,
+		JobID:                   jobID,
 	}
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
-		slog.Error("write registry after failed job failed", "job_id", jobID, "err", err)
+		slog.ErrorContext(ctx, "write registry after failed job failed", "job_id", jobID, "err", err)
 	}
 }
 
-func (manager *Manager) updateJobCancelled(jobID string) {
+func (manager *Manager) updateJobCancelled(ctx context.Context, jobID string) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -185,6 +193,7 @@ func (manager *Manager) updateJobCancelled(jobID string) {
 		return
 	}
 
+	traceID := string(correlation.FromContext(ctx).TraceID)
 	now := clock.Now()
 	job.State = model.JobStateCancelled
 	job.UpdatedAt = now
@@ -193,7 +202,7 @@ func (manager *Manager) updateJobCancelled(jobID string) {
 	job.Progress.LastEventAt = now
 	job.Progress.HeartbeatAt = now
 	if err := manager.appendJobLocked("job_cancelled", job); err != nil {
-		slog.Error("append cancelled job event failed", "job_id", jobID, "err", err)
+		slog.ErrorContext(ctx, "append cancelled job event failed", "job_id", jobID, "err", err)
 	}
 
 	codebase, found := manager.codebases[job.CodebaseID]
@@ -206,10 +215,12 @@ func (manager *Manager) updateJobCancelled(jobID string) {
 		Message:                 "job cancelled",
 		LastAttemptedPercentage: 0,
 		FailedAt:                now,
+		TraceID:                 traceID,
+		JobID:                   jobID,
 	}
 	codebase.UpdatedAt = now
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
-		slog.Error("write registry after cancelled job failed", "job_id", jobID, "err", err)
+		slog.ErrorContext(ctx, "write registry after cancelled job failed", "job_id", jobID, "err", err)
 	}
 }

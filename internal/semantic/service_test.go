@@ -9,6 +9,25 @@ import (
 	"goodkind.io/claude-context-go/internal/model"
 )
 
+// TestStagingCollectionNameStaysWithinCap proves the rebuild staging name
+// keeps the suffix and never exceeds the Milvus name-length cap.
+func TestStagingCollectionNameStaysWithinCap(t *testing.T) {
+	t.Parallel()
+
+	short := stagingCollectionName("code_chunks_abc123")
+	if short != "code_chunks_abc123"+stagingCollectionSuffix {
+		t.Fatalf("staging name = %q, want suffix appended", short)
+	}
+
+	long := stagingCollectionName(strings.Repeat("x", maxCollectionNameLength+10))
+	if len(long) != maxCollectionNameLength {
+		t.Fatalf("staging name length = %d, want %d", len(long), maxCollectionNameLength)
+	}
+	if !strings.HasSuffix(long, stagingCollectionSuffix) {
+		t.Fatalf("staging name %q lost its suffix after truncation", long)
+	}
+}
+
 func TestValidateExtensionFilter(t *testing.T) {
 	t.Parallel()
 

@@ -681,6 +681,8 @@ func (manager *Manager) CancelJob(jobID string) (model.Job, error) {
 			Message:                 "job cancelled",
 			LastAttemptedPercentage: 0,
 			FailedAt:                now,
+			TraceID:                 "",
+			JobID:                   jobID,
 		}
 		codebase.UpdatedAt = now
 		manager.codebases[codebase.ID] = codebase

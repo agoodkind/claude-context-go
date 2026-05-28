@@ -19,6 +19,47 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// appendCorrelationRef adds a single compact diagnostics line to a display
+// text so a successful response carries a greppable handle for the daemon
+// logs. The verdict stays on line 1 because the ref trails. Extras are
+// key/value pairs (skipped when the value is empty) for ids the trace context
+// does not already carry, such as codebase_id and job_id.
+func appendCorrelationRef(displayText string, ctx context.Context, extras ...string) string {
+	corr := correlation.FromContext(ctx)
+	refs := make([]string, 0, 1+len(extras)/2)
+	if corr.TraceID != "" {
+		refs = append(refs, "trace_id="+string(corr.TraceID))
+	}
+	for index := 0; index+1 < len(extras); index += 2 {
+		value := extras[index+1]
+		if value == "" {
+			continue
+		}
+		refs = append(refs, extras[index]+"="+value)
+	}
+	if len(refs) == 0 {
+		return displayText
+	}
+	return displayText + "\n🔎 " + strings.Join(refs, " ")
+}
+
+// jobIDOf returns the id of job or "" when job is nil, so callers can fold
+// optional job ids into appendCorrelationRef without nil checks.
+func jobIDOf(job *model.Job) string {
+	if job == nil {
+		return ""
+	}
+	return job.ID
+}
+
+// codebaseIDOf returns the id of codebase or "" when found is false.
+func codebaseIDOf(found bool, codebase model.Codebase) string {
+	if !found {
+		return ""
+	}
+	return codebase.ID
+}
+
 // beginRPC opens the per-RPC correlation span, emits daemon.rpc.started,
 // and returns the derived context plus a deferred completion function
 // that recovers panics through [adapterr.Respond] and emits
@@ -117,7 +158,7 @@ func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndex
 		State:         string(job.State),
 		Deduplicated:  deduplicated,
 		CanonicalPath: codebase.CanonicalPath,
-		DisplayText:   renderStartIndex(request.GetPath(), codebase, job, deduplicated),
+		DisplayText:   appendCorrelationRef(renderStartIndex(request.GetPath(), codebase, job, deduplicated), ctx, "codebase_id", codebase.ID, "job_id", job.ID),
 	}, nil
 }
 
@@ -133,7 +174,7 @@ func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndex
 	return &pb.ClearIndexResponse{
 		CodebaseId:  codebase.ID,
 		Cleared:     true,
-		DisplayText: renderClearIndex(codebase, indexedCount, indexingCount),
+		DisplayText: appendCorrelationRef(renderClearIndex(codebase, indexedCount, indexingCount), ctx, "codebase_id", codebase.ID),
 	}, nil
 }
 
@@ -149,7 +190,7 @@ func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRe
 	return &pb.CancelJobResponse{
 		JobId:       job.ID,
 		Cancelled:   job.State == "cancelled",
-		DisplayText: renderCancelJob(job),
+		DisplayText: appendCorrelationRef(renderCancelJob(job), ctx, "job_id", job.ID, "codebase_id", job.CodebaseID),
 	}, nil
 }
 
@@ -172,7 +213,7 @@ func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRe
 		JobId:       job.ID,
 		CodebaseId:  codebase.ID,
 		State:       string(job.State),
-		DisplayText: renderSyncIndex(codebase, job, deduplicated),
+		DisplayText: appendCorrelationRef(renderSyncIndex(codebase, job, deduplicated), ctx, "codebase_id", codebase.ID, "job_id", job.ID),
 	}, nil
 }
 
@@ -186,7 +227,7 @@ func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequ
 	}
 	response := &pb.GetIndexResponse{
 		Tracked:     found,
-		DisplayText: renderGetIndex(request.GetPath(), found, codebasePointer(found, codebase), activeJob),
+		DisplayText: appendCorrelationRef(renderGetIndex(request.GetPath(), found, codebasePointer(found, codebase), activeJob), ctx, "codebase_id", codebaseIDOf(found, codebase), "job_id", jobIDOf(activeJob)),
 	}
 	if found {
 		response.Codebase = pbconv.ToCodebase(codebase)
@@ -207,7 +248,7 @@ func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndex
 	for _, codebase := range codebases {
 		response.Indexes = append(response.Indexes, pbconv.ToCodebase(codebase))
 	}
-	response.DisplayText = renderListIndexes(codebases)
+	response.DisplayText = appendCorrelationRef(renderListIndexes(codebases), ctx)
 	return response, nil
 }
 
@@ -222,7 +263,7 @@ func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest)
 	}
 	return &pb.GetJobResponse{
 		Job:         pbconv.ToJob(job),
-		DisplayText: renderGetJob(&job),
+		DisplayText: appendCorrelationRef(renderGetJob(&job), ctx, "job_id", job.ID, "codebase_id", job.CodebaseID),
 	}, nil
 }
 
@@ -238,7 +279,7 @@ func (server *GRPCServer) ListJobs(ctx context.Context, request *pb.ListJobsRequ
 	for _, job := range jobs {
 		response.Jobs = append(response.Jobs, pbconv.ToJob(job))
 	}
-	response.DisplayText = renderListJobs(jobs)
+	response.DisplayText = appendCorrelationRef(renderListJobs(jobs), ctx, "codebase_id", request.GetCodebaseId())
 	return response, nil
 }
 
@@ -271,13 +312,13 @@ func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCode
 		Results:   make([]*pb.SearchResult, 0, len(outcome.Results)),
 		Codebase:  pbconv.ToCodebase(outcome.Codebase),
 		ActiveJob: pbconv.ToJobPointer(outcome.ActiveJob),
-		DisplayText: renderSearch(searchView{
+		DisplayText: appendCorrelationRef(renderSearch(searchView{
 			RequestedPath: request.GetPath(),
 			Query:         request.GetQuery(),
 			Codebase:      outcome.Codebase,
 			ActiveJob:     outcome.ActiveJob,
 			Results:       outcome.Results,
-		}),
+		}), ctx, "codebase_id", outcome.Codebase.ID, "job_id", jobIDOf(outcome.ActiveJob)),
 	}
 	for _, result := range outcome.Results {
 		response.Results = append(response.Results, &pb.SearchResult{
@@ -310,7 +351,7 @@ func (server *GRPCServer) Doctor(ctx context.Context, request *pb.DoctorRequest)
 			Detail:   diagnostic,
 		})
 	}
-	response.DisplayText = renderDoctor(diagnostics)
+	response.DisplayText = appendCorrelationRef(renderDoctor(diagnostics), ctx)
 	return response, nil
 }
 

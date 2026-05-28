@@ -6,6 +6,7 @@ require (
 	github.com/mark3labs/mcp-go v0.50.0
 	github.com/milvus-io/milvus/client/v2 v2.6.4
 	github.com/openai/openai-go/v2 v2.7.1
+	github.com/rjeczalik/notify v0.9.3
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-c v0.24.2
 	github.com/tree-sitter/tree-sitter-cpp v0.23.4
@@ -16,12 +17,15 @@ require (
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
 	github.com/tree-sitter/tree-sitter-scala v0.26.0
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
-	goodkind.io/gklog v0.3.0
+	goodkind.io/gklog v0.4.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 )
 
-require github.com/cenkalti/backoff/v5 v5.0.3 // indirect
+require (
+	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
+	github.com/gofrs/flock v0.13.0 // indirect
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

@@ -53,6 +53,7 @@ type Config struct {
 	BackgroundSyncEnabled  bool
 	SyncIntervalMS         int
 	TriggerWatcherEnabled  bool
+	FileWatcherEnabled     bool
 	SyncLockStaleMS        int
 }
 
@@ -128,6 +129,7 @@ func Default() (Config, error) {
 		BackgroundSyncEnabled:  envBoolOrDefault("CLAUDE_CONTEXT_BACKGROUND_SYNC", true),
 		SyncIntervalMS:         envIntOrDefault("CLAUDE_CONTEXT_SYNC_INTERVAL_MS", defaultSyncInterval),
 		TriggerWatcherEnabled:  envBoolOrDefault("CLAUDE_CONTEXT_TRIGGER_WATCHER", true),
+		FileWatcherEnabled:     envBoolOrDefault("CLAUDE_CONTEXT_FILE_WATCHER", true),
 		SyncLockStaleMS:        envIntOrDefault("CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS", defaultSyncLockAge),
 	}, nil
 }

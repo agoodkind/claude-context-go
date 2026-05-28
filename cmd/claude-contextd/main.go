@@ -16,6 +16,7 @@ import (
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/daemon"
 	"goodkind.io/claude-context-go/internal/store"
+	"goodkind.io/gklog"
 	"goodkind.io/gklog/correlation"
 	"google.golang.org/grpc"
 )
@@ -28,20 +29,35 @@ func main() {
 	}
 }
 
+func correlationHandlerOptions() correlation.HandlerOptions {
+	return correlation.HandlerOptions{
+		Strict:   true,
+		Required: []string{"trace_id", "span_id"},
+	}
+}
+
 // installCorrelationLogger wraps the default JSON slog handler with a
 // correlation handler in strict mode and returns a root context that
-// carries the given origin so boot records inherit a trace_id.
+// carries the given origin so boot records inherit a trace_id. The boot
+// logger writes only to stderr; once the state paths are known,
+// installConcernRouter swaps in per-concern files.
 func installCorrelationLogger(origin string) context.Context {
 	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
-	handler := correlation.SlogHandler(jsonHandler, correlation.HandlerOptions{
-		Strict:   true,
-		Required: []string{"trace_id", "span_id", "job_id", "codebase_id"},
-	})
-	slog.SetDefault(slog.New(handler))
+	slog.SetDefault(slog.New(correlation.SlogHandler(jsonHandler, correlationHandlerOptions())))
 	rootCorrelation := correlation.New("").WithIdentityAttributes(
 		correlation.IdentityAttribute{Key: "origin", Value: origin},
 	)
 	return correlation.WithContext(context.Background(), rootCorrelation)
+}
+
+// installConcernRouter swaps the default logger so records fan out to
+// per-concern JSONL files under logsDir while the combined stream stays on
+// stderr for the service log. The concern is the first dot-separated segment
+// of each message; the daemon concern catches anything without a dot.
+func installConcernRouter(logsDir string) {
+	combined := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	router := gklog.NewRouter(logsDir, slog.LevelInfo, combined, gklog.RouterOptions{FallbackConcern: "daemon", Rotation: gklog.RotationConfig{}})
+	slog.SetDefault(slog.New(correlation.SlogHandler(router, correlationHandlerOptions())))
 }
 
 func run(rootContext context.Context) error {
@@ -75,6 +91,8 @@ func run(rootContext context.Context) error {
 			return fmt.Errorf("ensure state directory %s: %w", path, err)
 		}
 	}
+
+	installConcernRouter(cfg.LogsDir)
 
 	if err := os.RemoveAll(cfg.SocketPath); err != nil {
 		slog.ErrorContext(rootContext, "remove stale socket failed", "path", cfg.SocketPath, "err", err)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -78,11 +79,15 @@ func resolveMaxFileBytes() int64 {
 
 // processedFile is the per-file output of one splitter pass. Skipped=true
 // means the file's bytes are not valid UTF-8; Chunks and FileHash are then
-// empty and callers add the path to Result.SkippedFiles.
+// empty and callers add the path to Result.SkippedFiles. Removed=true means
+// the file was absent on disk when the task ran, so the converge operation
+// for this path is a removal: callers delete its rows and drop it from the
+// snapshot rather than treating the absence as an error.
 type processedFile struct {
 	Chunks   []model.StoredChunk
 	FileHash string
 	Skipped  bool
+	Removed  bool
 }
 
 // OneFileResult mirrors the per-file accumulator output for callers that
@@ -95,14 +100,22 @@ type OneFileResult = processedFile
 func (runner *Runner) IndexOne(ctx context.Context, root string, relativePath string, cfg model.IndexConfig) (OneFileResult, error) {
 	fullPath := filepath.Join(root, relativePath)
 	if oversize, err := runner.isOversize(ctx, fullPath, relativePath); err != nil {
-		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false}, err
+		if errors.Is(err, os.ErrNotExist) {
+			slog.DebugContext(ctx, "source file absent; converging to removal", "path", fullPath)
+			return OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: true}, nil
+		}
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: false}, err
 	} else if oversize {
-		return OneFileResult{Chunks: nil, FileHash: "", Skipped: true}, nil
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: true, Removed: false}, nil
 	}
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			slog.DebugContext(ctx, "source file absent; converging to removal", "path", fullPath)
+			return OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: true}, nil
+		}
 		slog.ErrorContext(ctx, "read source file failed", "path", fullPath, "err", err)
-		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false}, fmt.Errorf("read source file %s: %w", fullPath, err)
+		return OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: false}, fmt.Errorf("read source file %s: %w", fullPath, err)
 	}
 	return runner.processFile(ctx, fullPath, relativePath, data, cfg.SplitterType)
 }
@@ -115,7 +128,9 @@ func (runner *Runner) isOversize(ctx context.Context, fullPath string, relativeP
 	}
 	info, err := os.Stat(fullPath)
 	if err != nil {
-		slog.ErrorContext(ctx, "stat source file failed", "path", fullPath, "err", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.ErrorContext(ctx, "stat source file failed", "path", fullPath, "err", err)
+		}
 		return false, fmt.Errorf("stat source file %s: %w", fullPath, err)
 	}
 	if info.Size() <= runner.maxFileBytes {
@@ -132,7 +147,7 @@ func (runner *Runner) isOversize(ctx context.Context, fullPath string, relativeP
 func (runner *Runner) processFile(ctx context.Context, fullPath string, relativePath string, data []byte, splitterType string) (processedFile, error) {
 	if !utf8.Valid(data) {
 		slog.WarnContext(ctx, "indexer.skipped_invalid_utf8", "path", relativePath, "bytes", len(data))
-		return processedFile{Chunks: nil, FileHash: "", Skipped: true}, nil
+		return processedFile{Chunks: nil, FileHash: "", Skipped: true, Removed: false}, nil
 	}
 	splitResult, err := runner.dispatcher.SplitFileWithType(ctx, fullPath, data, splitterType)
 	if err != nil {
@@ -149,7 +164,7 @@ func (runner *Runner) processFile(ctx context.Context, fullPath string, relative
 			FileExtension: filepath.Ext(relativePath),
 		})
 	}
-	return processedFile{Chunks: chunks, FileHash: digestFileBytes(data), Skipped: false}, nil
+	return processedFile{Chunks: chunks, FileHash: digestFileBytes(data), Skipped: false, Removed: false}, nil
 }
 
 // indexAccumulator collects per-file output across one indexing pass.
@@ -165,6 +180,10 @@ type indexAccumulator struct {
 // result into the accumulator. It returns false when the file was skipped.
 func (runner *Runner) ingestFile(ctx context.Context, fullPath string, relativePath string, splitterType string, accumulator *indexAccumulator) error {
 	if oversize, sizeErr := runner.isOversize(ctx, fullPath, relativePath); sizeErr != nil {
+		if errors.Is(sizeErr, os.ErrNotExist) {
+			slog.DebugContext(ctx, "source file absent during walk; excluding from rebuild", "path", fullPath)
+			return nil
+		}
 		return sizeErr
 	} else if oversize {
 		accumulator.skippedFiles = append(accumulator.skippedFiles, relativePath)
@@ -172,6 +191,10 @@ func (runner *Runner) ingestFile(ctx context.Context, fullPath string, relativeP
 	}
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			slog.DebugContext(ctx, "source file absent during walk; excluding from rebuild", "path", fullPath)
+			return nil
+		}
 		slog.ErrorContext(ctx, "read source file failed", "path", fullPath, "err", err)
 		return fmt.Errorf("read source file %s: %w", fullPath, err)
 	}

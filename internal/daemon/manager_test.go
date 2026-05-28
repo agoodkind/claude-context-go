@@ -270,8 +270,11 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 	if len(searchResponse.GetResults()) == 0 {
 		t.Fatal("SearchCode returned no results during force reindex")
 	}
-	if !strings.HasPrefix(searchResponse.GetDisplayText(), "⚠️  **Indexing in Progress**") {
-		t.Fatalf("SearchCode returned unexpected warning text: %q", searchResponse.GetDisplayText())
+	if !strings.HasPrefix(searchResponse.GetDisplayText(), "Found ") {
+		t.Fatalf("SearchCode must lead with the result count for truncating clients: %q", searchResponse.GetDisplayText())
+	}
+	if !strings.Contains(searchResponse.GetDisplayText(), "⚠️  **Indexing in Progress**") {
+		t.Fatalf("SearchCode response missing in-progress warning: %q", searchResponse.GetDisplayText())
 	}
 	if !strings.Contains(searchResponse.GetDisplayText(), "🔁 Retry suggestion") {
 		t.Fatalf("SearchCode response missing retry suggestion: %q", searchResponse.GetDisplayText())
@@ -678,6 +681,114 @@ func TestRunDeltaSyncReportsCodebaseTotalsAfterSync(t *testing.T) {
 	}
 	if codebase.LastSuccessfulRun.IndexedFiles != 5 {
 		t.Fatalf("LastSuccessfulRun.IndexedFiles = %d, want 5 (codebase total, not delta)", codebase.LastSuccessfulRun.IndexedFiles)
+	}
+}
+
+// TestRunDeltaSyncConvergesDeletedFileToRemoval proves that a file present at
+// capture time but reported absent when its converge task runs is treated as
+// a removal: the job completes, and the path is dropped from the snapshot so
+// the next run does not carry it forward. This is the mid-run delete case
+// that previously failed the whole job on an os.Stat error.
+func TestRunDeltaSyncConvergesDeletedFileToRemoval(t *testing.T) {
+	t.Parallel()
+
+	manager, cfg, repoPath := newTestManager(t)
+	extras := []string{"a.go", "b.go", "c.go", "d.go"}
+	for _, name := range extras {
+		path := filepath.Join(repoPath, name)
+		if err := os.WriteFile(path, []byte("package main\n// "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
+	initialHashes := map[string]string{
+		"main.go": hashText("package main\n"),
+		"a.go":    hashText("package main\n// a.go\n"),
+		"b.go":    hashText("package main\n// b.go\n"),
+		"c.go":    hashText("package main\n// c.go\n"),
+		"d.go":    hashText("package main\n// d.go\n"),
+	}
+	manager.runner = fakeRunner{
+		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+			return indexer.Result{
+				IndexedFiles: 5,
+				TotalChunks:  1,
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  "main.go",
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHashes: initialHashes,
+			}, nil
+		},
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			return indexer.OneFileResult{Removed: true}, nil
+		},
+	}
+
+	if _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Change a.go on disk so the next sync classifies it as modified and runs
+	// its converge task. The fake leaf then reports it absent, exercising the
+	// removal path.
+	if err := os.WriteFile(filepath.Join(repoPath, "a.go"), []byte("package main\n// a.go changed\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	syncer := NewBackgroundSync(cfg, manager)
+	syncer.runSyncAll(context.Background(), "test")
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	codebase, _, found, err := manager.GetIndex(context.Background(), repoPath)
+	if err != nil || !found {
+		t.Fatalf("GetIndex returned err=%v found=%v", err, found)
+	}
+	if codebase.LastFailedRun != nil {
+		t.Fatalf("LastFailedRun = %+v, want nil; an absent file must not fail the job", codebase.LastFailedRun)
+	}
+	snapshotPath := filepath.Join(cfg.MerkleDir, codebase.ID+".json")
+	snapshot, err := merkle.ReadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatalf("ReadSnapshot returned error: %v", err)
+	}
+	if _, present := snapshot.Files["a.go"]; present {
+		t.Fatalf("snapshot still lists a.go after removal; have %v", snapshot.Files)
+	}
+	for _, name := range []string{"main.go", "b.go", "c.go", "d.go"} {
+		if _, present := snapshot.Files[name]; !present {
+			t.Fatalf("snapshot dropped %s; a removal must not affect other files; have %v", name, snapshot.Files)
+		}
+	}
+}
+
+// TestRenderHistoricalFailureIncludesCorrelationIds proves a failed-run
+// status line carries the trace_id and job_id so the operator can resolve it
+// against the daemon's structured logs.
+func TestRenderHistoricalFailureIncludesCorrelationIds(t *testing.T) {
+	t.Parallel()
+
+	codebase := model.Codebase{
+		CanonicalPath: "/repo",
+		LastFailedRun: &model.IndexRunFailure{
+			Message:                 "boom",
+			LastAttemptedPercentage: 42,
+			FailedAt:                time.Now(),
+			TraceID:                 "trace-abc",
+			JobID:                   "job-xyz",
+		},
+	}
+	out := renderHistoricalFailure(&codebase)
+	if !strings.Contains(out, "trace_id=trace-abc") {
+		t.Fatalf("render output missing trace_id; got %q", out)
+	}
+	if !strings.Contains(out, "job_id=job-xyz") {
+		t.Fatalf("render output missing job_id; got %q", out)
 	}
 }
 
