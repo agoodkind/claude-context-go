@@ -5,7 +5,11 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"goodkind.io/claude-context-go/internal/clock"
@@ -15,6 +19,10 @@ import (
 const (
 	defaultSyncLockStale  = 10 * time.Minute
 	syncLockRetryInterval = 500 * time.Millisecond
+	// ownerPidFileName marks the lock directory with the PID of the daemon
+	// that created it, so a successor can tell its own crashed predecessor's
+	// lock (reclaim at once) from one the external TS adapter holds.
+	ownerPidFileName = "owner.pid"
 )
 
 // syncLock is a process-wide refcounted hold of the advisory lock that
@@ -72,19 +80,21 @@ func (lock *syncLock) acquire(ctx context.Context) bool {
 
 	if err := os.Mkdir(lock.lockPath, 0o755); err == nil {
 		lock.refcount = 1
+		lock.writeOwnerLocked(ctx)
 		return true
 	} else if !errors.Is(err, os.ErrExist) {
 		slog.ErrorContext(ctx, "acquire sync lock failed", "path", lock.lockPath, "err", err)
 		return false
 	}
 
-	// The directory exists with no local refcount: either the external TS tool
-	// holds it, or a crashed holder left it behind. Reclaim only once it is
-	// older than the stale window.
-	if !lock.reclaimStaleLocked(ctx) {
+	// The directory exists with no local refcount: either a crashed predecessor
+	// of this daemon left it (reclaim at once) or the external TS adapter holds
+	// it (honor the stale window).
+	if !lock.reclaimLocked(ctx) {
 		return false
 	}
 	lock.refcount = 1
+	lock.writeOwnerLocked(ctx)
 	return true
 }
 
@@ -125,11 +135,32 @@ func (lock *syncLock) release(ctx context.Context) {
 	}
 }
 
-// reclaimStaleLocked removes and recreates the lock directory when it is older
-// than the stale window, so a crashed holder cannot block embedding forever. It
-// returns false when the directory is fresh enough to still belong to a live
-// external holder. The caller holds lock.mu.
-func (lock *syncLock) reclaimStaleLocked(ctx context.Context) bool {
+// reclaimLocked decides whether an existing lock directory with no local
+// reference can be taken over, and recreates it when so. A lock whose owner PID
+// is recorded but no longer alive belongs to a crashed predecessor of this
+// daemon and is reclaimed at once, so a restart resumes indexing without
+// waiting out the stale window. A lock with a live owner is left alone. A lock
+// with no owner marker is the external TS adapter's; it is reclaimed only once
+// older than the stale window. The caller holds lock.mu.
+func (lock *syncLock) reclaimLocked(ctx context.Context) bool {
+	owner, hasOwner := lock.readOwnerLocked()
+	switch {
+	case hasOwner && processAlive(owner):
+		return false
+	case hasOwner:
+		slog.InfoContext(ctx, "reclaiming sync lock from a dead owner", "path", lock.lockPath, "owner_pid", owner)
+	default:
+		if !lock.staleByModTimeLocked(ctx) {
+			return false
+		}
+		slog.InfoContext(ctx, "reclaiming stale sync lock", "path", lock.lockPath)
+	}
+	return lock.recreateLocked(ctx)
+}
+
+// staleByModTimeLocked reports whether the lock directory is older than the
+// stale window. The caller holds lock.mu.
+func (lock *syncLock) staleByModTimeLocked(ctx context.Context) bool {
 	info, err := os.Stat(lock.lockPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "inspect sync lock failed", "path", lock.lockPath, "err", err)
@@ -139,11 +170,14 @@ func (lock *syncLock) reclaimStaleLocked(ctx context.Context) bool {
 	if lock.staleMS > 0 {
 		staleAge = time.Duration(lock.staleMS) * time.Millisecond
 	}
-	if clock.Now().Sub(info.ModTime()) <= staleAge {
-		return false
-	}
+	return clock.Now().Sub(info.ModTime()) > staleAge
+}
+
+// recreateLocked removes the existing lock directory and creates a fresh one.
+// The caller holds lock.mu.
+func (lock *syncLock) recreateLocked(ctx context.Context) bool {
 	if err := os.RemoveAll(lock.lockPath); err != nil {
-		slog.ErrorContext(ctx, "remove stale sync lock failed", "path", lock.lockPath, "err", err)
+		slog.ErrorContext(ctx, "remove sync lock failed", "path", lock.lockPath, "err", err)
 		return false
 	}
 	if err := os.Mkdir(lock.lockPath, 0o755); err != nil {
@@ -151,4 +185,43 @@ func (lock *syncLock) reclaimStaleLocked(ctx context.Context) bool {
 		return false
 	}
 	return true
+}
+
+// writeOwnerLocked stamps the lock directory with this process's PID so a
+// successor can recognize a lock this daemon left behind. Best effort: a write
+// failure only forfeits the fast dead-owner reclaim, falling back to the stale
+// window. The caller holds lock.mu.
+func (lock *syncLock) writeOwnerLocked(ctx context.Context) {
+	ownerPath := filepath.Join(lock.lockPath, ownerPidFileName)
+	if err := os.WriteFile(ownerPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		slog.WarnContext(ctx, "stamp sync lock owner failed", "path", ownerPath, "err", err)
+	}
+}
+
+// readOwnerLocked returns the PID recorded in the lock directory and whether a
+// valid one was found. The caller holds lock.mu.
+func (lock *syncLock) readOwnerLocked() (int, bool) {
+	data, err := os.ReadFile(filepath.Join(lock.lockPath, ownerPidFileName))
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// processAlive reports whether a process with the given PID currently exists.
+// Signal 0 performs the liveness check without delivering a signal; ESRCH means
+// the process is gone, while EPERM means it exists but is owned by another user.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
 }

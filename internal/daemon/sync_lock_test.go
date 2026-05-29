@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -79,6 +80,45 @@ func TestSyncLockReclaimsStaleDir(t *testing.T) {
 	lock.release(ctx)
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("lock dir should be gone after release of a reclaimed lock; stat err=%v", err)
+	}
+}
+
+// TestSyncLockReclaimsDeadOwnerImmediately proves a lock left by a crashed
+// daemon (its recorded owner PID no longer alive) is reclaimed at once, even
+// when the directory is fresh, so a restart resumes indexing without waiting
+// out the stale window.
+func TestSyncLockReclaimsDeadOwnerImmediately(t *testing.T) {
+	lock, lockPath := newTestSyncLock(t)
+	ctx := context.Background()
+
+	if err := os.Mkdir(lockPath, 0o755); err != nil {
+		t.Fatalf("Mkdir returned error: %v", err)
+	}
+	// A PID that is essentially certain not to be a live process.
+	if err := os.WriteFile(filepath.Join(lockPath, ownerPidFileName), []byte(strconv.Itoa(2147483646)), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if !lock.acquire(ctx) {
+		t.Fatal("acquire should reclaim a fresh lock whose owner process is dead")
+	}
+	lock.release(ctx)
+}
+
+// TestSyncLockDefersLiveOwner proves a lock whose recorded owner is a live
+// process is left alone, so the daemon never steals a lock another live owner
+// holds.
+func TestSyncLockDefersLiveOwner(t *testing.T) {
+	lock, lockPath := newTestSyncLock(t)
+	ctx := context.Background()
+
+	if err := os.Mkdir(lockPath, 0o755); err != nil {
+		t.Fatalf("Mkdir returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(lockPath, ownerPidFileName), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if lock.acquire(ctx) {
+		t.Fatal("acquire should defer to a lock held by a live owner")
 	}
 }
 
