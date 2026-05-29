@@ -4,15 +4,19 @@ import (
 	"context"
 	"log/slog"
 
+	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/metrics"
 	"goodkind.io/claude-context-go/internal/model"
 )
 
-// ResumeOrphanedJobs re-queues a streaming reindex for every codebase whose
-// previous indexing job was still running when the daemon exited. The
-// streaming path's per-file delete-then-upsert keeps the run idempotent, so
-// resuming is safe even though no mid-job state is persisted. Call this
-// once after NewManager returns and before the daemon advertises ready.
+// ResumeOrphanedJobs re-queues indexing for every codebase whose previous job
+// was still running when the daemon exited, but only when a merkle checkpoint
+// records the work already done. The delta and streaming paths checkpoint
+// per file, so their interrupted runs resume and skip embedded files. A full
+// bootstrap index writes its snapshot only on completion, so an interrupted
+// bootstrap has no checkpoint; resuming it would re-embed the whole codebase,
+// which a restart must never trigger. Call this once after NewManager returns
+// and before the daemon advertises ready.
 func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 	manager.mu.Lock()
 	type resumePlan struct {
@@ -40,14 +44,24 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 		return
 	}
 
-	if len(plans) > 0 {
-		paths := make([]string, 0, len(plans))
-		for _, plan := range plans {
-			paths = append(paths, plan.canonicalPath)
-		}
-		slog.InfoContext(ctx, "resuming orphaned indexing jobs", "count", len(plans), "paths", paths)
-	}
+	resumable := make([]resumePlan, 0, len(plans))
 	for _, plan := range plans {
+		if manager.hasResumableCheckpoint(plan.codebaseID, plan.config.IgnoreDigest) {
+			resumable = append(resumable, plan)
+			continue
+		}
+		manager.logResumeUnresumable(ctx, plan.codebaseID, plan.canonicalPath)
+	}
+	if len(resumable) == 0 {
+		return
+	}
+
+	paths := make([]string, 0, len(resumable))
+	for _, plan := range resumable {
+		paths = append(paths, plan.canonicalPath)
+	}
+	slog.InfoContext(ctx, "resuming orphaned indexing jobs", "count", len(resumable), "paths", paths)
+	for _, plan := range resumable {
 		client := model.ClientInfo{Name: "daemon-resume", PID: 0}
 		_, _, _, _, err := manager.StartIndex(ctx, plan.canonicalPath, client, plan.config, false)
 		if err != nil {
@@ -59,11 +73,27 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 	}
 }
 
+// hasResumableCheckpoint reports whether a codebase left mid-index persisted a
+// merkle checkpoint valid for its current config. Resuming without one would
+// re-embed every file from scratch, so the daemon treats a missing checkpoint
+// as not resumable.
+func (manager *Manager) hasResumableCheckpoint(codebaseID string, configDigest string) bool {
+	snapshot := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest, manager.legacyDigestForCodebase(codebaseID))
+	return len(snapshot.Files) > 0
+}
+
 // logResumeSkipped records that boot resume is disabled for one tracked
 // codebase. It exists as a method so the per-codebase line is not emitted
 // lexically inside the ResumeOrphanedJobs loop.
 func (manager *Manager) logResumeSkipped(ctx context.Context, codebaseID string, path string) {
 	slog.InfoContext(ctx, "skipping orphaned indexing job resume", "codebase_id", codebaseID, "path", path, "reason", "resume_on_boot_disabled")
+}
+
+// logResumeUnresumable records that an interrupted index had no checkpoint to
+// resume from, so the daemon leaves it tracked rather than re-embedding the
+// whole codebase on boot. Re-run index_codebase to finish it.
+func (manager *Manager) logResumeUnresumable(ctx context.Context, codebaseID string, path string) {
+	slog.InfoContext(ctx, "skipping unresumable interrupted index; re-run index_codebase to finish", "codebase_id", codebaseID, "path", path, "reason", "no_checkpoint")
 }
 
 // logResumeLaunched records that boot resume re-queued one codebase. It

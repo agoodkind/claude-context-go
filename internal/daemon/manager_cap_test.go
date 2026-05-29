@@ -10,6 +10,7 @@ import (
 
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/indexer"
+	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/store"
 )
@@ -267,10 +268,12 @@ func TestResumeOrphanedJobsHonorsResumeOnBoot(t *testing.T) {
 	cases := []struct {
 		name          string
 		resumeOnBoot  bool
+		hasCheckpoint bool
 		wantResumeJob bool
 	}{
-		{name: "resume enabled launches", resumeOnBoot: true, wantResumeJob: true},
-		{name: "resume disabled skips", resumeOnBoot: false, wantResumeJob: false},
+		{name: "resume enabled with checkpoint launches", resumeOnBoot: true, hasCheckpoint: true, wantResumeJob: true},
+		{name: "resume enabled without checkpoint skips", resumeOnBoot: true, hasCheckpoint: false, wantResumeJob: false},
+		{name: "resume disabled skips", resumeOnBoot: false, hasCheckpoint: true, wantResumeJob: false},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -296,14 +299,26 @@ func TestResumeOrphanedJobsHonorsResumeOnBoot(t *testing.T) {
 				t.Fatalf("EvalSymlinks returned error: %v", err)
 			}
 			codebaseID := "cb-resume-test"
+			resumeConfig := defaultIndexConfig()
+			resumeConfig.IgnoreDigest = "sha256:resume-checkpoint"
 			manager.mu.Lock()
 			manager.codebases[codebaseID] = model.Codebase{
 				ID:              codebaseID,
 				CanonicalPath:   canonical,
 				Status:          model.CodebaseStatusIndexing,
-				EffectiveConfig: defaultIndexConfig(),
+				EffectiveConfig: resumeConfig,
 			}
 			manager.mu.Unlock()
+
+			if testCase.hasCheckpoint {
+				snapshot := merkle.Snapshot{
+					ConfigDigest: resumeConfig.IgnoreDigest,
+					Files:        map[string]string{"main.go": hashText("package main\n")},
+				}
+				if err := merkle.WriteSnapshot(manager.merklePath(codebaseID), snapshot); err != nil {
+					t.Fatalf("WriteSnapshot returned error: %v", err)
+				}
+			}
 
 			manager.ResumeOrphanedJobs(context.Background())
 
