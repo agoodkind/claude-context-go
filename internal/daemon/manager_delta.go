@@ -46,6 +46,30 @@ type deltaState struct {
 	snapshotPath string
 	working      map[string]string
 	semantic     bool
+	// staging routes per-file embeds into the staging collection that a
+	// from-scratch build promotes onto the live name at the end, instead of
+	// the live collection an incremental sync writes to directly.
+	staging bool
+}
+
+// applyReindexForState runs one per-file delta against the live collection, or
+// against the staging collection when the job is a from-scratch build, and
+// classifies any backend error into a deltaOutcome. Both targets go through
+// the same delete-then-insert flow, so a re-embedded file is idempotent either
+// way. A zero-value outcome means the embed succeeded and the caller should
+// continue; a non-zero outcome means the step already resolved the job
+// (failed, cancelled) or signalled a fallback to a full build.
+func (manager *Manager) applyReindexForState(ctx context.Context, job model.Job, state deltaState, chunks []model.StoredChunk, removedPaths []string, phase string) deltaOutcome {
+	var err error
+	if state.staging {
+		err = manager.semantic.StageReindex(ctx, job.CanonicalPath, chunks, removedPaths, nil)
+	} else {
+		err = manager.semantic.Reindex(ctx, job.CanonicalPath, chunks, removedPaths, nil)
+	}
+	if err != nil {
+		return manager.classifyReindexErr(ctx, job, err, phase)
+	}
+	return deltaOutcome{fallback: false, handled: false}
 }
 
 // planStreamingReindex captures a fresh merkle snapshot and synthesizes a
@@ -177,6 +201,7 @@ func (manager *Manager) runDeltaSync(ctx context.Context, job model.Job) bool {
 		snapshotPath: manager.merklePath(codebase.ID),
 		working:      make(map[string]string, len(plan.seedSnapshot.Files)),
 		semantic:     manager.semantic != nil && manager.semantic.Available(),
+		staging:      false,
 	}
 	maps.Copy(state.working, plan.seedSnapshot.Files)
 
@@ -232,6 +257,163 @@ func (manager *Manager) codebaseTotals(ctx context.Context, canonicalPath string
 	return fileCount, count
 }
 
+// runBootstrap builds a codebase index from scratch into a staging collection
+// and swaps it onto the live name only once every file is embedded, so a
+// search never observes a half-built first index. It embeds file by file and
+// checkpoints after each, so an interrupted build resumes by skipping the
+// files already embedded rather than restarting from the first one. Every
+// operation that lacks a usable incremental delta routes here: a true first
+// index, a forced rebuild, and a sync or streaming reindex whose live
+// collection has gone missing.
+func (manager *Manager) runBootstrap(ctx context.Context, job model.Job) {
+	ctx, done := spans.Open(ctx, "daemon.runBootstrap")
+	defer done(nil)
+
+	manager.mu.Lock()
+	codebase, codebaseFound := manager.codebases[job.CodebaseID]
+	manager.mu.Unlock()
+	if !codebaseFound {
+		return
+	}
+
+	plan := manager.planBootstrap(ctx, job, codebase.ID)
+	if plan.handled {
+		return
+	}
+
+	state := deltaState{
+		plan:         plan,
+		snapshotPath: manager.merklePath(codebase.ID),
+		working:      make(map[string]string, len(plan.currentSnapshot.Files)),
+		semantic:     manager.semantic != nil && manager.semantic.Available(),
+		staging:      true,
+	}
+	maps.Copy(state.working, plan.seedSnapshot.Files)
+
+	result, outcome := manager.applyDeltaChanges(ctx, job, state)
+	if outcome.handled {
+		return
+	}
+	if outcome.fallback {
+		// A from-scratch build has no further fallback; treat one as a failure
+		// so the job reaches a terminal state instead of stalling in running.
+		manager.updateJobFailed(ctx, job.ID, errors.New("bootstrap build could not complete against the semantic backend"))
+		return
+	}
+
+	if promote := manager.promoteBootstrap(ctx, job, state); promote.handled {
+		return
+	}
+
+	result.FileHashes = state.working
+	fileCount, chunkCount := manager.codebaseTotals(ctx, job.CanonicalPath, state.working, result.TotalChunks)
+	result.IndexedFiles = fileCount
+	result.TotalChunks = chunkCount
+	manager.updateJobCompleted(job.ID, result)
+}
+
+// planBootstrap captures a fresh snapshot for a from-scratch build and decides
+// whether a persisted checkpoint can seed a resume. Every discovered file is
+// classified Added so the per-file loop embeds it unless the checkpoint
+// already records its current hash. The checkpoint seeds a resume only when a
+// staging collection still backs it; otherwise the build restarts from the
+// first file and any stale staging is dropped first.
+func (manager *Manager) planBootstrap(ctx context.Context, job model.Job, codebaseID string) deltaPlan {
+	configDigest := job.Config.IgnoreDigest
+	legacyDigest := manager.legacyDigestForCodebase(codebaseID)
+	seed := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest, legacyDigest)
+	semanticReady := manager.semantic != nil && manager.semantic.Available()
+
+	captured, err := merkle.Capture(ctx, job.CanonicalPath, job.Config)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(ctx, job.ID)
+		} else {
+			manager.updateJobFailed(ctx, job.ID, fmt.Errorf("capture bootstrap snapshot: %w", err))
+		}
+		return deltaPlan{
+			diff:            merkle.Diff{Added: nil, Modified: nil, Removed: nil},
+			currentSnapshot: merkle.Snapshot{ConfigDigest: "", Files: nil, Inodes: nil},
+			seedSnapshot:    seed,
+			configDigest:    configDigest,
+			fallback:        false,
+			handled:         true,
+		}
+	}
+
+	if !manager.canResumeStaging(ctx, job.CanonicalPath, seed, semanticReady) {
+		if semanticReady {
+			if dropErr := manager.semantic.DropStaging(ctx, job.CanonicalPath); dropErr != nil {
+				slog.WarnContext(ctx, "drop stale staging before bootstrap failed", "path", job.CanonicalPath, "err", dropErr)
+			}
+		}
+		seed = merkle.Snapshot{ConfigDigest: configDigest, Files: nil, Inodes: nil}
+	}
+
+	addedFiles := make([]string, 0, len(captured.Files))
+	for relativePath := range captured.Files {
+		addedFiles = append(addedFiles, relativePath)
+	}
+	sort.Strings(addedFiles)
+	return deltaPlan{
+		diff:            merkle.Diff{Added: addedFiles, Modified: nil, Removed: nil},
+		currentSnapshot: captured,
+		seedSnapshot:    seed,
+		configDigest:    configDigest,
+		fallback:        false,
+		handled:         false,
+	}
+}
+
+// canResumeStaging reports whether a persisted checkpoint can seed a resumed
+// build. A checkpoint with no files cannot. When the semantic backend is
+// configured the staging collection must still exist, because that is where
+// the embedded vectors for the checkpointed files live; without it the
+// checkpoint describes work whose vectors were lost, so the build restarts.
+// When the backend is unavailable the checkpoint is the only state and is
+// trusted on its own.
+func (manager *Manager) canResumeStaging(ctx context.Context, canonicalPath string, seed merkle.Snapshot, semanticReady bool) bool {
+	if len(seed.Files) == 0 {
+		return false
+	}
+	if !semanticReady {
+		return true
+	}
+	hasStaging, err := manager.semantic.HasStaging(ctx, canonicalPath)
+	if err != nil {
+		slog.WarnContext(ctx, "check staging for resume failed; restarting build", "path", canonicalPath, "err", err)
+		return false
+	}
+	return hasStaging
+}
+
+// promoteBootstrap swaps the freshly built staging collection onto the live
+// name. When no file produced chunks there is no staging collection to
+// promote, which is a successful empty index rather than an error. A handled
+// outcome means promoteBootstrap already set a terminal job state.
+func (manager *Manager) promoteBootstrap(ctx context.Context, job model.Job, state deltaState) deltaOutcome {
+	if !state.semantic {
+		return deltaOutcome{fallback: false, handled: false}
+	}
+	hasStaging, err := manager.semantic.HasStaging(ctx, job.CanonicalPath)
+	if err != nil {
+		manager.updateJobFailed(ctx, job.ID, err)
+		return deltaOutcome{fallback: false, handled: true}
+	}
+	if !hasStaging {
+		return deltaOutcome{fallback: false, handled: false}
+	}
+	if err := manager.semantic.PromoteStaging(ctx, job.CanonicalPath); err != nil {
+		if errors.Is(err, context.Canceled) {
+			manager.updateJobCancelled(ctx, job.ID)
+		} else {
+			manager.updateJobFailed(ctx, job.ID, fmt.Errorf("promote staging collection: %w", err))
+		}
+		return deltaOutcome{fallback: false, handled: true}
+	}
+	return deltaOutcome{fallback: false, handled: false}
+}
+
 func (manager *Manager) computeDeltaPlan(ctx context.Context, job model.Job, codebaseID string, streamingReindex bool) deltaPlan {
 	if streamingReindex {
 		return manager.planStreamingReindex(ctx, job, codebaseID)
@@ -244,8 +426,8 @@ func (manager *Manager) applyDeltaRemovals(ctx context.Context, job model.Job, s
 	if len(removed) == 0 || !state.semantic {
 		return deltaOutcome{fallback: false, handled: false}
 	}
-	if err := manager.semantic.Reindex(ctx, job.CanonicalPath, nil, removed, nil); err != nil {
-		return manager.classifyReindexErr(ctx, job, err, "delta removal")
+	if outcome := manager.applyReindexForState(ctx, job, state, nil, removed, "delta removal"); outcome.fallback || outcome.handled {
+		return outcome
 	}
 	for _, path := range removed {
 		delete(state.working, path)
@@ -301,8 +483,8 @@ func (manager *Manager) handleChangedFile(ctx context.Context, job model.Job, st
 	if fileResult.Removed {
 		slog.InfoContext(ctx, "converge.remove", "component", "daemon", "subcomponent", "delta", "path", relativePath, "semantic", state.semantic)
 		if state.semantic {
-			if rmErr := manager.semantic.Reindex(ctx, job.CanonicalPath, nil, []string{relativePath}, nil); rmErr != nil {
-				return manager.classifyReindexErr(ctx, job, rmErr, "per-file removal")
+			if outcome := manager.applyReindexForState(ctx, job, state, nil, []string{relativePath}, "per-file removal"); outcome.fallback || outcome.handled {
+				return outcome
 			}
 		}
 		delete(state.working, relativePath)
@@ -313,8 +495,8 @@ func (manager *Manager) handleChangedFile(ctx context.Context, job model.Job, st
 		return deltaOutcome{fallback: false, handled: false}
 	}
 	if state.semantic {
-		if err := manager.semantic.Reindex(ctx, job.CanonicalPath, fileResult.Chunks, []string{relativePath}, nil); err != nil {
-			return manager.classifyReindexErr(ctx, job, err, "per-file reindex")
+		if outcome := manager.applyReindexForState(ctx, job, state, fileResult.Chunks, []string{relativePath}, "per-file reindex"); outcome.fallback || outcome.handled {
+			return outcome
 		}
 	}
 	state.working[relativePath] = fileResult.FileHash

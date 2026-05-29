@@ -4,9 +4,11 @@ import (
 	"context"
 	"log/slog"
 
+	"goodkind.io/claude-context-go/internal/clock"
 	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/metrics"
 	"goodkind.io/claude-context-go/internal/model"
+	"goodkind.io/gklog/correlation"
 )
 
 // ResumeOrphanedJobs re-queues indexing for every codebase whose previous job
@@ -51,6 +53,7 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 			continue
 		}
 		manager.logResumeUnresumable(ctx, plan.codebaseID, plan.canonicalPath)
+		manager.markUnresumableFailed(ctx, plan.codebaseID)
 	}
 	if len(resumable) == 0 {
 		return
@@ -80,6 +83,40 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 func (manager *Manager) hasResumableCheckpoint(codebaseID string, configDigest string) bool {
 	snapshot := merkle.LoadSnapshotForConfig(manager.merklePath(codebaseID), configDigest, manager.legacyDigestForCodebase(codebaseID))
 	return len(snapshot.Files) > 0
+}
+
+// markUnresumableFailed transitions an interrupted codebase that has no
+// checkpoint to failed, so it surfaces as failed rather than staying stuck
+// showing indexing across restarts. A per-file build checkpoints after each
+// file, so a missing checkpoint means almost nothing was embedded; a re-run of
+// index_codebase starts the build fresh.
+func (manager *Manager) markUnresumableFailed(ctx context.Context, codebaseID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	codebase, found := manager.codebases[codebaseID]
+	if !found {
+		return
+	}
+	if codebase.Status != model.CodebaseStatusIndexing {
+		return
+	}
+
+	now := clock.Now()
+	codebase.Status = model.CodebaseStatusFailed
+	codebase.ActiveJobID = ""
+	codebase.LastFailedRun = &model.IndexRunFailure{
+		Message:                 "interrupted index had no checkpoint to resume; re-run index_codebase to finish",
+		LastAttemptedPercentage: 0,
+		FailedAt:                now,
+		TraceID:                 string(correlation.FromContext(ctx).TraceID),
+		JobID:                   "",
+	}
+	codebase.UpdatedAt = now
+	manager.codebases[codebaseID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		slog.ErrorContext(ctx, "write registry after marking unresumable index failed", "codebase_id", codebaseID, "err", err)
+	}
 }
 
 // logResumeSkipped records that boot resume is disabled for one tracked

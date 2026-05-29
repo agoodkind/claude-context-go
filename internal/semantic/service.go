@@ -19,7 +19,6 @@ import (
 	"github.com/milvus-io/milvus/client/v2/entity"
 	"github.com/milvus-io/milvus/client/v2/index"
 	"github.com/milvus-io/milvus/client/v2/milvusclient"
-	"goodkind.io/claude-context-go/internal/adapterr"
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/embedding"
 	"goodkind.io/claude-context-go/internal/model"
@@ -146,100 +145,6 @@ func (service *Service) CollectionName(codebasePath string) string {
 	return prefix + "_" + sanitized + hashSuffix
 }
 
-// Replace drops and rebuilds one codebase collection from chunk data.
-func (service *Service) Replace(ctx context.Context, codebasePath string, chunks []model.StoredChunk, progress func(Progress)) (err error) {
-	ctx, done := spans.Open(ctx, "semantic.replace")
-	defer done(&err)
-
-	if !service.Available() {
-		return nil
-	}
-	if len(chunks) == 0 {
-		return nil
-	}
-	chunks = service.guardrailExpand(ctx, codebasePath, chunks, "replace")
-
-	collectionName := service.CollectionName(codebasePath)
-	stagingName := stagingCollectionName(collectionName)
-	// Drop any staging collection left by a crashed rebuild so the build
-	// starts clean. The live collection is untouched until the swap below.
-	if err := service.dropIfExists(ctx, stagingName); err != nil {
-		return err
-	}
-
-	batchSize := service.cfg.EmbeddingBatchSize
-	if batchSize <= 0 {
-		batchSize = 32
-	}
-
-	totalBatches := (len(chunks) + batchSize - 1) / batchSize
-	var writtenRows int32
-	collectionReady := false
-
-	for batchIndex := range totalBatches {
-		start := batchIndex * batchSize
-		end := min(start+batchSize, len(chunks))
-
-		chunkBatch := chunks[start:end]
-		textBatch := make([]string, 0, len(chunkBatch))
-		for _, chunk := range chunkBatch {
-			textBatch = append(textBatch, chunk.Content)
-		}
-
-		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
-		if err != nil {
-			slog.ErrorContext(ctx, "embed batch failed", "err", err)
-			return adapterr.NewEmbedderUnreachable(err)
-		}
-		if len(vectors) != len(chunkBatch) {
-			slog.ErrorContext(ctx, "embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
-			return fmt.Errorf("embedding batch returned %d vectors for %d chunks", len(vectors), len(chunkBatch))
-		}
-
-		if !collectionReady {
-			dimension := len(vectors[0])
-			if err := service.createCollection(ctx, stagingName, dimension); err != nil {
-				return err
-			}
-			collectionReady = true
-		}
-
-		if err := service.insertBatch(ctx, stagingName, chunkBatch, vectors); err != nil {
-			return err
-		}
-
-		writtenRows += safeInt32FromInt(len(chunkBatch))
-		if progress != nil {
-			progress(Progress{
-				Phase:                     "Generating embeddings and writing to Milvus...",
-				OverallPercent:            90 + (float64(batchIndex+1)/float64(totalBatches))*10,
-				EmbeddingBatchesTotal:     safeInt32FromInt(totalBatches),
-				EmbeddingBatchesCompleted: safeInt32FromInt(batchIndex + 1),
-				CollectionRowsWritten:     writtenRows,
-			})
-		}
-	}
-
-	// The staging collection is fully built. Swap it onto the live name: drop
-	// the old collection then rename staging onto it. A failure anywhere above
-	// returns before this point, leaving the previous collection serving
-	// queries; only these two metadata operations replace it.
-	if err := service.dropIfExists(ctx, collectionName); err != nil {
-		return err
-	}
-	return service.renameCollection(ctx, stagingName, collectionName)
-}
-
-// stagingCollectionName derives the transient rebuild collection name, kept
-// within the Milvus name-length cap.
-func stagingCollectionName(collectionName string) string {
-	maxBase := maxCollectionNameLength - len(stagingCollectionSuffix)
-	if len(collectionName) > maxBase {
-		collectionName = collectionName[:maxBase]
-	}
-	return collectionName + stagingCollectionSuffix
-}
-
 func (service *Service) renameCollection(ctx context.Context, oldName string, newName string) error {
 	if err := service.milvus.RenameCollection(ctx, milvusclient.NewRenameCollectionOption(oldName, newName)); err != nil {
 		slog.ErrorContext(ctx, "rename Milvus collection failed", "from", oldName, "to", newName, "err", err)
@@ -248,13 +153,13 @@ func (service *Service) renameCollection(ctx context.Context, oldName string, ne
 	return nil
 }
 
-// Reindex applies a per-file delta against an existing collection.
+// Reindex applies a per-file delta against an existing live collection.
 //
-// removedOrModifiedRelativePaths is deleted via Milvus expression
-// `relative_path == "<escaped>"`. The chunk batch is then embedded and
-// inserted in the same batched flow Replace uses. Reindex returns
-// ErrCollectionMissing if the collection no longer exists so callers can
-// fall back to a full Replace.
+// removedOrModifiedRelativePaths is deleted via the Milvus `relativePath in
+// [...]` expression. The chunk batch is then embedded and inserted through the
+// same batched flow the staging build uses. Reindex returns
+// ErrCollectionMissing when the live collection no longer exists, so callers
+// can fall back to a full staging build.
 func (service *Service) Reindex(ctx context.Context, codebasePath string, addedOrModifiedChunks []model.StoredChunk, removedOrModifiedRelativePaths []string, progress func(Progress)) (err error) {
 	ctx, done := spans.Open(ctx, "semantic.reindex")
 	defer done(&err)
@@ -283,50 +188,7 @@ func (service *Service) Reindex(ctx context.Context, codebasePath string, addedO
 		return nil
 	}
 	addedOrModifiedChunks = service.guardrailExpand(ctx, codebasePath, addedOrModifiedChunks, "reindex")
-
-	batchSize := service.cfg.EmbeddingBatchSize
-	if batchSize <= 0 {
-		batchSize = 32
-	}
-
-	totalBatches := (len(addedOrModifiedChunks) + batchSize - 1) / batchSize
-	var writtenRows int32
-	for batchIndex := range totalBatches {
-		start := batchIndex * batchSize
-		end := min(start+batchSize, len(addedOrModifiedChunks))
-
-		chunkBatch := addedOrModifiedChunks[start:end]
-		textBatch := make([]string, 0, len(chunkBatch))
-		for _, chunk := range chunkBatch {
-			textBatch = append(textBatch, chunk.Content)
-		}
-
-		vectors, err := service.embedder.EmbedBatch(ctx, textBatch)
-		if err != nil {
-			slog.ErrorContext(ctx, "embed reindex batch failed", "err", err)
-			return adapterr.NewEmbedderUnreachable(err)
-		}
-		if len(vectors) != len(chunkBatch) {
-			slog.ErrorContext(ctx, "reindex embedding batch returned unexpected vector count", "want", len(chunkBatch), "got", len(vectors), "err", errors.New("vector count mismatch"))
-			return fmt.Errorf("reindex embedding batch returned %d vectors for %d chunks", len(vectors), len(chunkBatch))
-		}
-
-		if err := service.insertBatch(ctx, collectionName, chunkBatch, vectors); err != nil {
-			return err
-		}
-
-		writtenRows += safeInt32FromInt(len(chunkBatch))
-		if progress != nil {
-			progress(Progress{
-				Phase:                     "Reindexing changed files...",
-				OverallPercent:            90 + (float64(batchIndex+1)/float64(totalBatches))*10,
-				EmbeddingBatchesTotal:     safeInt32FromInt(totalBatches),
-				EmbeddingBatchesCompleted: safeInt32FromInt(batchIndex + 1),
-				CollectionRowsWritten:     writtenRows,
-			})
-		}
-	}
-	return nil
+	return service.insertChunksBatched(ctx, collectionName, addedOrModifiedChunks, true, "Reindexing changed files...", progress)
 }
 
 // PruneToCurrent removes rows whose relativePath is outside the provided

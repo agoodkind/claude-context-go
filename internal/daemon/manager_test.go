@@ -39,11 +39,18 @@ func (runner fakeRunner) IndexFiles(ctx context.Context, root string, relativePa
 	return runner.index(ctx, root, indexConfig, progress)
 }
 
+// fakeRunnerRealIndexer backs fakeRunner.IndexOne when a test does not supply
+// its own indexOne. The daemon drives every index through the per-file path,
+// so the default double performs real per-file indexing of the on-disk files a
+// test writes: real chunks and a content hash that matches the merkle
+// snapshot, which keeps a follow-up sync from re-detecting unchanged files.
+var fakeRunnerRealIndexer = indexer.NewRunner()
+
 func (runner fakeRunner) IndexOne(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 	if runner.indexOne != nil {
 		return runner.indexOne(ctx, root, relativePath, indexConfig)
 	}
-	return indexer.OneFileResult{Skipped: true}, nil
+	return fakeRunnerRealIndexer.IndexOne(ctx, root, relativePath, indexConfig)
 }
 
 func TestGetIndexNotTrackedReturnsFriendlyStatus(t *testing.T) {
@@ -162,17 +169,12 @@ func TestClearIndexCancelsActiveJob(t *testing.T) {
 
 	manager, _, repoPath := newTestManager(t)
 	started := make(chan struct{})
+	var startOnce sync.Once
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			close(started)
-			progress(indexer.Progress{
-				Phase:          "Processing files and generating embeddings...",
-				OverallPercent: 33.3,
-				FilesTotal:     3,
-				FilesProcessed: 1,
-			})
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			startOnce.Do(func() { close(started) })
 			<-ctx.Done()
-			return indexer.Result{}, ctx.Err()
+			return indexer.OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: false}, ctx.Err()
 		},
 	}
 
@@ -198,21 +200,23 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 	t.Parallel()
 
 	manager, _, repoPath := newTestManager(t)
-	initialResult := indexer.Result{
-		IndexedFiles: 1,
-		TotalChunks:  1,
-		Chunks: []model.StoredChunk{{
-			Content:       "func SearchableThing() {}\n",
-			RelativePath:  "main.go",
-			StartLine:     1,
-			EndLine:       1,
-			Language:      "go",
-			FileExtension: ".go",
-		}},
-	}
+	// The initial index caches a chunk carrying the search term. Its file hash
+	// matches the on-disk main.go so the checkpoint is consistent with disk.
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			return initialResult, nil
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			return indexer.OneFileResult{
+				Chunks: []model.StoredChunk{{
+					Content:       "func SearchableThing() {}\n",
+					RelativePath:  relativePath,
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHash: hashText("package main\n"),
+				Skipped:  false,
+				Removed:  false,
+			}, nil
 		},
 	}
 
@@ -221,6 +225,13 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 		t.Fatalf("initial StartIndex returned error: %v", err)
 	}
 	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Change main.go so the forced reindex classifies it as modified and runs
+	// its per-file embed, which the runner below blocks to hold the codebase in
+	// the indexing state while the search assertions run.
+	if err := os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\nfunc Edited() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
 
 	release := make(chan struct{})
 	manager.runner = fakeRunner{
@@ -237,6 +248,7 @@ func TestForceReindexStartsFreshJobAndSearchShowsIndexingWarning(t *testing.T) {
 				}},
 				FileHash: hashText("force reindex"),
 				Skipped:  false,
+				Removed:  false,
 			}, nil
 		},
 	}
@@ -294,20 +306,32 @@ func TestStartIndexPersistsSkippedFiles(t *testing.T) {
 	t.Parallel()
 
 	manager, _, repoPath := newTestManager(t)
+	// Two discoverable .go files the per-file indexer reports as skipped (the
+	// production trigger is non-UTF-8 content). The daemon must persist that
+	// skipped list into LastSuccessfulRun and Doctor must surface the count.
+	for _, name := range []string{"binary.go", "weird.go"} {
+		if err := os.WriteFile(filepath.Join(repoPath, name), []byte("package main\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			return indexer.Result{
-				IndexedFiles: 1,
-				TotalChunks:  1,
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			if relativePath == "binary.go" || relativePath == "weird.go" {
+				return indexer.OneFileResult{Chunks: nil, FileHash: "", Skipped: true, Removed: false}, nil
+			}
+			content := "package main\n"
+			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{{
-					Content:       "package main\n",
-					RelativePath:  "main.go",
+					Content:       content,
+					RelativePath:  relativePath,
 					StartLine:     1,
 					EndLine:       1,
 					Language:      "go",
 					FileExtension: ".go",
 				}},
-				SkippedFiles: []string{"binary.bin", "weird-encoding.txt"},
+				FileHash: hashText(content),
+				Skipped:  false,
+				Removed:  false,
 			}, nil
 		},
 	}
@@ -327,7 +351,7 @@ func TestStartIndexPersistsSkippedFiles(t *testing.T) {
 	if codebase.LastSuccessfulRun == nil {
 		t.Fatal("LastSuccessfulRun nil after StartIndex completion")
 	}
-	wantSkipped := []string{"binary.bin", "weird-encoding.txt"}
+	wantSkipped := []string{"binary.go", "weird.go"}
 	if !slices.Equal(codebase.LastSuccessfulRun.SkippedFiles, wantSkipped) {
 		t.Fatalf("LastSuccessfulRun.SkippedFiles = %v, want %v", codebase.LastSuccessfulRun.SkippedFiles, wantSkipped)
 	}
@@ -350,25 +374,25 @@ func TestStartIndexForceDeduplicatesAgainstInFlightJob(t *testing.T) {
 	t.Parallel()
 
 	manager, _, repoPath := newTestManager(t)
-	initialResult := indexer.Result{
-		IndexedFiles: 1,
-		TotalChunks:  1,
-		Chunks: []model.StoredChunk{{
-			Content:       "package main\n",
-			RelativePath:  "main.go",
-			StartLine:     1,
-			EndLine:       1,
-			Language:      "go",
-			FileExtension: ".go",
-		}},
-	}
 	release := make(chan struct{})
 	var indexCalls int32
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			atomic.AddInt32(&indexCalls, 1)
 			<-release
-			return initialResult, nil
+			return indexer.OneFileResult{
+				Chunks: []model.StoredChunk{{
+					Content:       "package main\n",
+					RelativePath:  relativePath,
+					StartLine:     1,
+					EndLine:       1,
+					Language:      "go",
+					FileExtension: ".go",
+				}},
+				FileHash: hashText("package main\n"),
+				Skipped:  false,
+				Removed:  false,
+			}, nil
 		},
 	}
 
@@ -527,32 +551,26 @@ func TestRunDeltaSyncCheckpointsPerFile(t *testing.T) {
 		}
 	}
 
+	// The initial index uses the real per-file indexer, establishing a
+	// checkpoint whose hashes match disk.
+	if _, _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
+		t.Fatalf("initial StartIndex returned error: %v", err)
+	}
+	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Change every file so the streaming reindex re-embeds all five and
+	// checkpoints after each.
+	for _, name := range []string{"main.go", "a.go", "b.go", "c.go", "d.go"} {
+		if err := os.WriteFile(filepath.Join(repoPath, name), []byte("package main\n// "+name+" edited\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
 	embedCalls := atomic.Int32{}
 	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			return indexer.Result{
-				IndexedFiles: 5,
-				TotalChunks:  5,
-				Chunks: []model.StoredChunk{{
-					Content:       "initial",
-					RelativePath:  "main.go",
-					StartLine:     1,
-					EndLine:       1,
-					Language:      "go",
-					FileExtension: ".go",
-				}},
-				FileHashes: map[string]string{
-					"main.go": hashText("main"),
-					"a.go":    hashText("a.go"),
-					"b.go":    hashText("b.go"),
-					"c.go":    hashText("c.go"),
-					"d.go":    hashText("d.go"),
-				},
-			}, nil
-		},
 		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			embedCalls.Add(1)
-			content := "package main\n// " + relativePath + "\n"
+			content := "package main\n// " + relativePath + " edited\n"
 			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{{
 					Content:       content,
@@ -564,14 +582,10 @@ func TestRunDeltaSyncCheckpointsPerFile(t *testing.T) {
 				}},
 				FileHash: hashText(content),
 				Skipped:  false,
+				Removed:  false,
 			}, nil
 		},
 	}
-
-	if _, _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
-		t.Fatalf("initial StartIndex returned error: %v", err)
-	}
-	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
 
 	// Force a streaming reindex by passing force=true (matching config).
 	if _, _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), true); err != nil {
@@ -701,44 +715,23 @@ func TestRunDeltaSyncConvergesDeletedFileToRemoval(t *testing.T) {
 		}
 	}
 
-	initialHashes := map[string]string{
-		"main.go": hashText("package main\n"),
-		"a.go":    hashText("package main\n// a.go\n"),
-		"b.go":    hashText("package main\n// b.go\n"),
-		"c.go":    hashText("package main\n// c.go\n"),
-		"d.go":    hashText("package main\n// d.go\n"),
-	}
-	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			return indexer.Result{
-				IndexedFiles: 5,
-				TotalChunks:  1,
-				Chunks: []model.StoredChunk{{
-					Content:       "package main\n",
-					RelativePath:  "main.go",
-					StartLine:     1,
-					EndLine:       1,
-					Language:      "go",
-					FileExtension: ".go",
-				}},
-				FileHashes: initialHashes,
-			}, nil
-		},
-		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
-			return indexer.OneFileResult{Removed: true}, nil
-		},
-	}
-
+	// The initial index uses the real per-file indexer so the checkpoint records
+	// all five files with hashes that match disk.
 	if _, _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
 		t.Fatalf("initial StartIndex returned error: %v", err)
 	}
 	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
 
 	// Change a.go on disk so the next sync classifies it as modified and runs
-	// its converge task. The fake leaf then reports it absent, exercising the
-	// removal path.
+	// its converge task. The leaf below then reports the changed file absent,
+	// exercising the removal path; the four unchanged files are skipped.
 	if err := os.WriteFile(filepath.Join(repoPath, "a.go"), []byte("package main\n// a.go changed\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	manager.runner = fakeRunner{
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			return indexer.OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: true}, nil
+		},
 	}
 
 	syncer := NewBackgroundSync(cfg, manager)
@@ -808,39 +801,21 @@ func TestRunDeltaSyncEmptyDiffPreservesCodebaseTotals(t *testing.T) {
 		}
 	}
 
-	initialHashes := map[string]string{
-		"main.go": hashText("package main\n"),
-		"a.go":    hashText("package main\n// a.go\n"),
-		"b.go":    hashText("package main\n// b.go\n"),
-		"c.go":    hashText("package main\n// c.go\n"),
-		"d.go":    hashText("package main\n// d.go\n"),
-	}
-	manager.runner = fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
-			return indexer.Result{
-				IndexedFiles: 5,
-				TotalChunks:  5,
-				Chunks: []model.StoredChunk{{
-					Content:       "package main\n",
-					RelativePath:  "main.go",
-					StartLine:     1,
-					EndLine:       1,
-					Language:      "go",
-					FileExtension: ".go",
-				}},
-				FileHashes: initialHashes,
-			}, nil
-		},
-		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
-			t.Fatalf("indexOne should not run on empty-diff sync; got %s", relativePath)
-			return indexer.OneFileResult{Skipped: true}, nil
-		},
-	}
-
+	// The initial index uses the real per-file indexer so the checkpoint hashes
+	// match disk; a follow-up sync with no changes then yields an empty diff.
 	if _, _, _, _, err := manager.StartIndex(context.Background(), repoPath, testClientInfo(), defaultIndexConfig(), false); err != nil {
 		t.Fatalf("initial StartIndex returned error: %v", err)
 	}
 	waitForCodebaseStatus(t, manager, repoPath, model.CodebaseStatusIndexed)
+
+	// Any per-file embed on the unchanged codebase is a bug: the empty-diff fast
+	// path must skip every file.
+	manager.runner = fakeRunner{
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
+			t.Errorf("indexOne should not run on empty-diff sync; got %s", relativePath)
+			return indexer.OneFileResult{Chunks: nil, FileHash: "", Skipped: true, Removed: false}, nil
+		},
+	}
 
 	// Call SyncIndex directly so the planSyncDiff empty-diff fast path
 	// runs even though the background-sync pre-check would have skipped

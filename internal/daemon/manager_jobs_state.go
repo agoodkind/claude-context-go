@@ -9,7 +9,6 @@ import (
 	"goodkind.io/claude-context-go/internal/merkle"
 	"goodkind.io/claude-context-go/internal/metrics"
 	"goodkind.io/claude-context-go/internal/model"
-	"goodkind.io/claude-context-go/internal/semantic"
 	"goodkind.io/claude-context-go/internal/store"
 	"goodkind.io/gklog/correlation"
 )
@@ -52,31 +51,6 @@ func (manager *Manager) updateJobProgress(jobID string, progress indexer.Progres
 	job.Progress.FilesTotal = progress.FilesTotal
 	job.Progress.FilesProcessed = progress.FilesProcessed
 	job.Progress.ChunksGenerated = progress.ChunksGenerated
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	manager.jobs[jobID] = job
-}
-
-func (manager *Manager) updateJobSemanticProgress(jobID string, progress semantic.Progress) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	job, found := manager.jobs[jobID]
-	if !found {
-		return
-	}
-	if job.State != model.JobStateQueued && job.State != model.JobStateRunning && job.State != model.JobStateCancelling {
-		return
-	}
-
-	now := clock.Now()
-	job.State = model.JobStateRunning
-	job.UpdatedAt = now
-	job.Progress.Phase = progress.Phase
-	job.Progress.OverallPercent = progress.OverallPercent
-	job.Progress.EmbeddingBatchesTotal = progress.EmbeddingBatchesTotal
-	job.Progress.EmbeddingBatchesCompleted = progress.EmbeddingBatchesCompleted
-	job.Progress.CollectionRowsWritten = progress.CollectionRowsWritten
 	job.Progress.LastEventAt = now
 	job.Progress.HeartbeatAt = now
 	manager.jobs[jobID] = job

@@ -75,12 +75,15 @@ func newCapTestRepo(t *testing.T) string {
 	return repoPath
 }
 
-// blockingRunner returns a fakeRunner whose Index blocks on release after
+// blockingRunner returns a fakeRunner whose IndexOne blocks on release after
 // signalling entry on entered, so a test can observe how many jobs run at once
-// and then let them finish.
+// and then let them finish. The from-scratch build drives the per-file path,
+// so the block lands in IndexOne rather than the no-longer-used bulk Index.
 func blockingRunner(entered chan<- struct{}, release <-chan struct{}, inFlight *atomic.Int32, maxInFlight *atomic.Int32) fakeRunner {
 	return fakeRunner{
-		index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+		index:      nil,
+		indexFiles: nil,
+		indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 			current := inFlight.Add(1)
 			for {
 				observed := maxInFlight.Load()
@@ -93,22 +96,22 @@ func blockingRunner(entered chan<- struct{}, release <-chan struct{}, inFlight *
 			case <-release:
 			case <-ctx.Done():
 				inFlight.Add(-1)
-				return indexer.Result{}, ctx.Err()
+				return indexer.OneFileResult{Chunks: nil, FileHash: "", Skipped: false, Removed: false}, ctx.Err()
 			}
 			inFlight.Add(-1)
 			content := "package main\n"
-			return indexer.Result{
-				IndexedFiles: 1,
-				TotalChunks:  1,
+			return indexer.OneFileResult{
 				Chunks: []model.StoredChunk{{
 					Content:       content,
-					RelativePath:  "main.go",
+					RelativePath:  relativePath,
 					StartLine:     1,
 					EndLine:       1,
 					Language:      "go",
 					FileExtension: ".go",
 				}},
-				FileHashes: map[string]string{"main.go": hashText(content)},
+				FileHash: hashText(content),
+				Skipped:  false,
+				Removed:  false,
 			}, nil
 		},
 	}
@@ -281,14 +284,16 @@ func TestResumeOrphanedJobsHonorsResumeOnBoot(t *testing.T) {
 			manager.config.ResumeIndexingOnBoot = testCase.resumeOnBoot
 			release := make(chan struct{})
 			manager.runner = fakeRunner{
-				index: func(ctx context.Context, root string, indexConfig model.IndexConfig, progress func(indexer.Progress)) (indexer.Result, error) {
+				index:      nil,
+				indexFiles: nil,
+				indexOne: func(ctx context.Context, root string, relativePath string, indexConfig model.IndexConfig) (indexer.OneFileResult, error) {
 					<-release
 					content := "package main\n"
-					return indexer.Result{
-						IndexedFiles: 1,
-						TotalChunks:  1,
-						Chunks:       []model.StoredChunk{{Content: content, RelativePath: "main.go", StartLine: 1, EndLine: 1, Language: "go", FileExtension: ".go"}},
-						FileHashes:   map[string]string{"main.go": hashText(content)},
+					return indexer.OneFileResult{
+						Chunks:   []model.StoredChunk{{Content: content, RelativePath: relativePath, StartLine: 1, EndLine: 1, Language: "go", FileExtension: ".go"}},
+						FileHash: hashText(content),
+						Skipped:  false,
+						Removed:  false,
 					}, nil
 				},
 			}

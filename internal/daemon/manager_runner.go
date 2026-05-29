@@ -2,13 +2,10 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
-	"goodkind.io/claude-context-go/internal/indexer"
 	"goodkind.io/claude-context-go/internal/metrics"
-	"goodkind.io/claude-context-go/internal/semantic"
 	"goodkind.io/claude-context-go/internal/spans"
 	"goodkind.io/gklog/correlation"
 )
@@ -67,36 +64,23 @@ func (manager *Manager) runJob(ctx context.Context, jobID string) {
 
 	manager.updateJobRunning(job)
 
+	// Every operation reaches a terminal job state below. An incremental sync
+	// or streaming reindex that finds no usable delta (no prior snapshot, or a
+	// live collection that has gone missing) falls through to the from-scratch
+	// staging build, which is also the path a true first index and a forced
+	// rebuild take.
 	switch jobOperation(job.Operation) {
 	case jobOperationSync:
 		if manager.runDeltaSync(ctx, job) {
 			return
 		}
+		manager.runBootstrap(ctx, job)
 	case jobOperationStreamingReindex:
-		manager.runDeltaSync(ctx, job)
-		return
+		if manager.runDeltaSync(ctx, job) {
+			return
+		}
+		manager.runBootstrap(ctx, job)
 	case jobOperationIndex:
+		manager.runBootstrap(ctx, job)
 	}
-
-	result, err := manager.runner.Index(ctx, job.CanonicalPath, job.Config, func(progress indexer.Progress) {
-		manager.updateJobProgress(job.ID, progress)
-	})
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			manager.updateJobCancelled(ctx, job.ID)
-			return
-		}
-		manager.updateJobFailed(ctx, job.ID, err)
-		return
-	}
-	if manager.semantic != nil && manager.semantic.Available() {
-		err = manager.semantic.Replace(ctx, job.CanonicalPath, result.Chunks, func(progress semantic.Progress) {
-			manager.updateJobSemanticProgress(job.ID, progress)
-		})
-		if err != nil {
-			manager.updateJobFailed(ctx, job.ID, err)
-			return
-		}
-	}
-	manager.updateJobCompleted(job.ID, result)
 }
