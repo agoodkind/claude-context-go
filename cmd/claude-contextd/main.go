@@ -11,10 +11,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/daemon"
+	"goodkind.io/claude-context-go/internal/debugserver"
+	"goodkind.io/claude-context-go/internal/metrics"
 	"goodkind.io/claude-context-go/internal/store"
 	"goodkind.io/gklog"
 	"goodkind.io/gklog/correlation"
@@ -73,17 +76,7 @@ func run(rootContext context.Context) error {
 	stateRoot := flag.String("state-root", cfg.StateRoot, "state root")
 	flag.Parse()
 
-	cfg.StateRoot = *stateRoot
-	cfg.SocketPath = *socketPath
-	cfg.RegistryPath = filepath.Join(cfg.StateRoot, "registry.json")
-	cfg.JobsPath = filepath.Join(cfg.StateRoot, "jobs.jsonl")
-	cfg.EventsPath = filepath.Join(cfg.StateRoot, "events.jsonl")
-	cfg.SocketsDir = filepath.Dir(cfg.SocketPath)
-	cfg.LogsDir = filepath.Join(cfg.StateRoot, "logs")
-	cfg.LogPath = filepath.Join(cfg.LogsDir, "claude-contextd.log")
-	cfg.MerkleDir = filepath.Join(cfg.StateRoot, "merkle")
-	cfg.LocksDir = filepath.Join(cfg.StateRoot, "locks")
-	cfg.ChunksDir = filepath.Join(cfg.StateRoot, "chunks")
+	cfg = applyStatePaths(cfg, *stateRoot, *socketPath)
 
 	for _, path := range []string{cfg.StateRoot, cfg.SocketsDir, cfg.LogsDir, cfg.MerkleDir, cfg.LocksDir, cfg.ChunksDir} {
 		if err := store.EnsureDir(path); err != nil {
@@ -93,6 +86,7 @@ func run(rootContext context.Context) error {
 	}
 
 	installConcernRouter(cfg.LogsDir)
+	metrics.Register()
 
 	if err := os.RemoveAll(cfg.SocketPath); err != nil {
 		slog.ErrorContext(rootContext, "remove stale socket failed", "path", cfg.SocketPath, "err", err)
@@ -118,6 +112,15 @@ func run(rootContext context.Context) error {
 	manager.ResumeOrphanedJobs(runtimeContext)
 	daemon.NewBackgroundSync(cfg, manager).Start(runtimeContext)
 	manager.StartReconcilerLoop(runtimeContext)
+
+	metrics.StartReporter(runtimeContext, time.Duration(cfg.PerfCountersIntervalMS)*time.Millisecond)
+	var debugSrv *debugserver.Server
+	if cfg.DebugListenerEnabled {
+		if debugSrv, err = startDebugServer(runtimeContext, cfg); err != nil {
+			return err
+		}
+		defer stopDebugServer(rootContext, debugSrv)
+	}
 
 	server := grpc.NewServer()
 	shutdownCh := make(chan struct{}, 1)
@@ -150,6 +153,57 @@ func run(rootContext context.Context) error {
 	cancelRuntime()
 	server.GracefulStop()
 	return nil
+}
+
+// applyStatePaths derives every state-relative path from the resolved state
+// root and socket so the rest of startup reads a fully-populated config.
+func applyStatePaths(cfg config.Config, stateRoot string, socketPath string) config.Config {
+	cfg.StateRoot = stateRoot
+	cfg.SocketPath = socketPath
+	cfg.RegistryPath = filepath.Join(cfg.StateRoot, "registry.json")
+	cfg.JobsPath = filepath.Join(cfg.StateRoot, "jobs.jsonl")
+	cfg.EventsPath = filepath.Join(cfg.StateRoot, "events.jsonl")
+	cfg.SocketsDir = filepath.Dir(cfg.SocketPath)
+	cfg.LogsDir = filepath.Join(cfg.StateRoot, "logs")
+	cfg.LogPath = filepath.Join(cfg.LogsDir, "claude-contextd.log")
+	cfg.MerkleDir = filepath.Join(cfg.StateRoot, "merkle")
+	cfg.LocksDir = filepath.Join(cfg.StateRoot, "locks")
+	cfg.ChunksDir = filepath.Join(cfg.StateRoot, "chunks")
+	return cfg
+}
+
+// debugShutdownTimeout bounds how long daemon exit waits on the debug
+// listener so an in-flight profile request cannot delay shutdown.
+const debugShutdownTimeout = 2 * time.Second
+
+// startDebugServer binds the loopback pprof and expvar listener. The bind is
+// eager so a port conflict surfaces during startup rather than inside the
+// serving goroutine.
+func startDebugServer(ctx context.Context, cfg config.Config) (*debugserver.Server, error) {
+	srv, err := debugserver.New(cfg.DebugListenAddr)
+	if err != nil {
+		slog.ErrorContext(ctx, "create debug listener failed", "addr", cfg.DebugListenAddr, "err", err)
+		return nil, fmt.Errorf("create debug listener on %s: %w", cfg.DebugListenAddr, err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		slog.ErrorContext(ctx, "start debug listener failed", "addr", cfg.DebugListenAddr, "err", err)
+		return nil, fmt.Errorf("start debug listener on %s: %w", cfg.DebugListenAddr, err)
+	}
+	slog.InfoContext(ctx, "debug listener started", "addr", srv.Addr())
+	return srv, nil
+}
+
+// stopDebugServer shuts the debug listener within a bounded window. A nil
+// server is a no-op so callers need not branch on whether it was started.
+func stopDebugServer(ctx context.Context, srv *debugserver.Server) {
+	if srv == nil {
+		return
+	}
+	shutdownCtx, cancel := context.WithTimeout(ctx, debugShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.WarnContext(ctx, "debug listener shutdown failed", "err", err)
+	}
 }
 
 func goSafe(ctx context.Context, run func()) {
