@@ -61,6 +61,7 @@ func (manager *Manager) StartReconcilerLoop(ctx context.Context) {
 	}
 	interval := time.Duration(intervalMS) * time.Millisecond
 	orphanTable := newOrphanFirstSeenTable()
+	slog.InfoContext(ctx, "reverse reconciler started", "interval_ms", intervalMS, "orphan_gc_enabled", manager.config.MilvusOrphanGCEnabled, "orphan_grace_ms", manager.config.MilvusOrphanGraceMS)
 
 	goSafe(ctx, "reconciler", func() {
 		ticker := time.NewTicker(interval)
@@ -81,6 +82,7 @@ func (manager *Manager) StartReconcilerLoop(ctx context.Context) {
 // them after the configured grace period.
 func (manager *Manager) runReverseReconcile(ctx context.Context, orphanTable *orphanFirstSeenMS) {
 	if manager.semantic == nil || !manager.semantic.Available() {
+		slog.DebugContext(ctx, "reverse reconcile skipped: semantic unavailable")
 		return
 	}
 	collections, err := manager.semantic.ListCollections(ctx)
@@ -123,6 +125,13 @@ func (manager *Manager) runReverseReconcile(ctx context.Context, orphanTable *or
 		}
 		orphans = append(orphans, collectionName)
 	}
+	daemonOwned := 0
+	for _, collectionName := range collections {
+		if semantic.IsDaemonOwnedCollection(collectionName) {
+			daemonOwned++
+		}
+	}
+	slog.InfoContext(ctx, "reverse reconcile pass", "collections_total", len(collections), "daemon_owned", daemonOwned, "registered", len(known), "candidates_for_gc", len(orphans))
 	if len(orphans) == 0 {
 		return
 	}
