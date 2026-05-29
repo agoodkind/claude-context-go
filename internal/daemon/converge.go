@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"sort"
 
 	"goodkind.io/claude-context-go/internal/discovery"
 	"goodkind.io/claude-context-go/internal/merkle"
@@ -45,8 +47,17 @@ func (manager *Manager) ConvergePaths(ctx context.Context, codebaseID string, re
 	}
 	snapshot.ConfigDigest = configDigest
 
+	// Sort so present files converge before missing ones. A rename pairs a
+	// delete on the source with a create on the destination; if the source
+	// is processed first, the snapshot's inode entry for the source is
+	// dropped before the destination can look it up, and the CopyChunks
+	// fast path is lost. Processing present files first lets the
+	// destination match the source's inode while it still lives in the
+	// snapshot.
+	orderedPaths := orderPathsByPresence(codebase.CanonicalPath, relativePaths)
+
 	changed := false
-	for _, relativePath := range relativePaths {
+	for _, relativePath := range orderedPaths {
 		if converged := manager.convergeOnePath(ctx, codebase, relativePath, &snapshot); converged {
 			changed = true
 		}
@@ -217,6 +228,28 @@ func pickRenameSource(candidates []string, fileHashes map[string]string, freshHa
 		}
 	}
 	return ""
+}
+
+// orderPathsByPresence sorts relativePaths so files that currently exist
+// on disk come before files that have been removed. A stable secondary
+// alphabetical order keeps the iteration deterministic when several
+// files share the same presence bucket.
+func orderPathsByPresence(root string, relativePaths []string) []string {
+	ordered := append([]string{}, relativePaths...)
+	sort.SliceStable(ordered, func(first int, second int) bool {
+		firstExists := fileExists(filepath.Join(root, ordered[first]))
+		secondExists := fileExists(filepath.Join(root, ordered[second]))
+		if firstExists != secondExists {
+			return firstExists
+		}
+		return ordered[first] < ordered[second]
+	})
+	return ordered
+}
+
+func fileExists(absolutePath string) bool {
+	_, err := os.Lstat(absolutePath)
+	return err == nil
 }
 
 func (manager *Manager) logConvergeReindexErr(ctx context.Context, relativePath string, op string, err error) {
