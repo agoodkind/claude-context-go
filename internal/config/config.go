@@ -12,16 +12,14 @@ import (
 )
 
 const (
-	defaultStateDirName               = ".contextd"
-	defaultSocketName                 = "claude-contextd.sock"
-	defaultLogFileName                = "claude-contextd.log"
-	defaultSyncInterval               = 300000
-	defaultSyncLockAge                = 600000
-	defaultMilvusOrphanGraceMS        = 86_400_000
-	defaultOrphanReconcilerIntervalMS = 3_600_000
-	defaultDebugListenAddr            = "127.0.0.1:6480"
-	defaultPerfCountersIntervalMS     = 60000
-	defaultMaxConcurrentIndexJobs     = 3
+	defaultStateDirName           = ".contextd"
+	defaultSocketName             = "claude-contextd.sock"
+	defaultLogFileName            = "claude-contextd.log"
+	defaultSyncInterval           = 300000
+	defaultSyncLockAge            = 600000
+	defaultDebugListenAddr        = "127.0.0.1:6480"
+	defaultPerfCountersIntervalMS = 60000
+	defaultMaxConcurrentIndexJobs = 3
 )
 
 type embeddingProvider string
@@ -80,20 +78,6 @@ type Config struct {
 	// ResumeIndexingOnBoot controls whether daemon startup relaunches
 	// codebases that were left mid-index when the daemon last stopped.
 	ResumeIndexingOnBoot bool
-
-	// MilvusOrphanGCEnabled controls whether the reconciler may drop
-	// orphan collections (collections matching the daemon's prefixes but
-	// not present in the registry) after the grace period elapses. The
-	// default is false so a fresh deploy never destroys data without an
-	// explicit opt-in.
-	MilvusOrphanGCEnabled bool
-	// MilvusOrphanGraceMS is the minimum age, in milliseconds, an orphan
-	// collection must be observed before the reconciler will drop it.
-	MilvusOrphanGraceMS int
-	// OrphanReconcilerIntervalMS controls how often the reverse-pass
-	// reconciler runs. The forward pass still runs on every GetIndex and
-	// ListIndexes call; this interval only governs the reverse pass.
-	OrphanReconcilerIntervalMS int
 }
 
 type persistedConfig struct {
@@ -141,43 +125,40 @@ func Default() (Config, error) {
 	}
 
 	return Config{
-		StateRoot:                  stateRoot,
-		SocketPath:                 socketPath,
-		RegistryPath:               filepath.Join(stateRoot, "registry.json"),
-		JobsPath:                   filepath.Join(stateRoot, "jobs.jsonl"),
-		EventsPath:                 filepath.Join(stateRoot, "events.jsonl"),
-		LogsDir:                    logsDir,
-		LogPath:                    logPath,
-		MerkleDir:                  filepath.Join(stateRoot, "merkle"),
-		LocksDir:                   filepath.Join(stateRoot, "locks"),
-		SocketsDir:                 socketsDir,
-		ChunksDir:                  filepath.Join(stateRoot, "chunks"),
-		ContextRoot:                contextRoot,
-		EmbeddingProvider:          envOrDefault("EMBEDDING_PROVIDER", defaultProvider),
-		EmbeddingModel:             envOrDefault("EMBEDDING_MODEL", defaultModel),
-		EmbeddingBatchSize:         envIntOrDefault("EMBEDDING_BATCH_SIZE", intOrDefault(fileConfig.EmbeddingBatchSize, 32)),
-		EmbeddingDimension:         envInt32OrDefault("EMBEDDING_DIMENSION", fileConfig.EmbeddingDimension),
-		OpenAIAPIKey:               envOrDefault("OPENAI_API_KEY", fileConfig.OpenAIAPIKey),
-		OpenAIBaseURL:              envOrDefault("OPENAI_BASE_URL", fileConfig.OpenAIBaseURL),
-		CustomExtensions:           parseCommaSeparated(os.Getenv("CUSTOM_EXTENSIONS")),
-		CustomIgnorePatterns:       parseCommaSeparated(os.Getenv("CUSTOM_IGNORE_PATTERNS")),
-		MilvusAddress:              envOrDefault("MILVUS_ADDRESS", fileConfig.MilvusAddress),
-		MilvusToken:                envOrDefault("MILVUS_TOKEN", fileConfig.MilvusToken),
-		CollectionNameOverride:     envOrDefault("CODE_CHUNKS_COLLECTION_NAME_OVERRIDE", fileConfig.CollectionNameOverride),
-		HybridMode:                 envBoolOrDefault("HYBRID_MODE", boolOrDefault(fileConfig.HybridMode, true)),
-		BackgroundSyncEnabled:      envBoolOrDefault("CLAUDE_CONTEXT_BACKGROUND_SYNC", true),
-		SyncIntervalMS:             envIntOrDefault("CLAUDE_CONTEXT_SYNC_INTERVAL_MS", defaultSyncInterval),
-		TriggerWatcherEnabled:      envBoolOrDefault("CLAUDE_CONTEXT_TRIGGER_WATCHER", true),
-		FileWatcherEnabled:         envBoolOrDefault("CLAUDE_CONTEXT_FILE_WATCHER", true),
-		SyncLockStaleMS:            envIntOrDefault("CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS", defaultSyncLockAge),
-		MilvusOrphanGCEnabled:      envBoolOrDefault("CLAUDE_CONTEXT_MILVUS_ORPHAN_GC", false),
-		MilvusOrphanGraceMS:        envIntOrDefault("CLAUDE_CONTEXT_MILVUS_ORPHAN_GRACE_MS", defaultMilvusOrphanGraceMS),
-		OrphanReconcilerIntervalMS: envIntOrDefault("CLAUDE_CONTEXT_ORPHAN_RECONCILER_INTERVAL_MS", defaultOrphanReconcilerIntervalMS),
-		DebugListenerEnabled:       envBoolOrDefault("CLAUDE_CONTEXT_DEBUG_LISTENER", true),
-		DebugListenAddr:            envOrDefault("CLAUDE_CONTEXT_DEBUG_LISTEN_ADDR", defaultDebugListenAddr),
-		PerfCountersIntervalMS:     envIntOrDefault("CLAUDE_CONTEXT_PERF_COUNTERS_INTERVAL_MS", defaultPerfCountersIntervalMS),
-		MaxConcurrentIndexJobs:     envIntOrDefault("CLAUDE_CONTEXT_MAX_CONCURRENT_INDEX_JOBS", defaultMaxConcurrentIndexJobs),
-		ResumeIndexingOnBoot:       envBoolOrDefault("CLAUDE_CONTEXT_RESUME_ON_BOOT", true),
+		StateRoot:              stateRoot,
+		SocketPath:             socketPath,
+		RegistryPath:           filepath.Join(stateRoot, "registry.json"),
+		JobsPath:               filepath.Join(stateRoot, "jobs.jsonl"),
+		EventsPath:             filepath.Join(stateRoot, "events.jsonl"),
+		LogsDir:                logsDir,
+		LogPath:                logPath,
+		MerkleDir:              filepath.Join(stateRoot, "merkle"),
+		LocksDir:               filepath.Join(stateRoot, "locks"),
+		SocketsDir:             socketsDir,
+		ChunksDir:              filepath.Join(stateRoot, "chunks"),
+		ContextRoot:            contextRoot,
+		EmbeddingProvider:      envOrDefault("EMBEDDING_PROVIDER", defaultProvider),
+		EmbeddingModel:         envOrDefault("EMBEDDING_MODEL", defaultModel),
+		EmbeddingBatchSize:     envIntOrDefault("EMBEDDING_BATCH_SIZE", intOrDefault(fileConfig.EmbeddingBatchSize, 32)),
+		EmbeddingDimension:     envInt32OrDefault("EMBEDDING_DIMENSION", fileConfig.EmbeddingDimension),
+		OpenAIAPIKey:           envOrDefault("OPENAI_API_KEY", fileConfig.OpenAIAPIKey),
+		OpenAIBaseURL:          envOrDefault("OPENAI_BASE_URL", fileConfig.OpenAIBaseURL),
+		CustomExtensions:       parseCommaSeparated(os.Getenv("CUSTOM_EXTENSIONS")),
+		CustomIgnorePatterns:   parseCommaSeparated(os.Getenv("CUSTOM_IGNORE_PATTERNS")),
+		MilvusAddress:          envOrDefault("MILVUS_ADDRESS", fileConfig.MilvusAddress),
+		MilvusToken:            envOrDefault("MILVUS_TOKEN", fileConfig.MilvusToken),
+		CollectionNameOverride: envOrDefault("CODE_CHUNKS_COLLECTION_NAME_OVERRIDE", fileConfig.CollectionNameOverride),
+		HybridMode:             envBoolOrDefault("HYBRID_MODE", boolOrDefault(fileConfig.HybridMode, true)),
+		BackgroundSyncEnabled:  envBoolOrDefault("CLAUDE_CONTEXT_BACKGROUND_SYNC", true),
+		SyncIntervalMS:         envIntOrDefault("CLAUDE_CONTEXT_SYNC_INTERVAL_MS", defaultSyncInterval),
+		TriggerWatcherEnabled:  envBoolOrDefault("CLAUDE_CONTEXT_TRIGGER_WATCHER", true),
+		FileWatcherEnabled:     envBoolOrDefault("CLAUDE_CONTEXT_FILE_WATCHER", true),
+		SyncLockStaleMS:        envIntOrDefault("CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS", defaultSyncLockAge),
+		DebugListenerEnabled:   envBoolOrDefault("CLAUDE_CONTEXT_DEBUG_LISTENER", true),
+		DebugListenAddr:        envOrDefault("CLAUDE_CONTEXT_DEBUG_LISTEN_ADDR", defaultDebugListenAddr),
+		PerfCountersIntervalMS: envIntOrDefault("CLAUDE_CONTEXT_PERF_COUNTERS_INTERVAL_MS", defaultPerfCountersIntervalMS),
+		MaxConcurrentIndexJobs: envIntOrDefault("CLAUDE_CONTEXT_MAX_CONCURRENT_INDEX_JOBS", defaultMaxConcurrentIndexJobs),
+		ResumeIndexingOnBoot:   envBoolOrDefault("CLAUDE_CONTEXT_RESUME_ON_BOOT", true),
 	}, nil
 }
 

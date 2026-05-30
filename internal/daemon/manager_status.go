@@ -39,14 +39,21 @@ func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (mod
 	if manager.semantic != nil && manager.semantic.Available() {
 		hasCollection, hasErr := manager.semantic.HasCollectionForPath(ctx, canonicalPath)
 		if hasErr == nil && hasCollection {
-			synthetic := manager.synthesizeUnregisteredCodebase(canonicalPath)
+			// A live collection with no registry entry is a codebase the TS
+			// tool indexed. Adopt it as first-class so it gains a stable id, a
+			// watcher, and background sync; fall back to an ephemeral record
+			// only when the registry write fails.
+			codebase, adopted := manager.adoptUnregisteredCodebase(ctx, canonicalPath)
+			if !adopted {
+				codebase = manager.synthesizeUnregisteredCodebase(canonicalPath)
+			}
 			classification := &model.PathClassification{
 				Kind:                model.PathClassificationInScopeIndexed,
 				ExcludedByPattern:   "",
 				ExcludedByGitignore: "",
-				CoveringCodebaseID:  synthetic.ID,
+				CoveringCodebaseID:  codebase.ID,
 			}
-			return synthetic, nil, true, classification, nil
+			return codebase, nil, true, classification, nil
 		}
 		if hasErr != nil {
 			slog.WarnContext(ctx, "Milvus HasCollection failed during GetIndex", "path", canonicalPath, "err", hasErr)

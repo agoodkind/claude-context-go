@@ -20,13 +20,18 @@ Sources of truth:
 
 ## TS upstream drop-in compatibility
 
-The Go daemon must work as a drop-in replacement for the upstream TS adapter, without any migration step. `~/.context/mcp-codebase-snapshot.json` and `~/.context/merkle/<md5(path)>.json` are treated as a read-only fallback view. The mechanism lives in `internal/migrate/snapshot.go` (`LoadSnapshot`, `SynthesizeCodebase`) and `internal/daemon/manager.go` (`resolveFromLegacySnapshot`).
+The Milvus collection is the portable index, shared byte-for-byte with the upstream TS adapter. Both tools name it `hybrid_code_chunks_<md5(path)[:8]>`, use the same schema, and compute the same deterministic chunk id `chunk_<sha256(path:start:end:content)[:16]>`. Each tool keeps its own private bookkeeping outside Milvus: TS at `~/.context/mcp-codebase-snapshot.json` and `~/.context/merkle/<md5(path)>.json`; the Go daemon at `~/.contextd/registry.json` and `~/.contextd/merkle/<codebase-id>.json`.
+
+The contract is two-way and reduces to one rule the daemon fully controls: never silently drop or rename a shared collection, and never write TS's bookkeeping files (the daemon only reads the TS merkle, to seed adoption).
+
+Adoption (TS to Go): when `GetIndex` resolves a path whose collection exists but which has no registry entry, `adoptUnregisteredCodebase` (`internal/daemon/manager_adopt.go`) persists a first-class registry record with a stable id, seeds the Go merkle from the TS merkle via `internal/migrate/snapshot.go` (`LoadTSMerkle`) so the first sync re-embeds only changed files, starts the watcher, and enqueues one refresh sync. The collection is never touched.
+
+Switch-back (Go to TS): a Go-written or Go-modified collection stays in the shared format and is never dropped or renamed, so TS resolves it by md5 collection name, self-recovers its own snapshot, reuses the collection non-destructively, and re-embeds only changed files. Verified against the TS source at `~/Sites/claude-context`.
 
 Rules:
 
-- Both adapters compute the same Milvus collection name `hybrid_code_chunks_<md5(path)[:8]>`, so the actual embedded data is already shared. Code that constructs collection names must keep this invariant.
-- The Go registry stays the write source for any codebase the Go daemon owns. Synthesized records from the TS snapshot are never persisted and never appear in `manager.codebases`, so background sync cannot accidentally pick them up and re-embed.
-- Do not add any one-shot or recurring import that copies TS state into the Go registry. The user explicitly rejected import semantics in favor of read-through.
+- Code that constructs collection names, the schema, or chunk ids must preserve the shared invariant; the tests in `internal/semantic/portability_test.go` lock it.
+- The only collection deletion is explicit `clear_index`. There is no orphan-collection garbage collection; a collection without a registry entry is adopted, never dropped.
 
 ## Embedding
 

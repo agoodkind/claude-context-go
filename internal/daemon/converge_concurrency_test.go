@@ -33,8 +33,15 @@ func (f *fakeSemantic) HasStaging(context.Context, string) (bool, error) {
 func (f *fakeSemantic) Search(context.Context, string, string, int32, []string) ([]model.StoredChunk, error) {
 	return nil, nil
 }
-func (f *fakeSemantic) Count(context.Context, string) (int32, error)      { return 0, nil }
-func (f *fakeSemantic) ListCollections(context.Context) ([]string, error) { return nil, nil }
+func (f *fakeSemantic) Count(context.Context, string) (int32, error) { return 0, nil }
+
+// ListCollections returns the one collection CollectionName reports, keeping the
+// fake self-consistent: the forward reconciler in GetIndex drops a registry
+// entry whose collection is absent from this list, so it must include it.
+func (f *fakeSemantic) ListCollections(context.Context) ([]string, error) {
+	return []string{"code_chunks_test"}, nil
+}
+
 func (f *fakeSemantic) HasCollectionForPath(context.Context, string) (bool, error) {
 	return true, nil
 }
@@ -61,7 +68,6 @@ func (f *fakeSemantic) CopyChunks(ctx context.Context, codebasePath string, src 
 func (f *fakeSemantic) PruneToCurrent(context.Context, string, []string) error { return nil }
 func (f *fakeSemantic) Drop(context.Context, string) error                     { return nil }
 func (f *fakeSemantic) DropStaging(context.Context, string) error              { return nil }
-func (f *fakeSemantic) DropCollection(context.Context, string) error           { return nil }
 
 // TestConvergeViaWatcherRunsCodebasesConcurrentlyUpToCap proves that several
 // codebases converge at once up to the index-slot cap while another waits, that

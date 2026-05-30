@@ -32,7 +32,6 @@ type semanticWriter interface {
 type semanticDropper interface {
 	Drop(ctx context.Context, codebasePath string) error
 	DropStaging(ctx context.Context, codebasePath string) error
-	DropCollection(ctx context.Context, collectionName string) error
 }
 
 // semanticIndex is the full embedding-and-vector-store surface the manager

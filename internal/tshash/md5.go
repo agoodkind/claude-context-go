@@ -11,10 +11,19 @@ import "encoding/binary"
 // TS adapter uses this exact value as the Milvus collection-name suffix at
 // packages/core/src/context.ts:275.
 func PathPrefix(input string) string {
+	return FullHex(input)[:8]
+}
+
+// FullHex returns the full 32-character lowercase hex MD5 of input. The
+// upstream TS adapter names its per-codebase merkle file
+// ~/.context/merkle/<FullHex(path)>.json (packages/core/src/sync/synchronizer.ts
+// getSnapshotPath), so the daemon uses this to locate that file for read-only
+// adoption seeding.
+func FullHex(input string) string {
 	digest := sum([]byte(input))
 	const hex = "0123456789abcdef"
-	out := make([]byte, 8)
-	for index := range 4 {
+	out := make([]byte, 32)
+	for index := range 16 {
 		out[index*2] = hex[digest[index]>>4]
 		out[index*2+1] = hex[digest[index]&0x0f]
 	}

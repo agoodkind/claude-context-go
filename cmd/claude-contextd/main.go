@@ -117,7 +117,6 @@ func run(rootContext context.Context) error {
 	defer cancelRuntime()
 	manager.ResumeOrphanedJobs(runtimeContext)
 	daemon.NewBackgroundSync(cfg, manager).Start(runtimeContext)
-	manager.StartReconcilerLoop(runtimeContext)
 
 	metrics.StartReporter(runtimeContext, time.Duration(cfg.PerfCountersIntervalMS)*time.Millisecond)
 	var debugSrv *debugserver.Server
