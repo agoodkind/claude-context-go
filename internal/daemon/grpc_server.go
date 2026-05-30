@@ -117,6 +117,21 @@ func classifyManagerError(path string, err error) error {
 	return err
 }
 
+// requireNonEmpty reports an InvalidArgument error when a required request
+// field is empty or whitespace, so the daemon rejects a missing path, query, or
+// job id loudly instead of treating it as a normal not-found. argument names the
+// field for the error envelope; pathLike picks the path-specific hint over the
+// generic missing-argument hint.
+func requireNonEmpty(ctx context.Context, value string, argument string, pathLike bool) error {
+	if strings.TrimSpace(value) != "" {
+		return nil
+	}
+	if pathLike {
+		return status.Error(adapterr.Respond(ctx, adapterr.NewInvalidPath("codebase path is required", nil)))
+	}
+	return status.Error(adapterr.Respond(ctx, adapterr.NewMissingArgument(argument)))
+}
+
 // GRPCServer exposes the daemon manager through the generated gRPC service.
 type GRPCServer struct {
 	manager  *Manager
@@ -148,6 +163,9 @@ func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionReques
 func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndexRequest) (resp *pb.StartIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "StartIndex")
 	defer done(&err)
+	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
+		return nil, argErr
+	}
 	job, codebase, deduplicated, overlapsCodebaseID, callErr := server.manager.StartIndex(ctx, request.GetPath(), pbClient(request.GetClient()), pbconv.FromStartIndexConfig(request), request.GetForce())
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
@@ -167,6 +185,9 @@ func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndex
 func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndexRequest) (resp *pb.ClearIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "ClearIndex")
 	defer done(&err)
+	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
+		return nil, argErr
+	}
 	codebase, callErr := server.manager.ClearIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
@@ -183,7 +204,9 @@ func (server *GRPCServer) ClearIndex(ctx context.Context, request *pb.ClearIndex
 func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRequest) (resp *pb.CancelJobResponse, err error) {
 	ctx, done := beginRPC(ctx, "CancelJob")
 	defer done(&err)
-	_ = ctx
+	if argErr := requireNonEmpty(ctx, request.GetJobId(), "job_id", false); argErr != nil {
+		return nil, argErr
+	}
 	job, callErr := server.manager.CancelJob(request.GetJobId())
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewJobNotFound(request.GetJobId())))
@@ -199,6 +222,9 @@ func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRe
 func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRequest) (resp *pb.SyncIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "SyncIndex")
 	defer done(&err)
+	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
+		return nil, argErr
+	}
 	job, codebase, deduplicated, callErr := server.manager.SyncIndex(ctx, request.GetPath(), pbClient(request.GetClient()))
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
@@ -223,6 +249,9 @@ func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRe
 func (server *GRPCServer) GetIndex(ctx context.Context, request *pb.GetIndexRequest) (resp *pb.GetIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "GetIndex")
 	defer done(&err)
+	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
+		return nil, argErr
+	}
 	codebase, activeJob, found, classification, callErr := server.manager.GetIndex(ctx, request.GetPath())
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))
@@ -259,7 +288,9 @@ func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndex
 func (server *GRPCServer) GetJob(ctx context.Context, request *pb.GetJobRequest) (resp *pb.GetJobResponse, err error) {
 	ctx, done := beginRPC(ctx, "GetJob")
 	defer done(&err)
-	_ = ctx
+	if argErr := requireNonEmpty(ctx, request.GetJobId(), "job_id", false); argErr != nil {
+		return nil, argErr
+	}
 	job, found := server.manager.GetJob(request.GetJobId())
 	if !found {
 		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewJobNotFound(request.GetJobId())))
@@ -307,6 +338,12 @@ func (server *GRPCServer) WatchJobs(request *pb.WatchJobsRequest, stream pb.Clau
 func (server *GRPCServer) SearchCode(ctx context.Context, request *pb.SearchCodeRequest) (resp *pb.SearchCodeResponse, err error) {
 	ctx, done := beginRPC(ctx, "SearchCode")
 	defer done(&err)
+	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
+		return nil, argErr
+	}
+	if argErr := requireNonEmpty(ctx, request.GetQuery(), "query", false); argErr != nil {
+		return nil, argErr
+	}
 	outcome, callErr := server.manager.SearchCode(ctx, request.GetPath(), request.GetQuery(), request.GetLimit(), request.GetExtensionFilter())
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(request.GetPath(), callErr)))

@@ -70,6 +70,12 @@ func (manager *Manager) findStrictAncestor(canonicalPath string) (model.Codebase
 }
 
 func canonicalizePath(requestedPath string) (string, error) {
+	// Reject an empty or whitespace path before filepath.Abs, which would
+	// otherwise resolve "" to the current working directory and let a caller
+	// silently operate on the wrong codebase.
+	if strings.TrimSpace(requestedPath) == "" {
+		return "", errors.New("codebase path is required")
+	}
 	absolutePath, err := filepath.Abs(requestedPath)
 	if err != nil {
 		slog.Error("resolve absolute path failed", "path", requestedPath, "err", err)

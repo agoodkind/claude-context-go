@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	pb "goodkind.io/claude-context-go/gen/go/claudecontext/v1"
@@ -97,6 +98,13 @@ func run() error {
 	})
 }
 
+// blank reports whether a positional argument is missing or only whitespace,
+// so a subcommand rejects `claude-context status ""` locally instead of sending
+// an empty value to the daemon.
+func blank(args []string, index int) bool {
+	return index >= len(args) || strings.TrimSpace(args[index]) == ""
+}
+
 func execute(selected command, args []string, options cliOptions) error {
 	switch selected {
 	case commandVersion:
@@ -121,14 +129,14 @@ func execute(selected command, args []string, options cliOptions) error {
 			return client.Doctor(ctx, &pb.DoctorRequest{})
 		})
 	case commandStatus:
-		if len(args) == 0 {
+		if blank(args, 0) {
 			return fmt.Errorf("status requires a path")
 		}
 		return callAndPrint(options, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 			return client.GetIndex(ctx, &pb.GetIndexRequest{Path: args[0]})
 		})
 	case commandJob:
-		if len(args) == 0 {
+		if blank(args, 0) {
 			return fmt.Errorf("job requires an id")
 		}
 		return callAndPrint(options, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
@@ -137,7 +145,7 @@ func execute(selected command, args []string, options cliOptions) error {
 	case commandIndex:
 		return runIndexCommand(args, options)
 	case commandSync:
-		if len(args) == 0 {
+		if blank(args, 0) {
 			return fmt.Errorf("sync requires a path")
 		}
 		clientInfo, err := currentClientInfo()
@@ -150,7 +158,7 @@ func execute(selected command, args []string, options cliOptions) error {
 	case commandSearch:
 		return runSearchCommand(args, options)
 	case commandClear:
-		if len(args) == 0 {
+		if blank(args, 0) {
 			return fmt.Errorf("clear requires a path")
 		}
 		clientInfo, err := currentClientInfo()
@@ -161,7 +169,7 @@ func execute(selected command, args []string, options cliOptions) error {
 			return client.ClearIndex(ctx, &pb.ClearIndexRequest{Path: args[0], Client: clientInfo})
 		})
 	case commandCancel:
-		if len(args) == 0 {
+		if blank(args, 0) {
 			return fmt.Errorf("cancel requires a job id")
 		}
 		clientInfo, err := currentClientInfo()
@@ -192,7 +200,7 @@ func runIndexCommand(args []string, options cliOptions) error {
 		return fmt.Errorf("parse index flags: %w", err)
 	}
 	remaining := flags.Args()
-	if len(remaining) == 0 {
+	if blank(remaining, 0) {
 		return fmt.Errorf("index requires a path")
 	}
 
@@ -230,7 +238,7 @@ func runSearchCommand(args []string, options cliOptions) error {
 		return fmt.Errorf("parse search flags: %w", err)
 	}
 	remaining := flags.Args()
-	if len(remaining) < 2 {
+	if blank(remaining, 0) || blank(remaining, 1) {
 		return fmt.Errorf("search requires a path and query")
 	}
 

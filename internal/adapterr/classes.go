@@ -36,6 +36,10 @@ const (
 	// (empty, malformed, or otherwise unusable).
 	ClassInvalidPath Class = "invalid_path"
 
+	// ClassInvalidArgument reports a required non-path argument that is
+	// missing or empty (for example a search query or a job id).
+	ClassInvalidArgument Class = "invalid_argument"
+
 	// ClassConflictingJob reports that another job already owns the
 	// effective indexing operation for this codebase.
 	ClassConflictingJob Class = "conflicting_job"
@@ -59,7 +63,7 @@ func CodeFor(class Class) codes.Code {
 		return codes.FailedPrecondition
 	case ClassMilvusUnavailable, ClassEmbedderUnreachable:
 		return codes.Unavailable
-	case ClassInvalidPath:
+	case ClassInvalidPath, ClassInvalidArgument:
 		return codes.InvalidArgument
 	case ClassSearchResultIncomplete, ClassInternal:
 		return codes.Internal
@@ -102,6 +106,20 @@ func NewInvalidPath(message string, cause error) *AdapterError {
 		Code:          "invalid_path",
 		Hint:          "pass an absolute path to a directory",
 		Cause:         cause,
+		SafeForClient: true,
+	}
+}
+
+// NewMissingArgument reports a required argument that the caller left
+// empty or omitted. name is the argument the operation needs, so the
+// message points the caller at the exact field to supply.
+func NewMissingArgument(name string) *AdapterError {
+	return &AdapterError{
+		Class:         ClassInvalidArgument,
+		Message:       "missing required argument " + quote(name),
+		Code:          "invalid_argument",
+		Hint:          "supply a non-empty " + name,
+		Cause:         nil,
 		SafeForClient: true,
 	}
 }

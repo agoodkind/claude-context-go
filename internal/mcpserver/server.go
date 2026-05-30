@@ -43,7 +43,16 @@ func Run(ctx context.Context) error {
 	}
 
 	outputMode := response.ParseMode(os.Getenv(outputModeEnv))
-	mcpServer := server.NewMCPServer("claude-context", version.String())
+	// WithToolCapabilities advertises the tool set; WithInputSchemaValidation
+	// makes the server reject a tool call that omits a Required argument at the
+	// protocol layer, before the handler runs, so a missing argument fails
+	// loudly instead of defaulting to an empty value.
+	mcpServer := server.NewMCPServer(
+		"claude-context",
+		version.String(),
+		server.WithToolCapabilities(true),
+		server.WithInputSchemaValidation(),
+	)
 
 	registerSemanticSearchResource(mcpServer)
 	registerSemanticSearchPrompt(mcpServer)
@@ -106,7 +115,7 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 		mcp.NewTool(
 			"index_codebase",
 			mcp.WithDescription("Index a codebase directory for semantic search through the daemon"),
-			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+			mcp.WithString("absolutePath", mcp.Required(), mcp.Description("absolute path to the codebase directory")),
 			mcp.WithBoolean("force", mcp.Description("force reindex even if already indexed")),
 			mcp.WithString("splitter", mcp.Description("splitter type, typically ast")),
 			mcp.WithArray("customExtensions", mcp.Description("extra file extensions to include"), mcp.WithStringItems()),
@@ -115,8 +124,12 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 			mcp.WithNumber("wait_timeout_seconds", mcp.Description("max seconds to wait when wait=true; on timeout the daemon job keeps running and the tool returns the current progress (default 300)")),
 		),
 		wrapTool("index_codebase", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			absolutePath, errResult, ok := requireNonEmptyArg(req, "absolutePath")
+			if !ok {
+				return errResult, nil
+			}
 			startRequest := &pb.StartIndexRequest{
-				Path:             req.GetString("path", ""),
+				Path:             absolutePath,
 				Force:            req.GetBool("force", false),
 				CustomExtensions: req.GetStringSlice("customExtensions", []string{}),
 				IgnorePatterns:   req.GetStringSlice("ignorePatterns", []string{}),
@@ -142,12 +155,16 @@ func registerClearTool(mcpServer *server.MCPServer, socketPath string, outputMod
 		mcp.NewTool(
 			"clear_index",
 			mcp.WithDescription("Clear a tracked codebase index through the daemon"),
-			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+			mcp.WithString("absolutePath", mcp.Required(), mcp.Description("absolute path to the codebase directory")),
 		),
 		wrapTool("clear_index", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			absolutePath, errResult, ok := requireNonEmptyArg(req, "absolutePath")
+			if !ok {
+				return errResult, nil
+			}
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.ClearIndex(ctx, &pb.ClearIndexRequest{
-					Path:   req.GetString("path", ""),
+					Path:   absolutePath,
 					Client: &pb.ClientInfo{Name: "mcp"},
 				})
 			})
@@ -160,11 +177,15 @@ func registerStatusTool(mcpServer *server.MCPServer, socketPath string, outputMo
 		mcp.NewTool(
 			"get_indexing_status",
 			mcp.WithDescription("Get the current indexing status of one codebase path"),
-			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
+			mcp.WithString("absolutePath", mcp.Required(), mcp.Description("absolute path to the codebase directory")),
 		),
 		wrapTool("get_indexing_status", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			absolutePath, errResult, ok := requireNonEmptyArg(req, "absolutePath")
+			if !ok {
+				return errResult, nil
+			}
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
-				return client.GetIndex(ctx, &pb.GetIndexRequest{Path: req.GetString("path", "")})
+				return client.GetIndex(ctx, &pb.GetIndexRequest{Path: absolutePath})
 			})
 		}),
 	)
@@ -204,11 +225,15 @@ func registerGetJobTool(mcpServer *server.MCPServer, socketPath string, outputMo
 		mcp.NewTool(
 			"get_indexing_job",
 			mcp.WithDescription("Get one indexing job by id"),
-			mcp.WithString("job_id", mcp.Description("job id to inspect")),
+			mcp.WithString("job_id", mcp.Required(), mcp.Description("job id to inspect")),
 		),
 		wrapTool("get_indexing_job", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			jobID, errResult, ok := requireNonEmptyArg(req, "job_id")
+			if !ok {
+				return errResult, nil
+			}
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
-				return client.GetJob(ctx, &pb.GetJobRequest{JobId: req.GetString("job_id", "")})
+				return client.GetJob(ctx, &pb.GetJobRequest{JobId: jobID})
 			})
 		}),
 	)
@@ -357,16 +382,24 @@ func registerSearchTool(mcpServer *server.MCPServer, socketPath string, outputMo
 		mcp.NewTool(
 			"search_code",
 			mcp.WithDescription("Search indexed code in the daemon"),
-			mcp.WithString("path", mcp.Description("absolute path to the codebase directory")),
-			mcp.WithString("query", mcp.Description("natural language code search query")),
+			mcp.WithString("absolutePath", mcp.Required(), mcp.Description("absolute path to the codebase directory")),
+			mcp.WithString("query", mcp.Required(), mcp.Description("natural language code search query")),
 			mcp.WithNumber("limit", mcp.Description("maximum number of results")),
 			mcp.WithArray("extensionFilter", mcp.Description("optional file extensions filter"), mcp.WithStringItems()),
 		),
 		wrapTool("search_code", func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			absolutePath, errResult, ok := requireNonEmptyArg(req, "absolutePath")
+			if !ok {
+				return errResult, nil
+			}
+			query, errResult, ok := requireNonEmptyArg(req, "query")
+			if !ok {
+				return errResult, nil
+			}
 			return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.ClaudeContextDaemonServiceClient) (proto.Message, error) {
 				return client.SearchCode(ctx, &pb.SearchCodeRequest{
-					Path:            req.GetString("path", ""),
-					Query:           req.GetString("query", ""),
+					Path:            absolutePath,
+					Query:           query,
 					Limit:           safeInt32(req.GetInt("limit", 10)),
 					ExtensionFilter: req.GetStringSlice("extensionFilter", []string{}),
 				})
@@ -481,6 +514,23 @@ func toolErrorResult(message string) *mcp.CallToolResult {
 		IsError: true,
 		Content: []mcp.Content{mcp.NewTextContent(message)},
 	}
+}
+
+// requireNonEmptyArg reads a required string argument and returns an error
+// result when it is missing, empty, or only whitespace. The schema marks the
+// argument Required, so a well-behaved client is rejected before the handler
+// runs; this is the second line of defense for a client that sends the key with
+// an empty value. The returned bool is false when the argument is unusable, and
+// the caller returns the result immediately.
+func requireNonEmptyArg(req mcp.CallToolRequest, name string) (string, *mcp.CallToolResult, bool) {
+	value, err := req.RequireString(name)
+	if err != nil {
+		return "", toolErrorResult(name + " is required"), false
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", toolErrorResult(name + " is required"), false
+	}
+	return value, nil, true
 }
 
 func rpcErrorText(err error) string {
