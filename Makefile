@@ -5,10 +5,10 @@
 # audit, fmt, vet, or staticcheck targets here. They duplicate the central
 # pipeline and let agents bypass strict rules.
 
-# Identity
+# Identity. This repo has no own version package; it cross-stamps gklog/version.
 BINARY := claude-contextd
 CMD    := ./cmd/claude-contextd
-VPKG   := goodkind.io/claude-context-go/internal/version
+GKLOG_VPKG := goodkind.io/gklog/version
 CLI_BINARY := claude-context
 CLI_CMD := ./cmd/$(CLI_BINARY)
 MCP_BINARY := claude-context-mcp
@@ -20,9 +20,15 @@ GO_MK_MODULES := go-build.mk go-release.mk go-service.mk
 BUILD_CHECKS := true
 STATICCHECK_EXTRA_FLAGS = $(STATICCHECK_EXTRA_CORE_FLAGS) $(STATICCHECK_EXTRA_STRICT_FLAGS)
 
-LAUNCHD_LABEL := io.zilliz.claude-contextd
+LAUNCHD_LABEL := io.goodkind.claude-contextd
 SYSTEMD_UNIT := claude-contextd.service
+# macOS launchd captures the daemon's stderr to this file; Linux logs to journald
+# (the systemd unit sets no file path), so LOG_PATH there is only a harmless default.
+ifeq ($(shell uname),Darwin)
+LOG_PATH := $(HOME)/Library/Logs/claude-contextd.log
+else
 LOG_PATH := $(HOME)/.contextd/logs/claude-contextd.log
+endif
 
 # bootstrap.mk fetches go.mk + golangci.yml + every module in GO_MK_MODULES
 # at parse time and -includes them. Update path: edit go-makefile/bootstrap.mk,

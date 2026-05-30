@@ -13,8 +13,8 @@ import (
 	"goodkind.io/claude-context-go/internal/clock"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/pbconv"
-	"goodkind.io/claude-context-go/internal/version"
 	"goodkind.io/gklog/correlation"
+	"goodkind.io/gklog/version"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
@@ -138,7 +138,7 @@ func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionReques
 	_ = request
 	_ = ctx
 	return &pb.VersionResponse{
-		Version:   version.Version,
+		Version:   version.String(),
 		Commit:    version.Commit,
 		BuildTime: version.BuildTime,
 	}, nil

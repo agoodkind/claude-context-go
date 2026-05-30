@@ -21,7 +21,7 @@ import (
 	"goodkind.io/claude-context-go/internal/grpcutil"
 	"goodkind.io/claude-context-go/internal/model"
 	"goodkind.io/claude-context-go/internal/response"
-	"goodkind.io/claude-context-go/internal/version"
+	"goodkind.io/gklog/version"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -43,7 +43,7 @@ func Run(ctx context.Context) error {
 	}
 
 	outputMode := response.ParseMode(os.Getenv(outputModeEnv))
-	mcpServer := server.NewMCPServer("claude-context", version.Version)
+	mcpServer := server.NewMCPServer("claude-context", version.String())
 
 	registerSemanticSearchResource(mcpServer)
 	registerSemanticSearchPrompt(mcpServer)

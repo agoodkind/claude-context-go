@@ -6,7 +6,7 @@ Keep this file short, current, and focused on rules that should affect day-to-da
 
 ## Project purpose
 
-`claude-context-go` is a ground-up Go rewrite of `zilliztech/claude-context`. The repo owns three binaries: the long-lived `claude-contextd` daemon, the `claude-context` operator CLI, and the `claude-context-mcp` stdio adapter. VS Code and Chrome extension clients are intentionally out of scope here. The Go port is independent of and not affiliated with Zilliz; the `io.zilliz.claude-contextd` launchd label is kept only for drop-in service compatibility with the upstream daemon.
+`claude-context-go` is a ground-up Go rewrite of `zilliztech/claude-context`. The repo owns three binaries: the long-lived `claude-contextd` daemon, the `claude-context` operator CLI, and the `claude-context-mcp` stdio adapter. VS Code and Chrome extension clients are intentionally out of scope here. The Go port is independent of and not affiliated with Zilliz. The daemon's service identity is `io.goodkind.claude-contextd` (a launchd agent on macOS, a `claude-contextd.service` systemd user unit on Linux); the only compatibility requirement with the upstream TS tool is the shared Milvus data store (collection names, schema, and chunk ids), not the service identity.
 
 ## Transport contract
 

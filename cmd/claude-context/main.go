@@ -17,7 +17,7 @@ import (
 	"goodkind.io/claude-context-go/internal/config"
 	"goodkind.io/claude-context-go/internal/grpcutil"
 	"goodkind.io/claude-context-go/internal/response"
-	"goodkind.io/claude-context-go/internal/version"
+	"goodkind.io/gklog/version"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -100,7 +100,7 @@ func run() error {
 func execute(selected command, args []string, options cliOptions) error {
 	switch selected {
 	case commandVersion:
-		fmt.Printf("version=%s commit=%s build_time=%s\n", version.Version, version.Commit, version.BuildTime)
+		fmt.Printf("version=%s commit=%s build_time=%s\n", version.String(), version.Commit, version.BuildTime)
 		return nil
 	case commandDaemon:
 		return runDaemonSubcommand(args, options)

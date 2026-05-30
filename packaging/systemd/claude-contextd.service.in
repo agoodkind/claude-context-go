@@ -1,5 +1,6 @@
 [Unit]
 Description=Claude Context daemon
+Documentation=https://github.com/agoodkind/claude-context-go
 After=network.target
 
 [Service]
@@ -7,8 +8,6 @@ ExecStart=@@BIN_PATH@@
 Restart=on-failure
 RestartSec=2
 Environment=HOME=@@HOME@@
-StandardOutput=append:@@LOG_PATH@@
-StandardError=append:@@LOG_PATH@@
 
 [Install]
 WantedBy=default.target

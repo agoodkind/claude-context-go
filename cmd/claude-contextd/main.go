@@ -21,6 +21,7 @@ import (
 	"goodkind.io/claude-context-go/internal/store"
 	"goodkind.io/gklog"
 	"goodkind.io/gklog/correlation"
+	"goodkind.io/gklog/version"
 	"google.golang.org/grpc"
 )
 
@@ -88,6 +89,11 @@ func run(rootContext context.Context) error {
 	installConcernRouter(cfg.LogsDir)
 	metrics.Register()
 
+	slog.InfoContext(rootContext, "daemon identity", "build", version.String(), "commit", version.Commit, "socket", cfg.SocketPath, "state_root", cfg.StateRoot, "pid", os.Getpid())
+
+	if err := refuseIfDaemonAlreadyServing(rootContext, cfg.SocketPath); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(cfg.SocketPath); err != nil {
 		slog.ErrorContext(rootContext, "remove stale socket failed", "path", cfg.SocketPath, "err", err)
 		return fmt.Errorf("remove stale socket %s: %w", cfg.SocketPath, err)
@@ -179,6 +185,28 @@ const debugShutdownTimeout = 2 * time.Second
 // startDebugServer binds the loopback pprof and expvar listener. The bind is
 // eager so a port conflict surfaces during startup rather than inside the
 // serving goroutine.
+// refuseIfDaemonAlreadyServing returns an error when another claude-contextd is
+// already accepting connections on socketPath, so a second instance never
+// clobbers the live one's socket and steals its clients. A stale socket file
+// with no listener (the normal case after a crash or a kill-and-restart) fails
+// to dial and is cleared by the caller before binding.
+func refuseIfDaemonAlreadyServing(ctx context.Context, socketPath string) error {
+	dialContext, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialContext, "unix", socketPath)
+	if err != nil {
+		return nil
+	}
+	if closeErr := conn.Close(); closeErr != nil {
+		slog.WarnContext(ctx, "close probe connection failed", "path", socketPath, "err", closeErr)
+	}
+	conflict := fmt.Errorf("another claude-contextd is already listening on %s", socketPath)
+	slog.ErrorContext(ctx, "another claude-contextd is already serving this socket; refusing to start", "path", socketPath, "err", conflict)
+	return conflict
+}
+
 func startDebugServer(ctx context.Context, cfg config.Config) (*debugserver.Server, error) {
 	srv, err := debugserver.New(cfg.DebugListenAddr)
 	if err != nil {
