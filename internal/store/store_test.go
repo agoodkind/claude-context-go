@@ -65,6 +65,65 @@ func TestSchedulingPolicyRegistryAndJobJournalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAppendJobEventSyncSyncsEncodedEventBeforeReturning(t *testing.T) {
+	journalPath := filepath.Join(t.TempDir(), "jobs.jsonl")
+	event := model.JobEvent{Event: "job_paused", Job: model.Job{ID: "job-sync"}}
+
+	originalSync := syncFile
+	syncPaths := make([]string, 0, 2)
+	syncFile = func(file *os.File) error {
+		syncPaths = append(syncPaths, file.Name())
+		if file.Name() == filepath.Dir(journalPath) {
+			return originalSync(file)
+		}
+		data, err := os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatalf("ReadFile during sync returned error: %v", err)
+		}
+		var got model.JobEvent
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("Unmarshal encoded event during sync returned error: %v", err)
+		}
+		if !reflect.DeepEqual(got, event) {
+			t.Fatalf("synced event = %#v, want %#v", got, event)
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncFile = originalSync })
+
+	if err := AppendJobEventSync(journalPath, event); err != nil {
+		t.Fatalf("AppendJobEventSync returned error: %v", err)
+	}
+	if len(syncPaths) != 2 {
+		t.Fatalf("sync calls = %d, want 2", len(syncPaths))
+	}
+	if syncPaths[0] != journalPath {
+		t.Fatalf("journal sync path = %q, want %q", syncPaths[0], journalPath)
+	}
+	if syncPaths[1] != filepath.Dir(journalPath) {
+		t.Fatalf("directory sync path = %q, want %q", syncPaths[1], filepath.Dir(journalPath))
+	}
+}
+
+func TestAppendJobEventSyncReturnsSyncFailure(t *testing.T) {
+	journalPath := filepath.Join(t.TempDir(), "jobs.jsonl")
+	syncErr := errors.New("injected sync failure")
+	originalSync := syncFile
+	syncFile = func(*os.File) error { return syncErr }
+	t.Cleanup(func() { syncFile = originalSync })
+
+	err := AppendJobEventSync(
+		journalPath,
+		model.JobEvent{Event: "job_paused", Job: model.Job{ID: "job-sync-failure"}},
+	)
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("AppendJobEventSync error = %v, want injected sync failure", err)
+	}
+	if !strings.Contains(err.Error(), journalPath) {
+		t.Fatalf("AppendJobEventSync error = %q, want journal path %q", err, journalPath)
+	}
+}
+
 func TestReadJobEventsLatestReturnsLastEventPerJobID(t *testing.T) {
 	journalPath := filepath.Join(t.TempDir(), "jobs.jsonl")
 	occurredAt := []time.Time{

@@ -94,18 +94,19 @@ type Manager struct {
 	// failedBuildRetries caps automatic retries for terminal failed builds per daemon lifetime; not persisted, guarded by mu.
 	failedBuildRetries map[string]int
 	// lastJobJournalAt throttles periodic job-progress journaling; not persisted, guarded by mu.
-	lastJobJournalAt map[string]time.Time
-	appendJobEvent   appendJobEventFunc
-	jobJournal       *jobJournalWriter
-	runner           indexingRunner
-	semantic         semanticIndex
-	graphEngines     map[string]*cbm.Engine
-	graphLifecycle   map[string]*graphLifecycleState
-	graphMutex       sync.Mutex
-	graphIndex       func(context.Context, *cbm.Engine, string, string) error
-	graphIndexHook   func()
-	lifecycleHook    CodebaseLifecycleHook
-	lifecycleMutex   sync.Mutex
+	lastJobJournalAt    map[string]time.Time
+	appendJobEvent      appendJobEventFunc
+	appendJobTransition func(model.JobEvent) error
+	jobJournal          *jobJournalWriter
+	runner              indexingRunner
+	semantic            semanticIndex
+	graphEngines        map[string]*cbm.Engine
+	graphLifecycle      map[string]*graphLifecycleState
+	graphMutex          sync.Mutex
+	graphIndex          func(context.Context, *cbm.Engine, string, string) error
+	graphIndexHook      func()
+	lifecycleHook       CodebaseLifecycleHook
+	lifecycleMutex      sync.Mutex
 	// startedAt is when this daemon process built its manager. A status read
 	// reports uptime from it, so the number comes from the process rather than
 	// from a caller's clock.
@@ -214,6 +215,7 @@ func newManagerWithSemanticFactory(
 		failedBuildRetries:          map[string]int{},
 		lastJobJournalAt:            map[string]time.Time{},
 		appendJobEvent:              store.AppendJobEvent,
+		appendJobTransition:         nil,
 		jobJournal:                  nil,
 		runner:                      indexer.NewRunner(),
 		semantic:                    nil,
@@ -290,8 +292,10 @@ func newManagerWithSemanticFactory(
 		func(path string, event model.JobEvent) error {
 			return manager.appendJobEvent(path, event)
 		},
+		store.AppendJobEventSync,
 		jobJournalQueueCapacity,
 	)
+	manager.appendJobTransition = manager.jobJournal.enqueueAndSync
 	return manager, nil
 }
 

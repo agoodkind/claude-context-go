@@ -198,6 +198,15 @@ func syncFileDirectory(directoryPath string, description string) error {
 
 // AppendJobEvent appends one job event to the JSONL journal.
 func AppendJobEvent(path string, event model.JobEvent) error {
+	return appendJobEvent(path, event, false)
+}
+
+// AppendJobEventSync appends one job event and synchronizes it before returning.
+func AppendJobEventSync(path string, event model.JobEvent) error {
+	return appendJobEvent(path, event, true)
+}
+
+func appendJobEvent(path string, event model.JobEvent, sync bool) error {
 	if err := EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
@@ -206,12 +215,33 @@ func AppendJobEvent(path string, event model.JobEvent) error {
 		slog.Error("open jobs journal failed", "path", path, "err", err)
 		return fmt.Errorf("open jobs journal %s: %w", path, err)
 	}
-	defer file.Close()
-
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(event); err != nil {
 		slog.Error("append jobs journal failed", "path", path, "err", err)
-		return fmt.Errorf("append jobs journal %s: %w", path, err)
+		encodeErr := fmt.Errorf("append jobs journal %s: %w", path, err)
+		if closeErr := file.Close(); closeErr != nil {
+			return errors.Join(encodeErr, fmt.Errorf("close jobs journal %s: %w", path, closeErr))
+		}
+		return encodeErr
+	}
+	if sync {
+		if err := syncFile(file); err != nil {
+			slog.Error("sync jobs journal failed", "path", path, "err", err)
+			syncErr := fmt.Errorf("sync jobs journal %s: %w", path, err)
+			if closeErr := file.Close(); closeErr != nil {
+				return errors.Join(syncErr, fmt.Errorf("close jobs journal %s: %w", path, closeErr))
+			}
+			return syncErr
+		}
+	}
+	if err := file.Close(); err != nil {
+		slog.Error("close jobs journal failed", "path", path, "err", err)
+		return fmt.Errorf("close jobs journal %s: %w", path, err)
+	}
+	if sync {
+		if err := syncFileDirectory(filepath.Dir(path), "jobs journal"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

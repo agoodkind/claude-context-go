@@ -317,6 +317,7 @@ func TestJobJournalWriterWaitsForCompactionThreshold(t *testing.T) {
 	writer := newJobJournalWriter(
 		journalPath,
 		store.AppendJobEvent,
+		store.AppendJobEventSync,
 		8,
 		threshold,
 	)
@@ -376,6 +377,7 @@ func TestJobJournalWriterCompactsFirstAppendWhenSeededAboveThreshold(t *testing.
 	writer := newJobJournalWriter(
 		journalPath,
 		store.AppendJobEvent,
+		store.AppendJobEventSync,
 		8,
 		threshold,
 	)
@@ -419,7 +421,13 @@ func TestJobJournalWriterBacksOffAfterCompactionFailure(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, nil)))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
-	writer := newJobJournalWriter(journalPath, store.AppendJobEvent, 8, threshold)
+	writer := newJobJournalWriter(
+		journalPath,
+		store.AppendJobEvent,
+		store.AppendJobEventSync,
+		8,
+		threshold,
+	)
 	baseTime := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
 	for i := range 2 {
 		event := model.JobEvent{
