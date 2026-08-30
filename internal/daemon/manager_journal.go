@@ -77,6 +77,9 @@ func (manager *Manager) reconcileJournalOnStartLocked() {
 		default:
 			continue
 		}
+		if job.Operation == "converge" {
+			manager.interruptedConvergeJobs[id] = job
+		}
 		job.State = model.JobStateCancelled
 		job.UpdatedAt = now
 		completedAt := now

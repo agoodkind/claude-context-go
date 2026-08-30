@@ -163,8 +163,8 @@ func TestStartDeferredBuildStartsOneBootstrap(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetIndex(worktree) after build start returned err=%v found=%v", err, found)
 	}
-	if codebase.PolicyPendingInitialization {
-		t.Fatal("building worktree PolicyPendingInitialization = true, want false")
+	if !codebase.PolicyPendingInitialization {
+		t.Fatal("building worktree PolicyPendingInitialization = false, want true until an explicit index initializes policy")
 	}
 	if got := jobsForCodebase(manager, discovered.ID); got != 1 {
 		t.Fatalf("deferred build started %d jobs, want exactly 1", got)

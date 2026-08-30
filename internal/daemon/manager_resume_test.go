@@ -5,9 +5,104 @@ import (
 	"strings"
 	"testing"
 
+	"goodkind.io/lm-semantic-search/internal/clock"
 	"goodkind.io/lm-semantic-search/internal/merkle"
 	"goodkind.io/lm-semantic-search/internal/model"
 )
+
+func TestResumeOrphanedConvergePreservesPolicyAndDoesNotDuplicate(t *testing.T) {
+	manager, cfg, repoPath := newTestManager(t)
+	manager.config.ResumeIndexingOnBoot = true
+	canonicalPath, err := manager.resolveCanonicalPath(repoPath)
+	if err != nil {
+		t.Fatalf("resolveCanonicalPath: %v", err)
+	}
+	priority := model.JobPriorityHigh
+	quiet := true
+	idleAfterSeconds := int32(900)
+	policy := model.SchedulingPolicy{Priority: priority, Quiet: quiet, IdleAfterSeconds: idleAfterSeconds}
+	override := model.SchedulingPolicyPatch{Priority: &priority, Quiet: &quiet, IdleAfterSeconds: &idleAfterSeconds}
+	codebase := newCodebaseRecord(canonicalPath)
+	codebase.Status = model.CodebaseStatusIndexed
+	codebase.EffectiveConfig = defaultIndexConfig()
+	codebase.SchedulingPolicy = policy
+	job := newQueuedJob(codebase.ID, repoPath, canonicalPath, testClientInfo(), "converge", false, codebase.EffectiveConfig, emptyAdmissionBudget, clock.Now())
+	job.State = model.JobStateRunning
+	job.EffectiveSchedulingPolicy = policy
+	job.SchedulingOverride = override
+	job.QueueSequence = 17
+	manager.mu.Lock()
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		manager.mu.Unlock()
+		t.Fatalf("save: %v", err)
+	}
+	if err := manager.appendJobLocked("job_running", job); err != nil {
+		manager.mu.Unlock()
+		t.Fatalf("append: %v", err)
+	}
+	manager.mu.Unlock()
+	manager.closeJobJournal()
+
+	restarted, err := NewManager(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(restarted.CloseGraphEngines)
+	restarted.config.ResumeIndexingOnBoot = true
+	restarted.ResumeOrphanedJobs(context.Background())
+	assertRecoveredConverge(t, restarted, codebase.ID, policy, override, 17, 1)
+	restarted.ResumeOrphanedJobs(context.Background())
+	assertRecoveredConverge(t, restarted, codebase.ID, policy, override, 17, 1)
+}
+
+func assertRecoveredConverge(t *testing.T, manager *Manager, codebaseID string, policy model.SchedulingPolicy, override model.SchedulingPolicyPatch, sequence uint64, wantCount int) {
+	t.Helper()
+	count := 0
+	for _, job := range manager.ListJobs(codebaseID) {
+		if job.Operation != string(jobOperationSync) {
+			continue
+		}
+		count++
+		if job.EffectiveSchedulingPolicy != policy || job.QueueSequence != sequence || !sameSchedulingOverride(job.SchedulingOverride, override) {
+			t.Fatalf("successor = %+v", job)
+		}
+	}
+	if count != wantCount {
+		t.Fatalf("sync successors = %d, want %d", count, wantCount)
+	}
+}
+
+func sameSchedulingOverride(actual model.SchedulingPolicyPatch, expected model.SchedulingPolicyPatch) bool {
+	if !samePriorityPointer(actual.Priority, expected.Priority) {
+		return false
+	}
+	if !sameBoolPointer(actual.Quiet, expected.Quiet) {
+		return false
+	}
+	return sameInt32Pointer(actual.IdleAfterSeconds, expected.IdleAfterSeconds)
+}
+
+func samePriorityPointer(actual *model.JobPriority, expected *model.JobPriority) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	return actual != nil && *actual == *expected
+}
+
+func sameBoolPointer(actual *bool, expected *bool) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	return actual != nil && *actual == *expected
+}
+
+func sameInt32Pointer(actual *int32, expected *int32) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	return actual != nil && *actual == *expected
+}
 
 // A document conversation codebase left mid-index must never be re-launched
 // by the boot resume pass: its path is a chat URI, not a directory, and the

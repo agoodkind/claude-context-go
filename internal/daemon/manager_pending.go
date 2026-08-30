@@ -26,7 +26,8 @@ type pendingCodeRequest struct {
 	// a force StartIndex cancels the active job before admission, so a coalesced
 	// request reaches this slot only with force false; the field keeps the merge
 	// rule general.
-	force bool
+	force       bool
+	policyPatch model.SchedulingPolicyPatch
 }
 
 // activeJobResolution classifies how an incoming code request relates to a
@@ -154,6 +155,7 @@ func mostConservativeAbsence(first absencePolicy, second absencePolicy) absenceP
 func (manager *Manager) mergePendingCodeRequestLocked(codebaseID string, incoming pendingCodeRequest) {
 	if existing, found := manager.pendingCodeJobs[codebaseID]; found {
 		incoming.force = incoming.force || existing.force
+		incoming.policyPatch = mergeSchedulingPolicyPatches(existing.policyPatch, incoming.policyPatch)
 	}
 	manager.pendingCodeJobs[codebaseID] = incoming
 }
@@ -167,6 +169,13 @@ func (manager *Manager) mergePendingCodeRequestLocked(codebaseID string, incomin
 func (manager *Manager) enqueueConversationJobLocked(current model.Codebase, client model.ClientInfo, payload conversationJobPayload) (model.Job, error) {
 	original := current
 	now := clock.Now()
+	_, effectivePolicy, err := manager.resolveIndexPolicyLocked(current, indexPolicyIntent{
+		Patch:      model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil},
+		Initialize: false,
+	})
+	if err != nil {
+		return model.Job{}, err
+	}
 	job := newQueuedJob(
 		current.ID,
 		current.CanonicalPath,
@@ -178,6 +187,7 @@ func (manager *Manager) enqueueConversationJobLocked(current model.Codebase, cli
 		emptyAdmissionBudget,
 		now,
 	)
+	applyJobSchedulingPolicy(&job, effectivePolicy, model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil}, manager.nextQueueSequenceLocked())
 	current.Status = model.CodebaseStatusIndexing
 	current.ActiveJobID = job.ID
 	current.UpdatedAt = now
@@ -207,6 +217,14 @@ func (manager *Manager) enqueueConversationJobLocked(current model.Codebase, cli
 func (manager *Manager) enqueueCodeSyncJobLocked(current model.Codebase, request pendingCodeRequest) (model.Job, error) {
 	original := current
 	now := clock.Now()
+	resolvedCodebase, effectivePolicy, err := manager.resolveIndexPolicyLocked(current, indexPolicyIntent{
+		Patch:      request.policyPatch,
+		Initialize: false,
+	})
+	if err != nil {
+		return model.Job{}, err
+	}
+	current = resolvedCodebase
 	current.Status = model.CodebaseStatusIndexing
 	current.EffectiveConfig = request.indexConfig
 	if manager.semantic != nil && manager.semantic.Available() {
@@ -217,6 +235,7 @@ func (manager *Manager) enqueueCodeSyncJobLocked(current model.Codebase, request
 	}
 	current.UpdatedAt = now
 	job := newQueuedJob(current.ID, request.requestedPath, request.canonicalPath, request.client, string(jobOperationSync), request.force, request.indexConfig, emptyAdmissionBudget, now)
+	applyJobSchedulingPolicy(&job, effectivePolicy, request.policyPatch, manager.nextQueueSequenceLocked())
 	current.ActiveJobID = job.ID
 	manager.codebases[current.ID] = current
 	if err := manager.saveLocked(); err != nil {
