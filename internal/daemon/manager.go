@@ -374,16 +374,18 @@ func newCodebaseRecord(canonicalPath string) model.Codebase {
 			VectorBackend:      "",
 			Hybrid:             false,
 		},
-		CollectionName:        "",
-		LegacyCollectionNames: nil,
-		MerkleSnapshotPath:    "",
-		GraphState:            "",
-		GraphSnapshotHash:     "",
-		GraphUpdatedAt:        time.Time{},
-		Quarantine:            nil,
-		WorktreeCommonDir:     "",
-		InodeTrackingDisabled: false,
-		UpdatedAt:             clock.Now(),
+		SchedulingPolicy:            model.DefaultSchedulingPolicy(),
+		PolicyPendingInitialization: false,
+		CollectionName:              "",
+		LegacyCollectionNames:       nil,
+		MerkleSnapshotPath:          "",
+		GraphState:                  "",
+		GraphSnapshotHash:           "",
+		GraphUpdatedAt:              time.Time{},
+		Quarantine:                  nil,
+		WorktreeCommonDir:           "",
+		InodeTrackingDisabled:       false,
+		UpdatedAt:                   clock.Now(),
 	}
 }
 
@@ -437,12 +439,20 @@ func newQueuedJob(
 			LastEventAt:               now,
 			HeartbeatAt:               now,
 		},
-		Config:      indexConfig,
-		Budget:      budget,
-		StartedAt:   now,
-		UpdatedAt:   now,
-		CompletedAt: nil,
-		Error:       nil,
+		Config:                    indexConfig,
+		Budget:                    budget,
+		EffectiveSchedulingPolicy: model.DefaultSchedulingPolicy(),
+		SchedulingOverride: model.SchedulingPolicyPatch{
+			Priority:         nil,
+			Quiet:            nil,
+			IdleAfterSeconds: nil,
+		},
+		QueueSequence:    0,
+		SchedulingReason: "",
+		StartedAt:        now,
+		UpdatedAt:        now,
+		CompletedAt:      nil,
+		Error:            nil,
 	}
 }
 
@@ -639,6 +649,7 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 		codebase.Status = model.CodebaseStatusIndexing
 	}
 	codebase.EffectiveConfig = indexConfig
+	codebase.PolicyPendingInitialization = false
 	codebase.InodeTrackingDisabled = detectInodeTrackingDisabled(ctx, canonicalPath)
 	if manager.semantic != nil && manager.semantic.Available() {
 		codebase.CollectionName = manager.semantic.CollectionName(canonicalPath)

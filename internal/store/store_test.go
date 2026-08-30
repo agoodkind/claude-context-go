@@ -14,6 +14,57 @@ import (
 	"goodkind.io/lm-semantic-search/internal/model"
 )
 
+func TestSchedulingPolicyRegistryAndJobJournalRoundTrip(t *testing.T) {
+	stateRoot := t.TempDir()
+	registryPath := filepath.Join(stateRoot, "registry.json")
+	jobsPath := filepath.Join(stateRoot, "jobs.jsonl")
+	priority := model.JobPriorityHigh
+	quiet := true
+	idleAfterSeconds := int32(600)
+	policy := model.SchedulingPolicy{
+		Priority:         priority,
+		Quiet:            quiet,
+		IdleAfterSeconds: idleAfterSeconds,
+	}
+	codebase := model.Codebase{
+		ID:                          "codebase-1",
+		CanonicalPath:               "/tmp/codebase",
+		SchedulingPolicy:            policy,
+		PolicyPendingInitialization: true,
+	}
+	if err := WriteRegistry(registryPath, model.RegistryFile{Codebases: []model.Codebase{codebase}}); err != nil {
+		t.Fatalf("WriteRegistry returned error: %v", err)
+	}
+	registry, err := ReadRegistry(registryPath)
+	if err != nil {
+		t.Fatalf("ReadRegistry returned error: %v", err)
+	}
+	if !reflect.DeepEqual(registry.Codebases, []model.Codebase{codebase}) {
+		t.Fatalf("registry codebases = %#v, want %#v", registry.Codebases, []model.Codebase{codebase})
+	}
+	job := model.Job{
+		ID:                        "job-1",
+		EffectiveSchedulingPolicy: policy,
+		SchedulingOverride: model.SchedulingPolicyPatch{
+			Priority:         &priority,
+			Quiet:            &quiet,
+			IdleAfterSeconds: &idleAfterSeconds,
+		},
+		QueueSequence:    7,
+		SchedulingReason: "operator_request",
+	}
+	if err := AppendJobEvent(jobsPath, model.JobEvent{Event: "job_queued", Job: job}); err != nil {
+		t.Fatalf("AppendJobEvent returned error: %v", err)
+	}
+	jobs, err := ReadJobEvents(jobsPath)
+	if err != nil {
+		t.Fatalf("ReadJobEvents returned error: %v", err)
+	}
+	if !reflect.DeepEqual(jobs["job-1"], job) {
+		t.Fatalf("job = %#v, want %#v", jobs["job-1"], job)
+	}
+}
+
 func TestReadJobEventsLatestReturnsLastEventPerJobID(t *testing.T) {
 	journalPath := filepath.Join(t.TempDir(), "jobs.jsonl")
 	occurredAt := []time.Time{

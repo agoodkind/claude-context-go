@@ -21,6 +21,9 @@ func indexedSiblingScene(t *testing.T) (*Manager, string) {
 	manager, _, _ := newTestManager(t)
 	manager.runner = fakeRunner{}
 	manager.deferredBuildDelay = time.Hour
+	manager.semantic = &fakeSemantic{
+		hasCollectionForPath: func(context.Context, string) (bool, error) { return false, nil },
+	}
 
 	base := t.TempDir()
 	mainRoot := filepath.Join(base, "repo")
@@ -59,6 +62,9 @@ func TestGetIndexDiscoversWorktreeWithoutJob(t *testing.T) {
 	if codebase.Status != model.CodebaseStatusDiscovered {
 		t.Fatalf("discovered codebase Status = %q, want %q", codebase.Status, model.CodebaseStatusDiscovered)
 	}
+	if !codebase.PolicyPendingInitialization {
+		t.Fatal("discovered codebase PolicyPendingInitialization = false, want true before its first build")
+	}
 	if codebase.CanonicalPath != worktreeRoot {
 		t.Fatalf("discovered codebase CanonicalPath = %q, want %q", codebase.CanonicalPath, worktreeRoot)
 	}
@@ -70,6 +76,21 @@ func TestGetIndexDiscoversWorktreeWithoutJob(t *testing.T) {
 	}
 	if got := jobsForCodebase(manager, codebase.ID); got != 0 {
 		t.Fatalf("discovered codebase has %d jobs, want 0 (the read must not start an embed)", got)
+	}
+}
+
+func TestGetIndexDiscoversWorktreeWithExistingCollectionInitialized(t *testing.T) {
+	manager, worktreeRoot := indexedSiblingScene(t)
+	manager.semantic = &fakeSemantic{
+		hasCollectionForPath: func(context.Context, string) (bool, error) { return true, nil },
+	}
+
+	codebase, _, found, _, err := manager.GetIndex(context.Background(), worktreeRoot)
+	if err != nil || !found {
+		t.Fatalf("GetIndex(worktree) returned err=%v found=%v", err, found)
+	}
+	if codebase.PolicyPendingInitialization {
+		t.Fatal("discovered worktree with an existing collection PolicyPendingInitialization = true, want false")
 	}
 }
 
@@ -138,6 +159,13 @@ func TestStartDeferredBuildStartsOneBootstrap(t *testing.T) {
 	manager.startDeferredBuild(context.Background(), worktreeRoot)
 
 	waitForCodebaseStatus(t, manager, worktreeRoot, model.CodebaseStatusIndexing)
+	codebase, _, found, _, err := manager.GetIndex(context.Background(), worktreeRoot)
+	if err != nil || !found {
+		t.Fatalf("GetIndex(worktree) after build start returned err=%v found=%v", err, found)
+	}
+	if codebase.PolicyPendingInitialization {
+		t.Fatal("building worktree PolicyPendingInitialization = true, want false")
+	}
 	if got := jobsForCodebase(manager, discovered.ID); got != 1 {
 		t.Fatalf("deferred build started %d jobs, want exactly 1", got)
 	}

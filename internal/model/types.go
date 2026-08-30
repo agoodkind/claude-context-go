@@ -241,16 +241,18 @@ type Codebase struct {
 	LastFailedRun     *IndexRunFailure `json:"last_failed_run,omitempty"`
 	// LiveFileTotal and LiveChunkTotal track the latest known corpus size,
 	// updated during runs rather than only at completion.
-	LiveFileTotal         int32            `json:"liveFileTotal,omitempty"`
-	LiveChunkTotal        int32            `json:"liveChunkTotal,omitempty"`
-	EffectiveConfig       IndexConfig      `json:"effective_config"`
-	CollectionName        string           `json:"collection_name,omitempty"`
-	LegacyCollectionNames []string         `json:"legacy_collection_names,omitempty"`
-	MerkleSnapshotPath    string           `json:"merkle_snapshot_path,omitempty"`
-	GraphState            GraphState       `json:"graph_state,omitempty"`
-	GraphSnapshotHash     string           `json:"graph_snapshot_hash,omitempty"`
-	GraphUpdatedAt        time.Time        `json:"graph_updated_at,omitzero"`
-	Quarantine            *QuarantineState `json:"quarantine,omitempty"`
+	LiveFileTotal               int32            `json:"liveFileTotal,omitempty"`
+	LiveChunkTotal              int32            `json:"liveChunkTotal,omitempty"`
+	EffectiveConfig             IndexConfig      `json:"effective_config"`
+	SchedulingPolicy            SchedulingPolicy `json:"scheduling_policy,omitzero"`
+	PolicyPendingInitialization bool             `json:"policy_pending_initialization,omitempty"`
+	CollectionName              string           `json:"collection_name,omitempty"`
+	LegacyCollectionNames       []string         `json:"legacy_collection_names,omitempty"`
+	MerkleSnapshotPath          string           `json:"merkle_snapshot_path,omitempty"`
+	GraphState                  GraphState       `json:"graph_state,omitempty"`
+	GraphSnapshotHash           string           `json:"graph_snapshot_hash,omitempty"`
+	GraphUpdatedAt              time.Time        `json:"graph_updated_at,omitzero"`
+	Quarantine                  *QuarantineState `json:"quarantine,omitempty"`
 	// WorktreeCommonDir is the shared git common dir when this codebase's root
 	// is a linked git worktree, else empty. It lets the daemon recognize a
 	// removed worktree (git deleted its admin entry) after the directory is gone
@@ -284,14 +286,18 @@ type Job struct {
 	// Forced records that the caller passed force=true on the index request, so a
 	// trigger-aware heading can tell a forced reindex apart from a first build or
 	// a changed-files sync, which otherwise share the same operation.
-	Forced      bool            `json:"forced"`
-	Progress    Progress        `json:"progress"`
-	Config      IndexConfig     `json:"config"`
-	Budget      AdmissionBudget `json:"budget,omitzero"`
-	StartedAt   time.Time       `json:"started_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
-	CompletedAt *time.Time      `json:"completed_at,omitempty"`
-	Error       *JobError       `json:"error,omitempty"`
+	Forced                    bool                  `json:"forced"`
+	Progress                  Progress              `json:"progress"`
+	Config                    IndexConfig           `json:"config"`
+	Budget                    AdmissionBudget       `json:"budget,omitzero"`
+	EffectiveSchedulingPolicy SchedulingPolicy      `json:"effective_scheduling_policy,omitzero"`
+	SchedulingOverride        SchedulingPolicyPatch `json:"scheduling_override,omitzero"`
+	QueueSequence             uint64                `json:"queue_sequence,omitempty"`
+	SchedulingReason          string                `json:"scheduling_reason,omitempty"`
+	StartedAt                 time.Time             `json:"started_at"`
+	UpdatedAt                 time.Time             `json:"updated_at"`
+	CompletedAt               *time.Time            `json:"completed_at,omitempty"`
+	Error                     *JobError             `json:"error,omitempty"`
 }
 
 // RegistryFile is the durable JSON representation of tracked codebases.

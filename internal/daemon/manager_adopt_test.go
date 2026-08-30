@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"goodkind.io/lm-semantic-search/internal/model"
+	"goodkind.io/lm-semantic-search/internal/store"
 )
 
 // recordingLifecycleHook captures the codebases the manager hands to the
@@ -63,6 +64,9 @@ func TestGetIndexAdoptsUnregisteredCollection(t *testing.T) {
 	if first.Status != model.CodebaseStatusIndexed {
 		t.Fatalf("adopted status = %q, want %q", first.Status, model.CodebaseStatusIndexed)
 	}
+	if first.PolicyPendingInitialization {
+		t.Fatal("adopted codebase PolicyPendingInitialization = true, want false")
+	}
 
 	second, _, _, _, err := manager.GetIndex(context.Background(), canonical)
 	if err != nil {
@@ -96,4 +100,49 @@ func TestGetIndexAdoptsUnregisteredCollection(t *testing.T) {
 		codebase, _, ok, _, getErr := manager.GetIndex(context.Background(), canonical)
 		return getErr == nil && ok && codebase.LastSuccessfulRun != nil
 	})
+}
+
+func TestLoadNormalizesLegacySchedulingPolicy(t *testing.T) {
+	cfg, repoPath := newTestManagerConfig(t)
+	legacyCodebase := model.Codebase{
+		ID:            "legacy-codebase",
+		CanonicalPath: repoPath,
+		Status:        model.CodebaseStatusIndexed,
+	}
+	if err := store.WriteRegistry(cfg.RegistryPath, model.RegistryFile{Codebases: []model.Codebase{legacyCodebase}}); err != nil {
+		t.Fatalf("WriteRegistry returned error: %v", err)
+	}
+	legacyJob := model.Job{
+		ID:         "legacy-job",
+		CodebaseID: legacyCodebase.ID,
+		State:      model.JobStateCompleted,
+	}
+	if err := store.AppendJobEvent(cfg.JobsPath, model.JobEvent{Event: "job_completed", Job: legacyJob}); err != nil {
+		t.Fatalf("AppendJobEvent returned error: %v", err)
+	}
+
+	manager, err := NewManager(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+	t.Cleanup(manager.CloseGraphEngines)
+
+	indexes := manager.ListIndexes(context.Background())
+	if len(indexes) != 1 {
+		t.Fatalf("loaded indexes = %d, want 1", len(indexes))
+	}
+	codebase := indexes[0]
+	if codebase.SchedulingPolicy != model.DefaultSchedulingPolicy() {
+		t.Fatalf("legacy codebase policy = %+v, want %+v", codebase.SchedulingPolicy, model.DefaultSchedulingPolicy())
+	}
+	if codebase.PolicyPendingInitialization {
+		t.Fatal("legacy codebase PolicyPendingInitialization = true, want false")
+	}
+	jobs := manager.ListJobs(legacyCodebase.ID)
+	if len(jobs) != 1 {
+		t.Fatalf("legacy jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].EffectiveSchedulingPolicy != model.DefaultSchedulingPolicy() {
+		t.Fatalf("legacy job policy = %+v, want %+v", jobs[0].EffectiveSchedulingPolicy, model.DefaultSchedulingPolicy())
+	}
 }
