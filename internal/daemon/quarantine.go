@@ -199,35 +199,41 @@ func quarantineJobMessage(signal quarantineSignal) string {
 }
 
 func (manager *Manager) updateJobQuarantined(ctx context.Context, jobID string, signal quarantineSignal) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	job, found := manager.jobs[jobID]
-	if !found {
+	traceID := string(correlation.FromContext(ctx).TraceID)
+	job, transitioned, journalErr := manager.serializeJobTransition(
+		jobID,
+		"job_failed",
+		func(job *model.Job) bool {
+			if isTerminalJobState(job.State) {
+				return false
+			}
+			now := clock.Now()
+			job.State = model.JobStateFailed
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			job.Progress.Phase = "quarantined"
+			job.Progress.LastEventAt = now
+			job.Progress.HeartbeatAt = now
+			job.Error = &model.JobError{
+				Message:   quarantineJobMessage(signal),
+				Code:      "",
+				Retryable: false,
+				TraceID:   traceID,
+				JobID:     jobID,
+			}
+			return true
+		},
+	)
+	if !transitioned {
 		return
 	}
-	delete(manager.conversationJobs, jobID)
-
-	traceID := string(correlation.FromContext(ctx).TraceID)
-	now := clock.Now()
 	metrics.JobFailed()
-	job.State = model.JobStateFailed
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "quarantined"
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	job.Error = &model.JobError{
-		Message:   quarantineJobMessage(signal),
-		Code:      "",
-		Retryable: false,
-		TraceID:   traceID,
-		JobID:     jobID,
+	if journalErr != nil {
+		slog.ErrorContext(ctx, "append quarantined job event failed", "job_id", jobID, "err", journalErr)
 	}
-	if err := manager.appendJobLocked("job_failed", job); err != nil {
-		slog.ErrorContext(ctx, "append quarantined job event failed", "job_id", jobID, "err", err)
-	}
-
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	delete(manager.conversationJobs, jobID)
 	codebase, found := manager.codebases[job.CodebaseID]
 	if !found {
 		return

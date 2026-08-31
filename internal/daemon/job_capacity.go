@@ -2,81 +2,69 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"goodkind.io/lm-semantic-search/internal/clock"
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
+	"goodkind.io/lm-semantic-search/internal/model"
 )
 
 const (
-	// defaultJobCapacityReacquireTimeout gives a read-side waiter five seconds
-	// to resume after its already-bounded collection load. That is long enough
-	// for scheduler jitter and ten advisory-lock retries, while short enough
-	// that a replacement indexing job cannot turn the bounded load outcome into
-	// another job-length wait.
-	defaultJobCapacityReacquireTimeout = 5 * time.Second
-
 	// defaultJobCapacityReleaseGrace is how long a read may run before the job
-	// gives up its indexing slot and the shared sync lock for the rest of it.
+	// durably pauses and yields its scheduler lease and shared sync lock.
 	// Whether a read will stall cannot be known before it runs, so this decides
 	// by watching: a healthy reuse read answers in milliseconds and keeps both
 	// holds, while a read parked behind a collection load that Milvus never
 	// finishes crosses the grace and frees them for the minutes it may still
-	// take. The half-second margin covers timer and scheduler delay so another
-	// job can observe the released capacity within the five-second contract.
+	// take.
 	defaultJobCapacityReleaseGrace = 4500 * time.Millisecond
+
+	stalledReadSchedulingReason = "stalled read"
+	syncLockSchedulingReason    = "waiting for sync lock"
 )
 
 type jobCapacityContextKey struct{}
 
-// jobCapacityTimings bounds the two waits around a read that gives up this
-// job's scarce holds: how long the read may run before they are released, and
-// how long the job may then wait to take them back.
+// jobCapacityTimings bounds how long a read may run before its scheduler lease
+// yields. Reacquisition is intentionally unbounded and remains cancellable.
 type jobCapacityTimings struct {
 	ReleaseGrace time.Duration
-	Reacquire    time.Duration
 }
 
 func defaultJobCapacityTimings() jobCapacityTimings {
 	return jobCapacityTimings{
 		ReleaseGrace: defaultJobCapacityReleaseGrace,
-		Reacquire:    defaultJobCapacityReacquireTimeout,
 	}
 }
 
-// jobCapacityReacquireError is the terminal outcome when a job cannot regain
-// the scarce holds it released around a stalled read. Its cause distinguishes
-// the resume deadline from cancellation of the job itself.
+// jobCapacityReacquireError reports that a yielded job could not regain its
+// scheduler lease or sync lock before cancellation or a permanent lock error.
 type jobCapacityReacquireError struct {
-	Timeout time.Duration
-	Cause   error
+	Cause error
 }
 
 func (err *jobCapacityReacquireError) Error() string {
-	return fmt.Sprintf(
-		"reacquire indexing capacity within %s after read: %v",
-		err.Timeout,
-		err.Cause,
-	)
+	return fmt.Sprintf("reacquire indexing capacity after read: %v", err.Cause)
 }
 
 func (err *jobCapacityReacquireError) Unwrap() error {
 	return err.Cause
 }
 
-// jobCapacity is one job's hold on the two scarce resources an indexing job
-// needs: a slot in the daemon-wide concurrency cap and a reference on the
-// shared advisory sync lock. The mutex guards the two held flags because the
-// stall watchdog releases them from its own goroutine while the job's goroutine
-// is inside a read.
+// jobCapacity is one scheduler lease's hold on admission capacity and the
+// shared advisory sync lock. No other production path owns either resource.
 type jobCapacity struct {
-	manager      *Manager
-	mu           sync.Mutex
-	slotHeld     bool
-	syncLockHeld bool
+	manager         *Manager
+	jobID           string
+	lease           *jobscheduler.Lease
+	mu              sync.Mutex
+	released        bool
+	holdSyncLock    bool
+	syncLockHeld    bool
+	waitsOnSyncLock bool
 	// syncLockLease is the release handle for the reference this capacity holds.
 	// The watchdog releases it from its own goroutine and a resume takes a fresh
 	// one, so the handle is stored rather than re-derived: a lease releases at
@@ -94,93 +82,225 @@ func jobCapacityFromContext(ctx context.Context) *jobCapacity {
 	return capacity
 }
 
-// acquireSyncLock takes this job's reference on the sync lock and reports the
-// outcome, so the caller can separate a cancelled request from a machine that
-// cannot grant the lock at all.
-func (capacity *jobCapacity) acquireSyncLock(ctx context.Context) (syncLockOutcome, error) {
-	capacity.mu.Lock()
-	defer capacity.mu.Unlock()
-	return capacity.acquireSyncLockLocked(ctx)
-}
-
-func (capacity *jobCapacity) acquireSyncLockLocked(ctx context.Context) (syncLockOutcome, error) {
-	if capacity.syncLockHeld {
-		return syncLockAcquired, nil
+func (manager *Manager) acquireJobCapacity(
+	ctx context.Context,
+	job model.Job,
+	holdSyncLock bool,
+) (*jobCapacity, syncLockOutcome, error) {
+	normalizedPolicy, err := model.ApplySchedulingPolicyPatch(
+		job.EffectiveSchedulingPolicy,
+		model.SchedulingPolicyPatch{
+			Priority:         nil,
+			Quiet:            nil,
+			IdleAfterSeconds: nil,
+		},
+	)
+	if err != nil {
+		wrappedErr := fmt.Errorf("normalize scheduler job policy: %w", err)
+		slog.ErrorContext(ctx, "normalize scheduler job policy failed", "job_id", job.ID, "err", wrappedErr)
+		return nil, syncLockFailed, wrappedErr
 	}
-	lease, outcome, err := capacity.manager.syncLock.acquireBlocking(ctx)
+	job.EffectiveSchedulingPolicy = normalizedPolicy
+	lease, err := manager.jobScheduler.Acquire(ctx, jobscheduler.Entry{
+		JobID:          job.ID,
+		Policy:         job.EffectiveSchedulingPolicy,
+		QueueSequence:  job.QueueSequence,
+		State:          jobscheduler.EntryWaiting,
+		Reason:         "",
+		PauseRequested: false,
+	})
+	if err != nil {
+		wrappedErr := fmt.Errorf("acquire scheduler capacity: %w", err)
+		slog.WarnContext(ctx, "acquire scheduler capacity stopped", "job_id", job.ID, "err", wrappedErr)
+		return nil, syncLockCancelled, wrappedErr
+	}
+	manager.policyMutationMutex.Lock()
+	manager.mu.Lock()
+	latestJob, found := manager.jobs[job.ID]
+	manager.mu.Unlock()
+	if found {
+		latestPolicy, policyErr := model.ApplySchedulingPolicyPatch(
+			latestJob.EffectiveSchedulingPolicy,
+			model.SchedulingPolicyPatch{
+				Priority:         nil,
+				Quiet:            nil,
+				IdleAfterSeconds: nil,
+			},
+		)
+		if policyErr != nil {
+			manager.policyMutationMutex.Unlock()
+			lease.Release()
+			wrappedErr := fmt.Errorf("normalize latest scheduler job policy: %w", policyErr)
+			slog.ErrorContext(ctx, "normalize latest scheduler job policy failed", "job_id", job.ID, "err", wrappedErr)
+			return nil, syncLockFailed, wrappedErr
+		}
+		priority := latestPolicy.Priority
+		quiet := latestPolicy.Quiet
+		idleAfterSeconds := latestPolicy.IdleAfterSeconds
+		if policyErr := lease.UpdatePolicy(model.SchedulingPolicyPatch{
+			Priority:         &priority,
+			Quiet:            &quiet,
+			IdleAfterSeconds: &idleAfterSeconds,
+		}); policyErr != nil {
+			manager.policyMutationMutex.Unlock()
+			lease.Release()
+			wrappedErr := fmt.Errorf("refresh scheduler job policy: %w", policyErr)
+			slog.ErrorContext(ctx, "refresh scheduler job policy failed", "job_id", job.ID, "err", wrappedErr)
+			return nil, syncLockFailed, wrappedErr
+		}
+	}
+	manager.policyMutationMutex.Unlock()
+	if !holdSyncLock && manager.semantic != nil && manager.semantic.Available() {
+		holdSyncLock = true
+	}
+	capacity := &jobCapacity{
+		manager:         manager,
+		jobID:           job.ID,
+		lease:           lease,
+		mu:              sync.Mutex{},
+		released:        false,
+		holdSyncLock:    holdSyncLock,
+		syncLockHeld:    false,
+		waitsOnSyncLock: false,
+		syncLockLease:   syncLockLease{lock: nil, once: nil},
+	}
+	if !holdSyncLock {
+		return capacity, syncLockAcquired, nil
+	}
+	outcome, lockErr := capacity.acquireSyncLock(ctx)
 	if outcome != syncLockAcquired {
-		return outcome, err
+		capacity.release(context.WithoutCancel(ctx))
+		return nil, outcome, lockErr
 	}
-	capacity.syncLockLease = lease
-	capacity.syncLockHeld = true
-	return syncLockAcquired, nil
+	return capacity, syncLockAcquired, nil
 }
 
-func (capacity *jobCapacity) acquire(ctx context.Context, holdSyncLock bool) bool {
-	capacity.mu.Lock()
-	defer capacity.mu.Unlock()
-	if !capacity.slotHeld {
-		select {
-		case capacity.manager.indexSlots <- struct{}{}:
-			capacity.slotHeld = true
-		case <-ctx.Done():
-			return false
-		}
-	}
-	if holdSyncLock {
-		// This function answers yes or no, so a failure that waiting cannot repair
-		// reads the same as a caller that walked away. Report the failure before
-		// collapsing it, or the machine-level fault the typed outcome exists to
-		// surface would leave no record anywhere.
-		if outcome, err := capacity.acquireSyncLockLocked(ctx); outcome != syncLockAcquired {
-			if outcome == syncLockFailed {
-				slog.ErrorContext(ctx, "job capacity sync lock failed", "component", "daemon", "subcomponent", "job_capacity", "outcome", string(outcome), "err", err)
+func (capacity *jobCapacity) acquireSyncLock(
+	ctx context.Context,
+) (syncLockOutcome, error) {
+	for {
+		lease, outcome, err := capacity.manager.syncLock.acquire(ctx)
+		switch outcome {
+		case syncLockAcquired:
+			capacity.mu.Lock()
+			if capacity.released {
+				capacity.mu.Unlock()
+				lease.release(context.WithoutCancel(ctx))
+				cause := ctx.Err()
+				if cause == nil {
+					cause = errSyncLockWaitCancelled
+				}
+				wrappedErr := fmt.Errorf("acquire sync lock after capacity release: %w", cause)
+				slog.WarnContext(ctx, "acquire sync lock stopped after capacity release", "job_id", capacity.jobID, "err", wrappedErr)
+				return syncLockCancelled, wrappedErr
 			}
-			capacity.releaseLocked(ctx)
-			return false
+			capacity.syncLockLease = lease
+			capacity.syncLockHeld = true
+			capacity.waitsOnSyncLock = false
+			capacity.mu.Unlock()
+			return syncLockAcquired, nil
+		case syncLockFailed:
+			return syncLockFailed, err
+		case syncLockCancelled:
+			return syncLockCancelled, err
+		case syncLockBusy:
+			capacity.markSyncLockWait(ctx)
+		}
+
+		if err := capacity.retryAfter(ctx, syncLockRetryInterval, syncLockSchedulingReason); err != nil {
+			wrappedErr := fmt.Errorf("retry scheduler capacity after sync lock wait: %w", err)
+			slog.WarnContext(ctx, "retry scheduler capacity after sync lock wait stopped", "job_id", capacity.jobID, "err", wrappedErr)
+			return syncLockCancelled, wrappedErr
 		}
 	}
-	return true
+}
+
+func (capacity *jobCapacity) markSyncLockWait(ctx context.Context) {
+	capacity.mu.Lock()
+	alreadyWaiting := capacity.waitsOnSyncLock
+	capacity.waitsOnSyncLock = true
+	capacity.mu.Unlock()
+	if alreadyWaiting {
+		return
+	}
+	capacity.manager.setJobSchedulingReason(ctx, capacity.jobID, syncLockSchedulingReason)
 }
 
 func (capacity *jobCapacity) release(ctx context.Context) {
 	capacity.mu.Lock()
 	defer capacity.mu.Unlock()
-	capacity.releaseLocked(ctx)
+	if capacity.released {
+		return
+	}
+	capacity.releaseSyncLockLocked(ctx)
+	capacity.lease.Release()
+	capacity.released = true
 }
 
-// releaseHeld gives up whatever this job currently holds and reports whether
-// the sync lock was among them, so a later resume takes back exactly what was
-// given up rather than guessing.
-func (capacity *jobCapacity) releaseHeld(ctx context.Context) bool {
+func (capacity *jobCapacity) yieldClaim(
+	ctx context.Context,
+	claim *jobscheduler.PauseClaim,
+) bool {
 	capacity.mu.Lock()
 	defer capacity.mu.Unlock()
-	heldSyncLock := capacity.syncLockHeld
-	capacity.releaseLocked(ctx)
-	return heldSyncLock
+	if capacity.released {
+		return false
+	}
+	capacity.releaseSyncLockLocked(ctx)
+	return claim.Yield()
 }
 
-func (capacity *jobCapacity) releaseLocked(ctx context.Context) {
+func (capacity *jobCapacity) retryAfter(
+	ctx context.Context,
+	delay time.Duration,
+	reason string,
+) error {
+	capacity.mu.Lock()
+	if capacity.released {
+		capacity.mu.Unlock()
+		return fmt.Errorf("retry released job capacity")
+	}
+	capacity.releaseSyncLockLocked(context.WithoutCancel(ctx))
+	capacity.mu.Unlock()
+	if err := capacity.lease.RetryAfter(ctx, delay, reason); err != nil {
+		wrappedErr := fmt.Errorf("retry scheduler lease: %w", err)
+		slog.WarnContext(ctx, "retry scheduler lease stopped", "job_id", capacity.jobID, "err", wrappedErr)
+		return wrappedErr
+	}
+	return nil
+}
+
+func (capacity *jobCapacity) releaseSyncLockLocked(ctx context.Context) {
 	if capacity.syncLockHeld {
 		capacity.syncLockLease.release(ctx)
 		capacity.syncLockLease = syncLockLease{lock: nil, once: nil}
 		capacity.syncLockHeld = false
 	}
-	if capacity.slotHeld {
-		<-capacity.manager.indexSlots
-		capacity.slotHeld = false
-	}
 }
 
-// stallRelease is the watchdog that frees this job's holds once a read has run
-// longer than the release grace. releasedSyncLock is written by the watchdog
-// goroutine and read only after join returns, so the channel close orders the
-// two accesses.
+func (capacity *jobCapacity) reacquire(
+	ctx context.Context,
+	holdSyncLock bool,
+) (syncLockOutcome, error) {
+	if err := capacity.lease.Reacquire(ctx); err != nil {
+		wrappedErr := fmt.Errorf("reacquire scheduler capacity: %w", err)
+		slog.WarnContext(ctx, "reacquire scheduler capacity stopped", "job_id", capacity.jobID, "err", wrappedErr)
+		return syncLockCancelled, wrappedErr
+	}
+	if !holdSyncLock {
+		return syncLockAcquired, nil
+	}
+	return capacity.acquireSyncLock(ctx)
+}
+
+// stallRelease is the watchdog that durably pauses and yields this job once a
+// read has run longer than the release grace. Its result is read only after
+// join returns, so the channel close orders the accesses.
 type stallRelease struct {
-	stopped          chan struct{}
-	finished         chan struct{}
-	released         bool
-	releasedSyncLock bool
+	stopped  chan struct{}
+	finished chan struct{}
+	released bool
+	err      error
 }
 
 // startStallRelease arms the watchdog. It touches the capacity only after the
@@ -193,10 +313,10 @@ func startStallRelease(
 ) *stallRelease {
 	startedAt := clock.Now()
 	watchdog := &stallRelease{
-		stopped:          make(chan struct{}),
-		finished:         make(chan struct{}),
-		released:         false,
-		releasedSyncLock: false,
+		stopped:  make(chan struct{}),
+		finished: make(chan struct{}),
+		released: false,
+		err:      nil,
 	}
 	go func() {
 		defer close(watchdog.finished)
@@ -216,8 +336,29 @@ func startStallRelease(
 			return
 		case <-graceTimer.C:
 		}
-		watchdog.releasedSyncLock = capacity.releaseHeld(ctx)
-		watchdog.released = true
+		claim, claimed := capacity.lease.ClaimYield(stalledReadSchedulingReason)
+		if !claimed {
+			return
+		}
+		if err := capacity.manager.pauseJob(capacity.jobID, stalledReadSchedulingReason); err != nil {
+			claim.Cancel()
+			capacity.manager.failScheduledJob(context.WithoutCancel(ctx), capacity.jobID, err)
+			capacity.release(context.WithoutCancel(ctx))
+			watchdog.err = err
+			return
+		}
+		if !capacity.manager.jobIsPaused(capacity.jobID) {
+			claim.Cancel()
+			return
+		}
+		watchdog.released = capacity.yieldClaim(context.WithoutCancel(ctx), claim)
+		if !watchdog.released {
+			failure := fmt.Errorf("yield stalled scheduler claim")
+			capacity.manager.failScheduledJob(context.WithoutCancel(ctx), capacity.jobID, failure)
+			capacity.release(context.WithoutCancel(ctx))
+			watchdog.err = failure
+			return
+		}
 		slog.WarnContext(ctx, "released indexing capacity for a stalled read",
 			"component", "daemon",
 			"subcomponent", "capacity",
@@ -231,10 +372,10 @@ func startStallRelease(
 // join stops the watchdog and reports what it released, if anything. It returns
 // only once the watchdog goroutine has finished, so the caller owns the
 // capacity again from here on.
-func (watchdog *stallRelease) join() (released bool, releasedSyncLock bool) {
+func (watchdog *stallRelease) join() (bool, error) {
 	close(watchdog.stopped)
 	<-watchdog.finished
-	return watchdog.released, watchdog.releasedSyncLock
+	return watchdog.released, watchdog.err
 }
 
 // runReleasingCapacityIfStalled runs one store read, giving up this job's
@@ -248,11 +389,8 @@ func (watchdog *stallRelease) join() (released bool, releasedSyncLock bool) {
 // pays nothing, while a read parked behind a collection load Milvus never
 // finishes stops starving the jobs queued behind it.
 //
-// Once the holds are gone the job must take them back to keep writing, and that
-// resume is bounded: a replacement job or the external adapter may already have
-// taken what this job gave up, and waiting for it without a bound would restore
-// the job-length stall the release exists to prevent. Failing to resume is a
-// terminal, typed outcome rather than a silent continuation.
+// Once the holds are gone the job joins the scheduler with its original policy
+// and queue sequence. It stays visibly paused until both resources return.
 func (manager *Manager) runReleasingCapacityIfStalled(
 	ctx context.Context,
 	operation func() error,
@@ -264,37 +402,28 @@ func (manager *Manager) runReleasingCapacityIfStalled(
 
 	watchdog := startStallRelease(ctx, capacity, manager.jobCapacityTimings.ReleaseGrace)
 	operationErr := operation()
-	released, reacquireSyncLock := watchdog.join()
+	released, pauseErr := watchdog.join()
+	if pauseErr != nil {
+		return &jobCapacityReacquireError{Cause: pauseErr}
+	}
 	if !released {
 		return operationErr
 	}
 
-	reacquireCtx, cancel := context.WithTimeout(ctx, manager.jobCapacityTimings.Reacquire)
-	reacquired := capacity.acquire(reacquireCtx, reacquireSyncLock)
-	reacquireCause := reacquireCtx.Err()
-	cancel()
-	if reacquired {
-		return operationErr
+	outcome, reacquireErr := capacity.reacquire(ctx, capacity.holdSyncLock)
+	if outcome != syncLockAcquired {
+		capacity.release(context.WithoutCancel(ctx))
+		if outcome == syncLockFailed {
+			manager.updateJobFailed(context.WithoutCancel(ctx), capacity.jobID, reacquireErr)
+		} else {
+			manager.updateJobCancelled(context.WithoutCancel(ctx), capacity.jobID)
+		}
+		return &jobCapacityReacquireError{Cause: reacquireErr}
 	}
-
-	if operationErr != nil {
-		slog.ErrorContext(ctx, "read failed before indexing capacity reacquire",
-			"component", "daemon",
-			"subcomponent", "capacity",
-			"err", operationErr,
-		)
+	if err := manager.resumeJob(capacity.jobID); err != nil {
+		capacity.release(context.WithoutCancel(ctx))
+		manager.failScheduledJob(context.WithoutCancel(ctx), capacity.jobID, err)
+		return &jobCapacityReacquireError{Cause: err}
 	}
-	if reacquireCause == nil {
-		reacquireCause = errors.New("indexing capacity unavailable")
-	}
-	reacquireErr := &jobCapacityReacquireError{
-		Timeout: manager.jobCapacityTimings.Reacquire,
-		Cause:   reacquireCause,
-	}
-	slog.ErrorContext(ctx, "reacquire indexing capacity after read failed",
-		"component", "daemon",
-		"subcomponent", "capacity",
-		"err", reacquireErr,
-	)
-	return reacquireErr
+	return operationErr
 }

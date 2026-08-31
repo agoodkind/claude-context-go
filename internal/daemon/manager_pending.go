@@ -62,7 +62,7 @@ func (manager *Manager) activeJobLocked(codebase model.Codebase, indexConfig mod
 	switch activeJob.State {
 	case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
 		return emptyJob, activeJobNone, nil
-	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+	case model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling:
 	default:
 		return emptyJob, activeJobNone, fmt.Errorf("unknown job state %s for active job %s", activeJob.State, activeJob.ID)
 	}
@@ -176,6 +176,7 @@ func (manager *Manager) enqueueConversationJobLocked(current model.Codebase, cli
 	if err != nil {
 		return model.Job{}, err
 	}
+	effectivePolicy.Priority = model.JobPriorityNormal
 	job := newQueuedJob(
 		current.ID,
 		current.CanonicalPath,

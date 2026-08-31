@@ -1316,9 +1316,16 @@ func newTestManager(t *testing.T) (*Manager, config.Config, string) {
 	if err != nil {
 		t.Fatalf("NewManager returned error: %v", err)
 	}
-	// Close cached graph engines before the t.TempDir cleanup removes the graph
-	// db, otherwise the open SQLite handle races RemoveAll ("directory not empty").
-	t.Cleanup(manager.CloseGraphEngines)
+	// Stop queued, paused, and running work before the temp directories disappear.
+	// Close cached graph engines afterward so no SQLite handle races RemoveAll.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := manager.cancelAndWaitForJobs(ctx); err != nil {
+			t.Errorf("cancelAndWaitForJobs: %v", err)
+		}
+		manager.CloseGraphEngines()
+	})
 	return manager, cfg, repoPath
 }
 

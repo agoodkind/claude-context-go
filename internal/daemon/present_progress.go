@@ -54,7 +54,7 @@ func formatBoundaryTime(value time.Time) string {
 
 // progressHeading names the pass for an active job, empty otherwise.
 func progressHeading(job model.Job) string {
-	if job.State != model.JobStateQueued && job.State != model.JobStateRunning && job.State != model.JobStateCancelling {
+	if job.State != model.JobStateQueued && job.State != model.JobStateRunning && job.State != model.JobStatePaused && job.State != model.JobStateCancelling {
 		return ""
 	}
 	switch job.Progress.RunMode {
@@ -101,7 +101,7 @@ func resolveProgressSurface(job model.Job) view.ProgressSurface {
 		scopeUnit = "file"
 	}
 
-	active := job.State == model.JobStateQueued || job.State == model.JobStateRunning || job.State == model.JobStateCancelling
+	active := job.State == model.JobStateQueued || job.State == model.JobStateRunning || job.State == model.JobStatePaused || job.State == model.JobStateCancelling
 
 	percentLabel := fmt.Sprintf("%.1f%%", resolveOverallPercent(progress))
 	percentScopeLabel := percentLabel + " run progress"
@@ -223,6 +223,8 @@ func resolveListSummary(jobs []model.Job, pipelineDegraded bool) view.ListSummar
 			summary.Queued++
 		case model.JobStateRunning:
 			summary.Running++
+		case model.JobStatePaused:
+			summary.Queued++
 		case model.JobStateCancelling:
 			summary.Canceling++
 		case model.JobStateCompleted:

@@ -68,7 +68,8 @@ func (manager *Manager) StatusSnapshot() StatusSnapshot {
 	// every job this daemon has ever run, tens of thousands of them, and all but
 	// a handful are terminal; reserving one slot each would allocate megabytes on
 	// every refresh to hold a few live jobs.
-	activeJobs := make([]model.Job, 0, cap(manager.indexSlots))
+	schedulerSnapshot := manager.jobScheduler.Snapshot()
+	activeJobs := make([]model.Job, 0, schedulerSnapshot.Capacity)
 	for _, job := range manager.jobs {
 		if isTerminalJobState(job.State) {
 			continue
@@ -82,14 +83,22 @@ func (manager *Manager) StatusSnapshot() StatusSnapshot {
 
 	return StatusSnapshot{
 		StartedAt:       manager.startedAt,
-		IndexSlotsInUse: len(manager.indexSlots),
-		IndexSlotsTotal: cap(manager.indexSlots),
+		IndexSlotsInUse: schedulerRunningCount(schedulerSnapshot.Running),
+		IndexSlotsTotal: schedulerSnapshot.Capacity,
 		Health:          health,
 		ActiveJobs:      activeJobs,
 		Pending:         manager.pendingWorkLocked(),
 		Codebases:       manager.codebaseViewsLocked(),
 		Watcher:         watcher,
 	}
+}
+
+func schedulerRunningCount(counts map[model.JobPriority]int) int {
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	return total
 }
 
 func watcherActivityWithoutRegisteredConverges(

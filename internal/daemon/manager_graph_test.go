@@ -120,7 +120,7 @@ func TestRunJobAsyncRunsGraphIndexAfterSemanticLockAndSlotRelease(t *testing.T) 
 			observed <- fmt.Sprintf("probe sync lock returned error: %v", err)
 			return
 		}
-		slotCount := len(manager.indexSlots)
+		slotCount, _ := manager.IndexSlots()
 		if held || slotCount != 0 {
 			observed <- fmt.Sprintf("sync lock held = %t, index slot count = %d", held, slotCount)
 			return

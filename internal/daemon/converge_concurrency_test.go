@@ -648,9 +648,10 @@ func TestConvergeViaWatcherRunsCodebasesConcurrentlyUpToCap(t *testing.T) {
 	}
 }
 
-// TestConvergeViaWatcherDefersToExternalLock proves a converge yields when the
-// shared lock is held externally and requeues its paths instead of embedding.
-func TestConvergeViaWatcherDefersToExternalLock(t *testing.T) {
+// TestWatcherUsesSchedulerWhenExternalLockBusy proves a converge releases its
+// scheduler slot while an external process holds the sync lock, then resumes
+// the same queued job after the lock becomes available.
+func TestWatcherUsesSchedulerWhenExternalLockBusy(t *testing.T) {
 	manager, cfg := newTestManagerWithCap(t, 2)
 	var reindexCalls atomic.Int32
 	manager.semantic = &fakeSemantic{
@@ -660,11 +661,8 @@ func TestConvergeViaWatcherDefersToExternalLock(t *testing.T) {
 		},
 	}
 
-	var requeued atomic.Int32
 	syncer := NewBackgroundSync(cfg, manager)
-	// A short debounce lets the requeued path drain promptly; the drain just
-	// records the requeue rather than re-running the converge.
-	syncer.queue = NewEventQueue(20*time.Millisecond, func(string, []string) { requeued.Add(1) })
+	syncer.queue = NewEventQueue(time.Hour, func(string, []string) {})
 
 	canonical := newCapTestRepo(t)
 	codebaseID := "cb-external-lock"
@@ -692,12 +690,31 @@ func TestConvergeViaWatcherDefersToExternalLock(t *testing.T) {
 		t.Fatalf("Flock returned error: %v", err)
 	}
 
-	syncer.convergeViaWatcher(context.Background(), codebaseID, []string{"main.go"})
+	convergeDone := make(chan struct{})
+	go func() {
+		defer close(convergeDone)
+		syncer.convergeViaWatcher(context.Background(), codebaseID, []string{"main.go"})
+	}()
 
 	if got := reindexCalls.Load(); got != 0 {
 		t.Fatalf("converge embedded %d time(s) while the lock was held externally, want 0", got)
 	}
-	waitForCondition(t, func() bool { return requeued.Load() >= 1 })
+	waitForCondition(t, func() bool {
+		snapshot := manager.jobScheduler.Snapshot()
+		slots, _ := manager.IndexSlots()
+		return snapshot.Paused[model.JobPriorityNormal] == 1 && slots == 0
+	})
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock external holder: %v", err)
+	}
+	select {
+	case <-convergeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher converge did not resume after the external lock released")
+	}
+	if got := reindexCalls.Load(); got != 1 {
+		t.Fatalf("converge embedded %d time(s), want 1 after lock release", got)
+	}
 }
 
 // TestConvergeCopyChunksFiresOnRename proves a renamed file converges through

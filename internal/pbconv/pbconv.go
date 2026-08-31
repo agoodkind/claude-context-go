@@ -293,7 +293,7 @@ func jobOutcome(state model.JobState) string {
 		return "failed"
 	case model.JobStateCancelled:
 		return "canceled"
-	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+	case model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling:
 		return ""
 	default:
 		return ""

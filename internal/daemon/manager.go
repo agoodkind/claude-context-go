@@ -20,6 +20,7 @@ import (
 	"goodkind.io/lm-semantic-search/internal/gitworktree"
 	"goodkind.io/lm-semantic-search/internal/indexability"
 	"goodkind.io/lm-semantic-search/internal/indexer"
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
 	"goodkind.io/lm-semantic-search/internal/semantic"
 	"goodkind.io/lm-semantic-search/internal/spans"
@@ -75,6 +76,7 @@ type Manager struct {
 	// concurrent construction, never contaminate or race each other.
 	conversationChunkByteBudget int
 	mu                          sync.Mutex
+	transitionMutex             sync.Mutex
 	codebases                   map[string]model.Codebase
 	jobs                        map[string]model.Job
 	conversationJobs            map[string]conversationJobPayload
@@ -116,14 +118,12 @@ type Manager struct {
 	// entries that already have a converge job.
 	watcherActivity      WatcherActivityReporter
 	watcherActivityMutex sync.Mutex
-	// indexSlots caps concurrently running index jobs. Each runJob holds one
-	// buffered slot for its duration; jobs that cannot acquire a slot stay
-	// queued until one frees.
-	indexSlots chan struct{}
-	// jobCapacityTimings bounds how long a read may stall before the job frees
-	// its slot and the sync lock, and how long it may then wait to resume. They
-	// are settable so the public-boundary contention tests do not pay the
-	// production waits.
+	// jobScheduler owns admission across every indexing source. Jobs remain
+	// queued until its lease owns capacity.
+	jobScheduler *jobscheduler.Scheduler
+	// jobCapacityTimings bounds how long a read may stall before its scheduler
+	// lease yields. It is settable so the public-boundary contention tests do not
+	// pay the production wait.
 	jobCapacityTimings jobCapacityTimings
 	// syncLock is the process-wide refcounted hold of the daemon's kernel file
 	// lock. Index jobs and background converges take a reference for their embed,
@@ -203,6 +203,7 @@ func newManagerWithSemanticFactory(
 		config:                      cfg,
 		conversationChunkByteBudget: conversationChunkMaxBytes,
 		mu:                          sync.Mutex{},
+		transitionMutex:             sync.Mutex{},
 		codebases:                   map[string]model.Codebase{},
 		jobs:                        map[string]model.Job{},
 		conversationJobs:            map[string]conversationJobPayload{},
@@ -229,7 +230,7 @@ func newManagerWithSemanticFactory(
 		startedAt:                   clock.Now(),
 		watcherActivity:             nil,
 		watcherActivityMutex:        sync.Mutex{},
-		indexSlots:                  make(chan struct{}, max(1, cfg.MaxConcurrentIndexJobs)),
+		jobScheduler:                jobscheduler.New(max(1, cfg.MaxConcurrentIndexJobs)),
 		jobCapacityTimings:          defaultJobCapacityTimings(),
 		syncLock:                    newSyncLock(filepath.Join(cfg.ContextRoot, "mcp-sync.flock"), cfg.ContextRoot),
 		health:                      dependencyHealth{Mode: dependencyHealthy, Since: time.Time{}, StoreReachableAt: time.Time{}, EmbedderReachableAt: time.Time{}},
@@ -771,13 +772,8 @@ func (manager *Manager) ClearIndex(ctx context.Context, requestedPath string, cl
 	// call is about to remove.
 	delete(manager.pendingConversationJobs, codebase.ID)
 	delete(manager.pendingCodeJobs, codebase.ID)
-	jobDone, cancel := manager.beginActiveJobCancellationLocked(codebase)
 	manager.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if err := waitForJobDone(ctx, jobDone); err != nil {
+	if err := manager.cancelActiveJobForPath(ctx, codebase.CanonicalPath); err != nil {
 		return model.Codebase{}, err
 	}
 
@@ -819,69 +815,6 @@ func (manager *Manager) ClearIndex(ctx context.Context, requestedPath string, cl
 	manager.mu.Unlock()
 	manager.notifyCodebaseRemoved(ctx, current.ID)
 	return current, nil
-}
-
-// CancelJob marks a tracked job as cancelled.
-func (manager *Manager) CancelJob(ctx context.Context, jobID string) (model.Job, error) {
-	manager.mu.Lock()
-
-	job, found := manager.jobs[jobID]
-	if !found {
-		manager.mu.Unlock()
-		return model.Job{}, fmt.Errorf("job not found: %s", jobID)
-	}
-	if job.State == model.JobStateCompleted || job.State == model.JobStateFailed || job.State == model.JobStateCancelled {
-		manager.mu.Unlock()
-		return job, nil
-	}
-	delete(manager.conversationJobs, jobID)
-
-	cancel, found := manager.cancels[jobID]
-	if found {
-		cancel()
-		delete(manager.cancels, jobID)
-	}
-
-	now := clock.Now()
-	job.State = model.JobStateCancelled
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "cancelled"
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	if err := manager.appendJobLocked("cancel_job", job); err != nil {
-		manager.mu.Unlock()
-		return model.Job{}, err
-	}
-
-	codebaseID := job.CodebaseID
-	var saveErr error
-	drainedJobID := ""
-	drained := false
-	codebase, found := manager.codebases[job.CodebaseID]
-	if found && codebase.ActiveJobID == job.ID {
-		// A cancellation is not a failure: leave the codebase at its last-good
-		// state so a status check reflects the current usable state.
-		codebase.ActiveJobID = ""
-		codebase.UpdatedAt = now
-		manager.codebases[codebase.ID] = codebase
-		if err := manager.saveLocked(); err != nil {
-			saveErr = err
-		}
-		// A submission coalesced onto this now-cancelled job still runs: drain the
-		// depth-1 pending slot into a fresh successor.
-		drainedJobID, drained = manager.drainPendingJobLocked(ctx, codebase.ID)
-	}
-
-	manager.mu.Unlock()
-	manager.notifyIndexStopped(ctx, codebaseID)
-	if drained {
-		manager.runDrainedJob(ctx, codebaseID, drainedJobID)
-	}
-	if saveErr != nil {
-		return model.Job{}, saveErr
-	}
-	return job, nil
 }
 
 // Codebase lifecycle hook plumbing lives in manager_lifecycle.go.
