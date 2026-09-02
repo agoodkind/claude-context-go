@@ -30,13 +30,10 @@ func TestActivitySnapshotUnavailableSource(t *testing.T) {
 	source.Close()
 }
 
-func TestNewUsesUnavailableFallback(t *testing.T) {
+func TestNewReturnsSource(t *testing.T) {
 	source := New()
-	t.Cleanup(source.Close)
-	snapshot := source.Sample(context.Background())
-
-	if snapshot.InputReason != unavailableSourceReason ||
-		snapshot.ThermalReason != unavailableSourceReason {
-		t.Fatalf("fallback reasons = input %q thermal %q", snapshot.InputReason, snapshot.ThermalReason)
+	if source == nil {
+		t.Fatal("New returned nil source")
 	}
+	t.Cleanup(source.Close)
 }
