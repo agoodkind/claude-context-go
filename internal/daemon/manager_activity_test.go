@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -164,7 +165,7 @@ func TestStatusSnapshotSeesADrainingSlotExactlyOnce(t *testing.T) {
 		jobs:                    map[string]model.Job{},
 		pendingCodeJobs:         map[string]pendingCodeRequest{codebaseID: {}},
 		pendingConversationJobs: map[string]conversationJobPayload{},
-		jobScheduler:            jobscheduler.New(1),
+		jobScheduler:            jobscheduler.New(context.Background(), 1, nil),
 	}
 
 	// Move the slot into the job store the way drainPendingJobLocked does, under
@@ -217,7 +218,7 @@ func TestStatusSnapshotOmitsTerminalJobs(t *testing.T) {
 		},
 		pendingCodeJobs:         map[string]pendingCodeRequest{},
 		pendingConversationJobs: map[string]conversationJobPayload{},
-		jobScheduler:            jobscheduler.New(4),
+		jobScheduler:            jobscheduler.New(context.Background(), 4, nil),
 	}
 
 	snapshot := manager.StatusSnapshot()
@@ -248,7 +249,7 @@ func TestStatusSnapshotResolvesHealthLikeEverySurface(t *testing.T) {
 			jobs:                    map[string]model.Job{},
 			pendingCodeJobs:         map[string]pendingCodeRequest{},
 			pendingConversationJobs: map[string]conversationJobPayload{},
-			jobScheduler:            jobscheduler.New(1),
+			jobScheduler:            jobscheduler.New(context.Background(), 1, nil),
 			semantic:                nil,
 			health: dependencyHealth{
 				Mode:  dependencyStoreUnavailable,

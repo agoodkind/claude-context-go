@@ -3,9 +3,24 @@ package daemon
 import (
 	"context"
 	"testing"
+	"time"
 
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
+	"goodkind.io/lm-semantic-search/internal/platformactivity"
 )
+
+type readyActivitySource struct{}
+
+func (readyActivitySource) Sample(context.Context) platformactivity.Snapshot {
+	return platformactivity.Snapshot{
+		InputAvailable:   true,
+		InputIdleFor:     24 * time.Hour,
+		ThermalAvailable: false,
+	}
+}
+
+func (readyActivitySource) Close() {}
 
 func TestFirstExplicitIndexPersistsPolicyAfterDiscovery(t *testing.T) {
 	manager, _, repoPath := newTestManager(t)
@@ -59,6 +74,9 @@ func TestFirstExplicitIndexPersistsPolicyAfterDiscovery(t *testing.T) {
 
 func TestExistingCodebaseUsesIndexPolicyForOneRun(t *testing.T) {
 	manager, _, repoPath := newTestManager(t)
+	manager.jobScheduler.Close()
+	manager.jobScheduler = jobscheduler.New(context.Background(), 1, readyActivitySource{})
+	t.Cleanup(manager.jobScheduler.Close)
 	canonicalPath, err := manager.resolveCanonicalPath(repoPath)
 	if err != nil {
 		t.Fatalf("resolveCanonicalPath: %v", err)

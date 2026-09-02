@@ -10,11 +10,13 @@ type semanticCloser interface {
 	Close(ctx context.Context) error
 }
 
-// Close shuts down the manager's graph and semantic resources.
+// Close shuts down the manager's activity, graph, journal, and semantic resources.
 func (manager *Manager) Close(ctx context.Context) error {
 	if err := manager.cancelAndWaitForJobs(ctx); err != nil {
 		return err
 	}
+	manager.jobScheduler.Close()
+	manager.closeJobJournal()
 	manager.CloseGraphEngines()
 	closer, ok := manager.semantic.(semanticCloser)
 	if !ok {

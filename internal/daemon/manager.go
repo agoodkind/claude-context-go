@@ -22,6 +22,7 @@ import (
 	"goodkind.io/lm-semantic-search/internal/indexer"
 	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
+	"goodkind.io/lm-semantic-search/internal/platformactivity"
 	"goodkind.io/lm-semantic-search/internal/semantic"
 	"goodkind.io/lm-semantic-search/internal/spans"
 	"goodkind.io/lm-semantic-search/internal/store"
@@ -190,6 +191,11 @@ type indexingRunner interface {
 	IndexOne(context.Context, *indexability.Resolver, string, string, string, model.IndexConfig) (indexer.OneFileResult, error)
 }
 
+type managerDependencies struct {
+	semanticFactory func(context.Context, config.Config) (semanticIndex, error)
+	activitySource  platformactivity.Source
+}
+
 // NewManager loads persisted daemon state from disk.
 func NewManager(ctx context.Context, cfg config.Config) (*Manager, error) {
 	return newManagerWithSemanticFactory(ctx, cfg, newSemanticIndex)
@@ -199,6 +205,17 @@ func newManagerWithSemanticFactory(
 	ctx context.Context,
 	cfg config.Config,
 	semanticFactory func(context.Context, config.Config) (semanticIndex, error),
+) (*Manager, error) {
+	return newManagerWithDependencies(ctx, cfg, managerDependencies{
+		semanticFactory: semanticFactory,
+		activitySource:  platformactivity.New(),
+	})
+}
+
+func newManagerWithDependencies(
+	ctx context.Context,
+	cfg config.Config,
+	dependencies managerDependencies,
 ) (*Manager, error) {
 	manager := &Manager{
 		config:                      cfg,
@@ -232,7 +249,11 @@ func newManagerWithSemanticFactory(
 		startedAt:                   clock.Now(),
 		watcherActivity:             nil,
 		watcherActivityMutex:        sync.Mutex{},
-		jobScheduler:                jobscheduler.New(max(1, cfg.MaxConcurrentIndexJobs)),
+		jobScheduler: jobscheduler.New(
+			ctx,
+			max(1, cfg.MaxConcurrentIndexJobs),
+			dependencies.activitySource,
+		),
 		jobCapacityTimings:          defaultJobCapacityTimings(),
 		syncLock:                    newSyncLock(filepath.Join(cfg.ContextRoot, "mcp-sync.flock"), cfg.ContextRoot),
 		health:                      dependencyHealth{Mode: dependencyHealthy, Since: time.Time{}, StoreReachableAt: time.Time{}, EmbedderReachableAt: time.Time{}},
@@ -256,6 +277,7 @@ func newManagerWithSemanticFactory(
 	}
 	if err := store.EnsureDir(cfg.GraphDir); err != nil {
 		slog.ErrorContext(ctx, "create graph cache directory failed", "path", cfg.GraphDir, "err", err)
+		manager.jobScheduler.Close()
 		return nil, fmt.Errorf("create graph cache directory: %w", err)
 	}
 	// Force the cbm engine to a single worker. Its parallel extraction worker
@@ -264,6 +286,7 @@ func newManagerWithSemanticFactory(
 	// background, non-fatal pass, so the lost parallelism is acceptable.
 	if err := os.Setenv("CBM_WORKERS", "1"); err != nil {
 		slog.ErrorContext(ctx, "set cbm worker count failed", "err", err)
+		manager.jobScheduler.Close()
 		return nil, fmt.Errorf("set cbm worker count: %w", err)
 	}
 	// The resolver reads each codebase's custom ignore patterns straight from the
@@ -273,8 +296,9 @@ func newManagerWithSemanticFactory(
 	// The observer is the sole caller of the resolver's invalidate, so every
 	// consumer signals it instead of invalidating the cache itself.
 	manager.observer = newIgnoreObserver(manager.indexability)
-	semanticBackend, err := semanticFactory(ctx, cfg)
+	semanticBackend, err := dependencies.semanticFactory(ctx, cfg)
 	if err != nil {
+		manager.jobScheduler.Close()
 		return nil, err
 	}
 	manager.semantic = semanticBackend
