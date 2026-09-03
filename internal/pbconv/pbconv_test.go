@@ -122,14 +122,14 @@ func TestSchedulingReasonProtoConversionIsClosed(t *testing.T) {
 		model.SchedulingReasonThermalSafety:       pb.SchedulingReason_SCHEDULING_REASON_THERMAL_SAFETY,
 	}
 	for modelReason, protoReason := range testCases {
-		if got := schedulingReasonToProto(modelReason); got != protoReason {
+		if got := SchedulingReasonToProto(modelReason); got != protoReason {
 			t.Errorf("reason %q converts to %v, want %v", modelReason, got, protoReason)
 		}
 		if got := schedulingReasonFromProto(protoReason); got != modelReason {
 			t.Errorf("reason %v converts to %q, want %q", protoReason, got, modelReason)
 		}
 	}
-	if got := schedulingReasonToProto(model.SchedulingReason("free-form")); got != pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED {
+	if got := SchedulingReasonToProto(model.SchedulingReason("free-form")); got != pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED {
 		t.Fatalf("free-form model reason converts to %v, want unspecified", got)
 	}
 	if got := schedulingReasonFromProto(pb.SchedulingReason(99)); got != model.SchedulingReasonUnspecified {

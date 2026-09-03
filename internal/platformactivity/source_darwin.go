@@ -12,11 +12,13 @@ import (
 	"context"
 	"math"
 	"time"
+
+	"goodkind.io/lm-semantic-search/internal/model"
 )
 
 const (
-	inputUnavailableReason = "input activity unavailable"
-	thermalUnsafeReason    = "thermal state unsafe"
+	inputUnavailableReason = model.SchedulingReasonActivityUnavailable
+	thermalUnsafeReason    = model.SchedulingReasonThermalSafety
 )
 
 type darwinSource struct {

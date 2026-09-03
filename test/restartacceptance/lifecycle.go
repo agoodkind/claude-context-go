@@ -15,7 +15,7 @@ import (
 
 const restartAcceptanceCleanupTimeout = 2 * time.Minute
 
-var acceptanceScenarioNames = []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+var acceptanceScenarioNames = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}
 
 type acceptanceLifecycleOperations struct {
 	Prepare      func(context.Context) (acceptanceRun, error)
