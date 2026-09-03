@@ -1,6 +1,9 @@
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // DefaultIdleAfterSeconds is the idle threshold for a new policy.
 const DefaultIdleAfterSeconds int32 = 300
@@ -16,6 +19,46 @@ const (
 	// JobPriorityLow runs after high and normal priority work.
 	JobPriorityLow JobPriority = "low"
 )
+
+// SchedulingReason names why a queued or paused job cannot run.
+type SchedulingReason string
+
+const (
+	// SchedulingReasonUnspecified means no policy reason applies.
+	SchedulingReasonUnspecified SchedulingReason = ""
+	// SchedulingReasonHigherPriorityWork means higher-priority work owns capacity.
+	SchedulingReasonHigherPriorityWork SchedulingReason = "higher-priority work"
+	// SchedulingReasonUserActive means the configured input-idle threshold has not elapsed.
+	SchedulingReasonUserActive SchedulingReason = "user active"
+	// SchedulingReasonActivityUnavailable means user activity cannot be observed.
+	SchedulingReasonActivityUnavailable SchedulingReason = "activity unavailable"
+	// SchedulingReasonThermalSafety means the host thermal state blocks quiet work.
+	SchedulingReasonThermalSafety SchedulingReason = "thermal safety"
+)
+
+// CanonicalSchedulingReason maps internal and legacy reason text onto the
+// closed reason vocabulary. Unknown text becomes unspecified.
+func CanonicalSchedulingReason(value string) SchedulingReason {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case normalized == string(SchedulingReasonHigherPriorityWork):
+		return SchedulingReasonHigherPriorityWork
+	case normalized == string(SchedulingReasonUserActive),
+		normalized == "input active",
+		normalized == "waiting for input idle":
+		return SchedulingReasonUserActive
+	case normalized == string(SchedulingReasonActivityUnavailable),
+		normalized == "input activity unavailable",
+		strings.Contains(normalized, "activity source"):
+		return SchedulingReasonActivityUnavailable
+	case normalized == string(SchedulingReasonThermalSafety),
+		normalized == "thermal state unsafe",
+		normalized == "thermal pressure":
+		return SchedulingReasonThermalSafety
+	default:
+		return SchedulingReasonUnspecified
+	}
+}
 
 // SchedulingPolicy stores a codebase's queue behavior.
 type SchedulingPolicy struct {

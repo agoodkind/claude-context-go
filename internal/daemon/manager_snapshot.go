@@ -4,6 +4,7 @@ import (
 	"sort"
 	"time"
 
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
 )
 
@@ -18,10 +19,9 @@ import (
 type StatusSnapshot struct {
 	// StartedAt is when this daemon process built its manager.
 	StartedAt time.Time
-	// IndexSlotsInUse and IndexSlotsTotal explain a job that is queued behind
-	// capacity rather than behind a dependency.
-	IndexSlotsInUse int
-	IndexSlotsTotal int
+	// Scheduler carries capacity, per-priority work counts, and the activity
+	// sample cached by the scheduler's background sampler.
+	Scheduler jobscheduler.Snapshot
 	// Health is the shared-dependency record, resolved the same way every other
 	// surface resolves it. It is read once and carried here, because reading it
 	// is not pure: it clears a boot-time store banner once the client has
@@ -39,9 +39,9 @@ type StatusSnapshot struct {
 	// job. The syncer owns the admission state under its own lock, and the
 	// snapshot filters entries that the job store can already report.
 	//
-	// They are not atomic with IndexSlotsInUse either, because a running converge
-	// holds an index slot and no single lock covers both the syncer's set and the
-	// slot channel. The read order makes the skew one-directional: a converge
+	// They are not atomic with Scheduler either, because a running converge holds
+	// a scheduler lease and no single lock covers both the syncer's set and the
+	// scheduler. The read order makes the skew one-directional: a converge
 	// that ends mid-read still shows its row while the slot count has already
 	// dropped, so the reply over-reports work for one poll rather than showing an
 	// occupied slot no row accounts for.
@@ -74,6 +74,7 @@ func (manager *Manager) StatusSnapshot() StatusSnapshot {
 		if isTerminalJobState(job.State) {
 			continue
 		}
+		job = jobWithSchedulerReason(job, schedulerSnapshot.Reasons)
 		activeJobs = append(activeJobs, job)
 	}
 	sort.Slice(activeJobs, func(first int, second int) bool {
@@ -82,23 +83,33 @@ func (manager *Manager) StatusSnapshot() StatusSnapshot {
 	watcher = watcherActivityWithoutRegisteredConverges(watcher, activeJobs)
 
 	return StatusSnapshot{
-		StartedAt:       manager.startedAt,
-		IndexSlotsInUse: schedulerRunningCount(schedulerSnapshot.Running),
-		IndexSlotsTotal: schedulerSnapshot.Capacity,
-		Health:          health,
-		ActiveJobs:      activeJobs,
-		Pending:         manager.pendingWorkLocked(),
-		Codebases:       manager.codebaseViewsLocked(),
-		Watcher:         watcher,
+		StartedAt:  manager.startedAt,
+		Scheduler:  schedulerSnapshot,
+		Health:     health,
+		ActiveJobs: activeJobs,
+		Pending:    manager.pendingWorkLocked(),
+		Codebases:  manager.codebaseViewsLocked(),
+		Watcher:    watcher,
 	}
 }
 
-func schedulerRunningCount(counts map[model.JobPriority]int) int {
-	total := 0
-	for _, count := range counts {
-		total += count
+func jobWithSchedulerReason(
+	job model.Job,
+	reasons map[string]model.SchedulingReason,
+) model.Job {
+	if job.State != model.JobStateQueued && job.State != model.JobStatePaused {
+		job.SchedulingReason = model.SchedulingReasonUnspecified
+		return job
 	}
-	return total
+	reason, found := reasons[job.ID]
+	if found {
+		job.SchedulingReason = model.CanonicalSchedulingReason(string(reason))
+		return job
+	}
+	job.SchedulingReason = model.CanonicalSchedulingReason(
+		string(job.SchedulingReason),
+	)
+	return job
 }
 
 func watcherActivityWithoutRegisteredConverges(

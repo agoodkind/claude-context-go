@@ -74,7 +74,7 @@ func newQueuedJob(
 			IdleAfterSeconds: nil,
 		},
 		QueueSequence:    0,
-		SchedulingReason: "",
+		SchedulingReason: model.SchedulingReasonUnspecified,
 		StartedAt:        now,
 		UpdatedAt:        now,
 		CompletedAt:      nil,
