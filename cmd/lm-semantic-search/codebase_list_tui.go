@@ -253,7 +253,10 @@ func (m listModel) clampOffset() listModel {
 
 // visibleRows is the number of data rows that fit between the header and footer.
 func (m listModel) visibleRows() int {
-	const chromeRows = 4 // header, rule, blank, footer
+	chromeRows := 4 // header, rule, selected policy, footer
+	if m.bannerLine() != "" {
+		chromeRows++
+	}
 	height := m.height
 	if height <= 0 {
 		height = len(m.codebases) + chromeRows
@@ -305,6 +308,7 @@ func (m listModel) listView() string {
 	for index := m.offset; index < end; index++ {
 		lines = append(lines, m.renderRow(m.codebases[index], index == m.cursor, widths))
 	}
+	lines = append(lines, m.policyLine())
 	lines = append(lines, m.footerLine())
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -423,6 +427,25 @@ func (m listModel) columnWidths() colWidths {
 
 func lineWidth(widths colWidths) int {
 	return 2 + widths.name + widths.status + widths.files + widths.id + widths.path + 4*len(columnGap)
+}
+
+func (m listModel) policyLine() string {
+	policy := "unavailable"
+	if m.cursor >= 0 && m.cursor < len(m.codebases) {
+		if resolved := schedulingPolicyCell(m.codebases[m.cursor]); resolved != "" {
+			policy = resolved
+		}
+	}
+	return faintStyle.Render("Stored policy: " + policy)
+}
+
+func schedulingPolicyCell(codebase *pb.Codebase) string {
+	scheduling := pbconv.SchedulingFromProto(
+		codebase.GetSchedulingPolicy(),
+		"",
+		pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED,
+	)
+	return render.SchedulingPolicy(scheduling)
 }
 
 func refreshCmd(options cliOptions) tea.Cmd {

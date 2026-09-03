@@ -231,8 +231,8 @@ func TestStatusSnapshotOmitsTerminalJobs(t *testing.T) {
 			t.Fatalf("terminal job %q reached the snapshot", job.ID)
 		}
 	}
-	if snapshot.IndexSlotsTotal != 4 {
-		t.Fatalf("index slots total = %d, want 4", snapshot.IndexSlotsTotal)
+	if snapshot.Scheduler.Capacity != 4 {
+		t.Fatalf("scheduler capacity = %d, want 4", snapshot.Scheduler.Capacity)
 	}
 }
 

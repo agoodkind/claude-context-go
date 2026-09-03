@@ -21,6 +21,7 @@
 - Activity unavailability keeps quiet work queued or paused. Missing thermal data does not block work.
 - GPU load, power draw, and ordinary temperature movement never define quiet eligibility.
 - Scheduling fields stay outside `IndexConfig` and never affect Merkle, collection, schema, or chunk identity.
+- Scheduling reasons use a closed model type and protobuf enum. Presentation code maps them to human labels.
 - Conversation jobs remain normal priority but participate in global admission and preemption.
 - The scheduler lease is the only owner of indexing capacity and the shared sync-lock lease.
 - Pause and resume journal events must reach a synchronous file flush before work releases or regains writable capacity.
@@ -59,7 +60,7 @@
 
 **Interfaces:**
 - Produces: `model.JobPriority`, `model.SchedulingPolicy`, `model.SchedulingPolicyPatch`, `model.DefaultSchedulingPolicy()`, `model.ValidateSchedulingPolicy(model.SchedulingPolicy) error`, and `model.ApplySchedulingPolicyPatch(model.SchedulingPolicy, model.SchedulingPolicyPatch) (model.SchedulingPolicy, error)`.
-- Produces: `model.JobStatePaused`, stored codebase policy, `PolicyPendingInitialization`, job effective policy, `QueueSequence`, and `SchedulingReason`.
+- Produces: `model.JobStatePaused`, stored codebase policy, `PolicyPendingInitialization`, job effective policy, `QueueSequence`, `model.SchedulingReason`, and `model.CanonicalSchedulingReason(string) model.SchedulingReason`.
 - Consumes: nothing from later tasks.
 
 - [ ] **Step 1: Write failing model and registry tests**
@@ -135,6 +136,16 @@ const (
     JobPriorityLow    JobPriority = "low"
 )
 
+type SchedulingReason string
+
+const (
+    SchedulingReasonUnspecified         SchedulingReason = ""
+    SchedulingReasonHigherPriorityWork SchedulingReason = "higher-priority work"
+    SchedulingReasonUserActive         SchedulingReason = "user active"
+    SchedulingReasonActivityUnavailable SchedulingReason = "activity unavailable"
+    SchedulingReasonThermalSafety      SchedulingReason = "thermal safety"
+)
+
 type SchedulingPolicy struct {
     Priority         JobPriority `json:"priority,omitempty"`
     Quiet            bool        `json:"quiet,omitempty"`
@@ -185,10 +196,11 @@ to `Codebase`, and these fields to `Job`:
 EffectiveSchedulingPolicy SchedulingPolicy `json:"effective_scheduling_policy,omitzero"`
 SchedulingOverride        SchedulingPolicyPatch `json:"scheduling_override,omitzero"`
 QueueSequence             uint64           `json:"queue_sequence,omitempty"`
-SchedulingReason          string           `json:"scheduling_reason,omitempty"`
+SchedulingReason          SchedulingReason `json:"scheduling_reason,omitempty"`
 ```
 
 Add `JobStatePaused = "paused"`. Normalize missing policies after registry and journal load. Keep legacy codebases initialized. Mark only newly discovered, unbuilt worktrees pending initialization. Keep adopted collections initialized.
+Normalize legacy scheduling-reason text through `CanonicalSchedulingReason`; unknown values become `SchedulingReasonUnspecified`.
 
 - [ ] **Step 5: Run focused tests and all checks**
 
@@ -412,7 +424,7 @@ type schedulerEntry struct {
     Policy         model.SchedulingPolicy
     QueueSequence  uint64
     State          schedulerEntryState
-    Reason         string
+    Reason         model.SchedulingReason
     PauseRequested bool
 }
 
@@ -873,6 +885,14 @@ enum SchedulingPriority {
   SCHEDULING_PRIORITY_LOW = 3;
 }
 
+enum SchedulingReason {
+  SCHEDULING_REASON_UNSPECIFIED = 0;
+  SCHEDULING_REASON_HIGHER_PRIORITY_WORK = 1;
+  SCHEDULING_REASON_USER_ACTIVE = 2;
+  SCHEDULING_REASON_ACTIVITY_UNAVAILABLE = 3;
+  SCHEDULING_REASON_THERMAL_SAFETY = 4;
+}
+
 message SchedulingPolicy {
   SchedulingPriority priority = 1;
   bool quiet = 2;
@@ -886,7 +906,7 @@ message SchedulingPolicyPatch {
 }
 ```
 
-Use `Codebase.scheduling_policy=19`, `Codebase.policy_pending_initialization=20`, `Job.effective_scheduling_policy=21`, `Job.queue_sequence=22`, and `Job.scheduling_reason=23`. Use `StartIndexRequest.scheduling_policy=9` and `SyncIndexRequest.scheduling_policy=3`.
+Use `Codebase.scheduling_policy=19`, `Codebase.policy_pending_initialization=20`, `Job.effective_scheduling_policy=21`, `Job.queue_sequence=22`, and enum-typed `Job.scheduling_reason=23`. Use `StartIndexRequest.scheduling_policy=9` and `SyncIndexRequest.scheduling_policy=3`.
 
 Add `UpdateCodebasePolicy` to the service. Its request uses `path=1`, `patch=2`, and `client=3`. Its response uses `codebase=1` and `display_text=2`.
 

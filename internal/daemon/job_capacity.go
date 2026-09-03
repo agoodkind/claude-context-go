@@ -22,8 +22,8 @@ const (
 	// take.
 	defaultJobCapacityReleaseGrace = 4500 * time.Millisecond
 
-	stalledReadSchedulingReason = "stalled read"
-	syncLockSchedulingReason    = "waiting for sync lock"
+	stalledReadSchedulingReason = model.SchedulingReasonUnspecified
+	syncLockSchedulingReason    = model.SchedulingReasonUnspecified
 )
 
 type jobCapacityContextKey struct{}
@@ -253,7 +253,7 @@ func (capacity *jobCapacity) yieldClaim(
 func (capacity *jobCapacity) retryAfter(
 	ctx context.Context,
 	delay time.Duration,
-	reason string,
+	reason model.SchedulingReason,
 ) error {
 	capacity.mu.Lock()
 	if capacity.released {

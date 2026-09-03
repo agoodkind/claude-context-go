@@ -67,6 +67,20 @@ func TestResolvePendingAndLoading(t *testing.T) {
 	}
 }
 
+func TestPausedCodebaseResolvesWaiting(t *testing.T) {
+	t.Parallel()
+
+	surface := Resolve(Inputs{
+		Status:        model.CodebaseStatusIndexing,
+		HasActiveJob:  true,
+		JobPaused:     true,
+		JobScopeKnown: true,
+	})
+	if surface.Display != DisplayWaiting {
+		t.Fatalf("paused display = %q, want %q", surface.Display, DisplayWaiting)
+	}
+}
+
 func TestResolveIdleCollectionAcceptsSearch(t *testing.T) {
 	t.Parallel()
 

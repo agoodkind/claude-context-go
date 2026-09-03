@@ -295,7 +295,7 @@ type Job struct {
 	EffectiveSchedulingPolicy SchedulingPolicy      `json:"effective_scheduling_policy,omitzero"`
 	SchedulingOverride        SchedulingPolicyPatch `json:"scheduling_override,omitzero"`
 	QueueSequence             uint64                `json:"queue_sequence,omitempty"`
-	SchedulingReason          string                `json:"scheduling_reason,omitempty"`
+	SchedulingReason          SchedulingReason      `json:"scheduling_reason,omitempty"`
 	StartedAt                 time.Time             `json:"started_at"`
 	UpdatedAt                 time.Time             `json:"updated_at"`
 	CompletedAt               *time.Time            `json:"completed_at,omitempty"`

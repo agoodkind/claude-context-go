@@ -25,6 +25,33 @@ func TestListModelViewShowsRecords(t *testing.T) {
 	}
 }
 
+func TestListModelViewShowsStoredSchedulingPolicy(t *testing.T) {
+	codebases := []*pb.Codebase{{
+		Id:            "cb_1_aaaa",
+		CanonicalPath: "/tmp/alpha",
+		DisplayStatus: "indexed",
+		GlyphToken:    "✓",
+		StatusLabel:   "indexed",
+		SchedulingPolicy: &pb.SchedulingPolicy{
+			Priority:         pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW,
+			Quiet:            true,
+			IdleAfterSeconds: 600,
+		},
+	}}
+	model := newListModel(cliOptions{}, codebases, nil)
+	model.width = 160
+
+	output := model.View()
+	for _, want := range []string{
+		"Stored policy:",
+		"priority=low · quiet=on · idle_after=10m",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("View() missing scheduling value %q\n%s", want, output)
+		}
+	}
+}
+
 // TestListRowRendersDaemonTokens proves a row renders the daemon-provided glyph
 // and label tokens rather than a client-side map, so the CLI shares the daemon's
 // status vocabulary including "waiting".

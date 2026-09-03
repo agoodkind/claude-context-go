@@ -137,6 +137,209 @@ func TestBreakdownIdenticalAcrossAllSurfaces(t *testing.T) {
 	}
 }
 
+func TestSchedulingIdenticalAcrossAllSurfaces(t *testing.T) {
+	t.Parallel()
+
+	policy := model.SchedulingPolicy{
+		Priority:         model.JobPriorityLow,
+		Quiet:            true,
+		IdleAfterSeconds: 600,
+	}
+	want := "priority=low · quiet=on · idle_after=10m"
+	scheduling := view.ResolveScheduling(
+		string(policy.Priority),
+		policy.Quiet,
+		policy.IdleAfterSeconds,
+		string(model.JobStatePaused),
+		view.SchedulingReasonUserActive,
+	)
+	if got := render.SchedulingPolicy(scheduling); got != want {
+		t.Fatalf("shared scheduling render = %q, want %q", got, want)
+	}
+	if scheduling.Reason != "user active" {
+		t.Fatalf("shared scheduling reason = %q, want user active", scheduling.Reason)
+	}
+
+	job := model.Job{
+		ID:                        "job-scheduling",
+		CanonicalPath:             "/repo",
+		Operation:                 "sync",
+		State:                     model.JobStatePaused,
+		EffectiveSchedulingPolicy: policy,
+		SchedulingReason:          model.SchedulingReasonUserActive,
+	}
+	daemonText := render.GetJob(resolveJobEntry(job, false, ""), true)
+	for _, expected := range []string{
+		"State: paused",
+		"Effective policy: " + want,
+		"Waiting: user active",
+	} {
+		if !strings.Contains(daemonText, expected) {
+			t.Fatalf("job display missing %q:\n%s", expected, daemonText)
+		}
+	}
+
+	wire := pbconv.ToJob(job)
+	if wire.GetSchedulingReason() != pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE {
+		t.Fatalf(
+			"wire scheduling reason = %v, want user active",
+			wire.GetSchedulingReason(),
+		)
+	}
+	protoRender := render.SchedulingPolicy(pbconv.SchedulingFromProto(
+		wire.GetEffectiveSchedulingPolicy(),
+		wire.GetState(),
+		wire.GetSchedulingReason(),
+	))
+	if protoRender != want {
+		t.Fatalf("proto scheduling render = %q, want %q", protoRender, want)
+	}
+
+	data, err := protojson.Marshal(wire)
+	if err != nil {
+		t.Fatalf("protojson.Marshal returned error: %v", err)
+	}
+	if !strings.Contains(
+		string(data),
+		`"schedulingReason":"SCHEDULING_REASON_USER_ACTIVE"`,
+	) {
+		t.Fatalf("JSON job omitted the canonical reason enum: %s", data)
+	}
+	var decoded pb.Job
+	if err := protojson.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("protojson.Unmarshal returned error: %v", err)
+	}
+	if decoded.GetEffectiveSchedulingPolicy() == nil {
+		t.Fatalf("JSON job omitted structured effective policy: %s", data)
+	}
+	jsonRender := render.SchedulingPolicy(pbconv.SchedulingFromProto(
+		decoded.GetEffectiveSchedulingPolicy(),
+		decoded.GetState(),
+		decoded.GetSchedulingReason(),
+	))
+	if jsonRender != want {
+		t.Fatalf("JSON scheduling render = %q, want %q", jsonRender, want)
+	}
+}
+
+func TestStoredSchedulingPolicyRendersInCodebaseStatusAndList(t *testing.T) {
+	t.Parallel()
+
+	codebase := &model.Codebase{
+		ID:            "cb-scheduling",
+		CanonicalPath: "/repo",
+		Status:        model.CodebaseStatusIndexed,
+		SchedulingPolicy: model.SchedulingPolicy{
+			Priority:         model.JobPriorityHigh,
+			Quiet:            false,
+			IdleAfterSeconds: 300,
+		},
+	}
+	want := "priority=high · quiet=off · idle_after=5m"
+	statusText := renderReadyStatusForTest(codebase)
+	if !strings.Contains(statusText, "Stored policy: "+want) {
+		t.Fatalf("codebase status missing stored policy:\n%s", statusText)
+	}
+
+	scheduling := view.ResolveScheduling(
+		string(codebase.SchedulingPolicy.Priority),
+		codebase.SchedulingPolicy.Quiet,
+		codebase.SchedulingPolicy.IdleAfterSeconds,
+		"",
+		view.SchedulingReasonUnspecified,
+	)
+	listText := render.ListIndexes([]view.CodebaseRowView{{
+		ID:            codebase.ID,
+		CanonicalPath: codebase.CanonicalPath,
+		Display:       view.Display(displayIndexed),
+		Scheduling:    scheduling,
+	}})
+	if !strings.Contains(listText, "stored policy: "+want) {
+		t.Fatalf("codebase list missing stored policy:\n%s", listText)
+	}
+
+	data, err := protojson.Marshal(pbconv.ToCodebase(*codebase))
+	if err != nil {
+		t.Fatalf("protojson.Marshal returned error: %v", err)
+	}
+	var decoded pb.Codebase
+	if err := protojson.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("protojson.Unmarshal returned error: %v", err)
+	}
+	if decoded.GetSchedulingPolicy() == nil {
+		t.Fatalf("JSON codebase omitted structured stored policy: %s", data)
+	}
+	jsonRender := render.SchedulingPolicy(pbconv.SchedulingFromProto(
+		decoded.GetSchedulingPolicy(),
+		"",
+		pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED,
+	))
+	if jsonRender != want {
+		t.Fatalf("JSON stored scheduling render = %q, want %q", jsonRender, want)
+	}
+}
+
+func TestPausedCodebaseStatusShowsSchedulingReason(t *testing.T) {
+	t.Parallel()
+
+	codebase := model.Codebase{
+		CanonicalPath:    "/repo",
+		Status:           model.CodebaseStatusIndexing,
+		SchedulingPolicy: model.DefaultSchedulingPolicy(),
+	}
+	job := model.Job{
+		State:                     model.JobStatePaused,
+		EffectiveSchedulingPolicy: model.DefaultSchedulingPolicy(),
+		SchedulingReason:          model.SchedulingReasonThermalSafety,
+	}
+	display := computeDisplayStatus(
+		codebase,
+		&job,
+		dependencyHealthy,
+		collectionNotApplicable,
+	)
+	if display != displayWaiting {
+		t.Fatalf("paused codebase display = %q, want %q", display, displayWaiting)
+	}
+	statusView, templateName := resolveStatusView(
+		codebase,
+		&job,
+		display,
+		dependencyHealthy,
+	)
+	text := render.GetIndex(view.GetIndexView{
+		Tracked:      true,
+		Display:      view.Display(display),
+		TemplateName: templateName,
+		Status:       statusView,
+	})
+	if !strings.Contains(text, "Waiting: thermal safety") {
+		t.Fatalf("paused codebase status missing reason:\n%s", text)
+	}
+}
+
+func TestRenderListJobsCountsPausedSeparately(t *testing.T) {
+	t.Parallel()
+
+	text := renderListJobsForTest([]model.Job{{
+		ID:                        "job-paused",
+		CanonicalPath:             "/repo",
+		Operation:                 "sync",
+		State:                     model.JobStatePaused,
+		EffectiveSchedulingPolicy: model.DefaultSchedulingPolicy(),
+		SchedulingReason:          model.SchedulingReasonHigherPriorityWork,
+	}}, false)
+	for _, want := range []string{
+		"Active: 0 queued, 0 running, 1 paused, 0 canceling",
+		"[paused",
+		"Waiting: higher-priority work",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("paused job list missing %q:\n%s", want, text)
+		}
+	}
+}
+
 // breakdownHasPending reports whether the proto breakdown carries a pending row.
 func breakdownHasPending(breakdown *pb.OutcomeBreakdown) bool {
 	for _, row := range breakdown.GetFileRows() {
@@ -901,7 +1104,7 @@ func TestRenderListJobsSummarizesHistory(t *testing.T) {
 	out := renderListJobsForTest(jobs, false)
 	for _, want := range []string{
 		"Tracked jobs: 3 total",
-		"Active: 0 queued, 1 running, 0 canceling",
+		"Active: 0 queued, 1 running, 0 paused, 0 canceling",
 		"Ended: 1 completed, 0 failed, 0 superseded, 1 canceled",
 		"Active jobs:",
 		"Ended jobs: 2",
@@ -1111,7 +1314,7 @@ func TestRenderConversationJobLabelsEachProgressScope(t *testing.T) {
 		"📄 1 of 92 changed documents processed",
 		"Changed since last sync: 76 conversations added · 16 modified",
 		"Tracked jobs: 10 total",
-		"Active: 0 queued, 1 running, 0 canceling",
+		"Active: 0 queued, 1 running, 0 paused, 0 canceling",
 		"Recent ended jobs: showing 8 of 9",
 	} {
 		if !strings.Contains(out, want) {
