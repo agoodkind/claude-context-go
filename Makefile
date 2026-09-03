@@ -36,6 +36,7 @@ export PATH := $(SIGNING_WRAPPER_DIR):$(PATH)
 # Pipeline modules. Add go-service.mk if this binary ships as a daemon and
 # set LAUNCHD_LABEL, SYSTEMD_UNIT, LOG_PATH before -include $(GO_MK).
 GO_MK_MODULES := go-build.mk go-release.mk go-service.mk
+export GO_MK_PLATFORM_STUB_OPTIONAL := goodkind.io/lm-semantic-search/internal/platformactivity
 BUILD_CHECKS := true
 STATICCHECK_EXTRA_FLAGS = $(STATICCHECK_EXTRA_CORE_FLAGS) $(STATICCHECK_EXTRA_STRICT_FLAGS)
 # Cold Linux runners need more than the generated three-minute default.
