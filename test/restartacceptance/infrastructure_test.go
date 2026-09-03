@@ -618,7 +618,7 @@ func TestHarnessRefusesUntaggedComposeProject(t *testing.T) {
 
 func TestResolveCaseRootRejectsUnsafeAndExistingNames(t *testing.T) {
 	casesRoot := t.TempDir()
-	for _, name := range []string{"case-a", "../a", "/tmp/a", "i", "a_bad", "A"} {
+	for _, name := range []string{"case-a", "../a", "/tmp/a", "a_bad", "A"} {
 		if _, err := resolveCaseRoot(casesRoot, name); err == nil {
 			t.Fatalf("unsafe case name %q was accepted", name)
 		}

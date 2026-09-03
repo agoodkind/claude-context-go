@@ -887,6 +887,16 @@ message DaemonIdentity {
 
 message GetStatusRequest {}
 
+// ActivitySourceStatus reports the cached host-activity decision used by quiet
+// scheduling. Reasons use SchedulingReason so callers never parse host text.
+message ActivitySourceStatus {
+  bool input_available = 1;
+  bool thermal_available = 2;
+  bool thermal_unsafe = 3;
+  SchedulingReason input_reason = 4;
+  SchedulingReason thermal_reason = 5;
+}
+
 // GetStatusResponse reports what the daemon is doing and what its counters
 // read. It carries only non-terminal work, so it stays a few kilobytes rather
 // than growing with job history the way ListJobs does.
@@ -896,4 +906,5 @@ message GetStatusResponse {
   repeated Metric metrics = 3;
   repeated ActivityRow activity = 4;
   string display_text = 5;
+  ActivitySourceStatus activity_source = 6;
 }

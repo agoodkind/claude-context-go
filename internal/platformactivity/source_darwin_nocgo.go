@@ -2,9 +2,13 @@
 
 package platformactivity
 
-import "context"
+import (
+	"context"
+
+	"goodkind.io/lm-semantic-search/internal/model"
+)
 
 // New returns an unavailable source when the native macOS bridge cannot build.
 func New(context.Context) Source {
-	return NewUnavailable("input activity unavailable")
+	return NewUnavailable(model.SchedulingReasonActivityUnavailable)
 }

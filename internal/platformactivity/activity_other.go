@@ -1,13 +1,17 @@
 package platformactivity
 
-import "context"
+import (
+	"context"
+
+	"goodkind.io/lm-semantic-search/internal/model"
+)
 
 type unavailableSource struct {
-	reason string
+	reason model.SchedulingReason
 }
 
 // NewUnavailable returns a source whose input and thermal signals stay unavailable.
-func NewUnavailable(reason string) Source {
+func NewUnavailable(reason model.SchedulingReason) Source {
 	return &unavailableSource{reason: reason}
 }
 
