@@ -45,32 +45,7 @@ func Run(ctx context.Context) error {
 	}
 
 	outputMode := response.ParseMode(os.Getenv(outputModeEnv))
-	// WithToolCapabilities advertises the tool set; WithInputSchemaValidation
-	// makes the server reject a tool call that omits a Required argument at the
-	// protocol layer, before the handler runs, so a missing argument fails
-	// loudly instead of defaulting to an empty value.
-	mcpServer := server.NewMCPServer(
-		"lm-semantic-search",
-		version.String(),
-		server.WithToolCapabilities(true),
-		server.WithInputSchemaValidation(),
-	)
-
-	registerSemanticSearchResource(mcpServer)
-	registerSemanticSearchPrompt(mcpServer)
-	registerIndexTool(mcpServer, cfg.SocketPath, outputMode)
-	registerClearTool(mcpServer, cfg.SocketPath, outputMode)
-	registerStatusTool(mcpServer, cfg.SocketPath, outputMode)
-	registerWaitForIndexingTool(mcpServer, cfg.SocketPath, outputMode)
-	registerListIndexesTool(mcpServer, cfg.SocketPath, outputMode)
-	registerListJobsTool(mcpServer, cfg.SocketPath, outputMode)
-	registerGetJobTool(mcpServer, cfg.SocketPath, outputMode)
-	registerDoctorTool(mcpServer, cfg.SocketPath, outputMode)
-	registerSearchTool(mcpServer, cfg.SocketPath, outputMode)
-	registerQueryGraphTool(mcpServer, cfg.SocketPath, outputMode)
-	registerTracePathTool(mcpServer, cfg.SocketPath, outputMode)
-	registerGetArchitectureTool(mcpServer, cfg.SocketPath, outputMode)
-	registerManageADRTool(mcpServer, cfg.SocketPath, outputMode)
+	mcpServer := newMCPServer(cfg.SocketPath, outputMode)
 
 	stdioServer := server.NewStdioServer(mcpServer)
 
@@ -115,6 +90,35 @@ func Run(ctx context.Context) error {
 	return nil
 }
 
+func newMCPServer(socketPath string, outputMode response.Mode) *server.MCPServer {
+	// WithToolCapabilities advertises the tool set; WithInputSchemaValidation
+	// makes the server reject a tool call that omits a Required argument at the
+	// protocol layer, before the handler runs, so a missing argument fails
+	// loudly instead of defaulting to an empty value.
+	mcpServer := server.NewMCPServer(
+		"lm-semantic-search",
+		version.String(),
+		server.WithToolCapabilities(true),
+		server.WithInputSchemaValidation(),
+	)
+	registerSemanticSearchResource(mcpServer)
+	registerSemanticSearchPrompt(mcpServer)
+	registerIndexTool(mcpServer, socketPath, outputMode)
+	registerClearTool(mcpServer, socketPath, outputMode)
+	registerStatusTool(mcpServer, socketPath, outputMode)
+	registerWaitForIndexingTool(mcpServer, socketPath, outputMode)
+	registerListIndexesTool(mcpServer, socketPath, outputMode)
+	registerListJobsTool(mcpServer, socketPath, outputMode)
+	registerGetJobTool(mcpServer, socketPath, outputMode)
+	registerDoctorTool(mcpServer, socketPath, outputMode)
+	registerSearchTool(mcpServer, socketPath, outputMode)
+	registerQueryGraphTool(mcpServer, socketPath, outputMode)
+	registerTracePathTool(mcpServer, socketPath, outputMode)
+	registerGetArchitectureTool(mcpServer, socketPath, outputMode)
+	registerManageADRTool(mcpServer, socketPath, outputMode)
+	return mcpServer
+}
+
 type daemonProtoCall func(context.Context, pb.SemanticSearchDaemonServiceClient) (proto.Message, error)
 
 // mcpClientInfo identifies this adapter to the daemon. caller_cwd lets the
@@ -138,6 +142,9 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 			mcp.WithString("splitter", mcp.Description("splitter type, typically ast")),
 			mcp.WithArray("ignorePatterns", mcp.Description("extra ignore patterns to exclude"), mcp.WithStringItems()),
 			mcp.WithArray("includeSubmodules", mcp.Description("submodule names or paths to include"), mcp.WithStringItems()),
+			mcp.WithString("priority", mcp.Description("scheduling priority for this index request"), mcp.Enum("high", "normal", "low")),
+			mcp.WithBoolean("quiet", mcp.Description("wait for host idle for this index request")),
+			mcp.WithNumber("idle_after_seconds", mcp.Description("host idle threshold in whole seconds for this index request")),
 			mcp.WithBoolean("wait", mcp.Description("block this tool call until the indexing job reaches a terminal state (completed, failed, or canceled)")),
 			mcp.WithNumber("wait_timeout_seconds", mcp.Description("max seconds to wait when wait=true; on timeout the daemon job keeps running and the tool returns the current progress (default 300)")),
 		),
@@ -146,6 +153,10 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 			if !ok {
 				return errResult, nil
 			}
+			schedulingPolicy, err := indexSchedulingPolicyPatch(ctx, req)
+			if err != nil {
+				return toolErrorResult(err.Error()), nil
+			}
 			startRequest := &pb.StartIndexRequest{
 				Path:              absolutePath,
 				Force:             req.GetBool("force", false),
@@ -153,6 +164,7 @@ func registerIndexTool(mcpServer *server.MCPServer, socketPath string, outputMod
 				IncludeSubmodules: req.GetStringSlice("includeSubmodules", []string{}),
 				Splitter:          &pb.SplitterConfig{Type: req.GetString("splitter", "")},
 				Client:            mcpClientInfo(),
+				SchedulingPolicy:  schedulingPolicy,
 			}
 			if !req.GetBool("wait", false) {
 				return callDaemonTool(ctx, socketPath, outputMode, func(ctx context.Context, client pb.SemanticSearchDaemonServiceClient) (proto.Message, error) {
