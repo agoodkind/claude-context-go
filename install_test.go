@@ -92,6 +92,19 @@ func TestDarwinONNXBridgeAllowsLoaderRelativeRunpath(t *testing.T) {
 	}
 }
 
+func TestPlatformActivityDeliberatePlatformSplitIsExported(t *testing.T) {
+	data, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	contents := string(data)
+
+	const declaration = "export GO_MK_PLATFORM_STUB_OPTIONAL := goodkind.io/lm-semantic-search/internal/platformactivity"
+	if !strings.Contains(contents, declaration) {
+		t.Fatalf("Makefile is missing platform stub declaration %q", declaration)
+	}
+}
+
 func TestLinuxSourceInstallStagesONNXRuntimeBesideDaemon(t *testing.T) {
 	data, err := os.ReadFile("Makefile")
 	if err != nil {
