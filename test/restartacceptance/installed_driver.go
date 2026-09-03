@@ -216,6 +216,8 @@ func (driver *realAcceptanceDriver) runInstalledScenario(
 		return driver.runInstalledScenarioG(ctx, run, proxies, fixture, recorder)
 	case "h":
 		return driver.runInstalledScenarioH(ctx, run, proxies, fixture, recorder)
+	case "i":
+		return driver.runInstalledScenarioI(ctx, run, h, proxies, fixture, recorder)
 	default:
 		return fmt.Errorf("unknown restart acceptance scenario %q", name)
 	}
@@ -770,6 +772,97 @@ func (driver *realAcceptanceDriver) runInstalledScenarioH(
 	})
 	proxies.embedding.ClearFailure()
 	proxies.milvus.ClearUnavailable()
+	return err
+}
+
+func (driver *realAcceptanceDriver) runInstalledScenarioI(
+	ctx context.Context,
+	run acceptanceRun,
+	h *harness,
+	proxies caseProxies,
+	fixture acceptanceFixture,
+	recorder *evidenceRecorder,
+) (runErr error) {
+	proxies.embedding.GateAfter(0)
+	runtime, err := startDaemonRuntime(ctx, installedLMSProcess(run), run.Paths.LMSSocket)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if runtime != nil {
+			runErr = errors.Join(runErr, stopDaemonRuntime(runtime))
+		}
+	}()
+
+	priorityLow := pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW
+	priorityHigh := pb.SchedulingPriority_SCHEDULING_PRIORITY_HIGH
+	var stoppedAt time.Time
+	_, err = runScenarioI(ctx, scenarioIInput{
+		StartLow: func(startContext context.Context) (*pb.StartIndexResponse, error) {
+			return runtime.client.StartIndex(startContext, &pb.StartIndexRequest{
+				Path: fixture.root,
+				Client: scenarioClientInfo(),
+				SchedulingPolicy: &pb.SchedulingPolicyPatch{Priority: &priorityLow},
+			})
+		},
+		WaitForLowBoundary: func(boundaryContext context.Context) error {
+			select {
+			case <-proxies.embedding.GateReached():
+				return nil
+			case <-boundaryContext.Done():
+				return context.Cause(boundaryContext)
+			}
+		},
+		StartHigh: func(startContext context.Context) (*pb.StartIndexResponse, error) {
+			return runtime.client.StartIndex(startContext, &pb.StartIndexRequest{
+				Path: fixture.secondRoot,
+				Client: scenarioClientInfo(),
+				SchedulingPolicy: &pb.SchedulingPolicyPatch{Priority: &priorityHigh},
+			})
+		},
+		ReleaseLowBoundary: proxies.embedding.ClearGate,
+		WaitForLowPaused: func(waitContext context.Context, jobID string) (*pb.Job, error) {
+			return waitForJob(waitContext, runtime.client, jobID, defaultScenarioReadyTimeout, defaultScenarioPollInterval, func(job *pb.Job) bool {
+				return job.GetState() == "paused"
+			})
+		},
+		CaptureLowJobs: func(captureContext context.Context, codebaseID string) (map[string]struct{}, error) {
+			return captureJobSet(captureContext, runtime.client, codebaseID)
+		},
+		StopDaemon: func(stopContext context.Context) error {
+			stoppedAt = time.Now()
+			err := runtime.stop(stopContext)
+			runtime = nil
+			return err
+		},
+		StartDaemon: func(startContext context.Context) error {
+			started, startErr := startDaemonRuntime(startContext, installedLMSProcess(run), run.Paths.LMSSocket)
+			if startErr == nil {
+				runtime = started
+			}
+			return startErr
+		},
+		WaitForLowSuccessor: func(waitContext context.Context, codebaseID string, before map[string]struct{}) (*pb.Job, error) {
+			successor, successorErr := waitForSuccessor(waitContext, runtime.client, codebaseID, before, stoppedAt, defaultScenarioRecoveryTimeout, defaultScenarioPollInterval)
+			if successorErr != nil {
+				return nil, successorErr
+			}
+			return waitForJob(waitContext, runtime.client, successor.GetId(), defaultScenarioRecoveryTimeout, defaultScenarioPollInterval, func(job *pb.Job) bool {
+				return job.GetState() == "completed"
+			})
+		},
+		VerifyCloneInventory: func(censusContext context.Context) error {
+			census, censusErr := h.census(censusContext)
+			if censusErr != nil {
+				return censusErr
+			}
+			if len(census.Databases) != 1 || census.Databases[0] != cloneMilvusDatabase {
+				return fmt.Errorf("isolated Milvus databases = %v, want [%s]", census.Databases, cloneMilvusDatabase)
+			}
+			return nil
+		},
+		Recorder: recorder,
+	})
 	return err
 }
 

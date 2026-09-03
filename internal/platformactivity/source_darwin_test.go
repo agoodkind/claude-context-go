@@ -7,6 +7,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"goodkind.io/lm-semantic-search/internal/model"
 )
 
 func TestDarwinActivityReportsValidIdleAndNominalThermalState(t *testing.T) {
@@ -75,9 +77,9 @@ func TestNativeActivityRejectsInvalidOrUnavailableIdle(t *testing.T) {
 			if snapshot.InputIdleFor != 0 {
 				t.Fatalf("InputIdleFor = %s, want 0", snapshot.InputIdleFor)
 			}
-			if snapshot.InputReason != "input activity unavailable" {
+			if snapshot.InputReason != model.SchedulingReasonActivityUnavailable {
 				t.Fatalf(
-					"InputReason = %q, want input activity unavailable",
+					"InputReason = %q, want activity unavailable",
 					snapshot.InputReason,
 				)
 			}
@@ -103,9 +105,9 @@ func TestDarwinActivityReportsSeriousAndCriticalThermalStatesUnsafe(t *testing.T
 			if !snapshot.ThermalUnsafe {
 				t.Fatal("ThermalUnsafe = false, want true")
 			}
-			if snapshot.ThermalReason != "thermal state unsafe" {
+			if snapshot.ThermalReason != model.SchedulingReasonThermalSafety {
 				t.Fatalf(
-					"ThermalReason = %q, want thermal state unsafe",
+					"ThermalReason = %q, want thermal safety",
 					snapshot.ThermalReason,
 				)
 			}

@@ -1,6 +1,7 @@
 # Codebase scheduling policy design
 
-Status: approved design, pending implementation plan
+Status: implemented. macOS installed-service validation passed. Linux
+installed-service validation remains tracked separately.
 Date: 2026-08-30
 
 Scope: persistent and per-run scheduling policy for code indexing. The policy
@@ -245,11 +246,12 @@ An older daemon can read a registry containing the new JSON fields because it
 ignores unknown fields. A rollback can drop those fields on its next full
 registry rewrite. Release notes must identify that reverse-compatibility limit.
 
-An older daemon does not understand a latest journal state of paused. A manual
-downgrade must first let every paused job resume and finish, or cancel it, so
-each job's latest event is a state the older daemon understands. The automatic
-updater only moves forward, so this work adds no downgrade mechanism. Release
-notes must state the manual drain requirement.
+## Manual downgrade
+
+An older daemon does not understand a latest journal state of paused. Before a
+manual downgrade, let every paused job resume and finish, or cancel it, so each
+job's latest event is a state the older daemon understands. The automatic
+updater only moves forward, so this work adds no downgrade mechanism.
 
 ## Operator visibility
 

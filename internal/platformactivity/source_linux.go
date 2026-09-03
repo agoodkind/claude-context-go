@@ -7,13 +7,15 @@ import (
 	"math"
 	"os"
 	"time"
+
+	"goodkind.io/lm-semantic-search/internal/model"
 )
 
 const (
-	inputActiveReason      = "input active"
-	inputUnavailableReason = "input activity unavailable"
+	inputActiveReason      = model.SchedulingReasonUserActive
+	inputUnavailableReason = model.SchedulingReasonActivityUnavailable
 	linuxThermalRoot       = "/sys/class/thermal"
-	thermalUnsafeReason    = "thermal state unsafe"
+	thermalUnsafeReason    = model.SchedulingReasonThermalSafety
 )
 
 type sessionActivity struct {
