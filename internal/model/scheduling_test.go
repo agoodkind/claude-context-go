@@ -14,6 +14,22 @@ func TestSchedulingPolicyDefaults(t *testing.T) {
 	}
 }
 
+func TestCanonicalSchedulingReasonUsesClosedVocabulary(t *testing.T) {
+	testCases := map[string]SchedulingReason{
+		"higher-priority work":       SchedulingReasonHigherPriorityWork,
+		"input active":               SchedulingReasonUserActive,
+		"waiting for input idle":     SchedulingReasonUserActive,
+		"input activity unavailable": SchedulingReasonActivityUnavailable,
+		"thermal state unsafe":       SchedulingReasonThermalSafety,
+		"free-form reason":           SchedulingReasonUnspecified,
+	}
+	for input, want := range testCases {
+		if got := CanonicalSchedulingReason(input); got != want {
+			t.Errorf("CanonicalSchedulingReason(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestApplySchedulingPolicyPatchPreservesOmittedFields(t *testing.T) {
 	priority := JobPriorityLow
 	stored := SchedulingPolicy{

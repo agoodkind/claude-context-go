@@ -148,7 +148,7 @@ func ToJob(job model.Job) *pb.Job {
 		Outcome:                   jobOutcome(job.State),
 		EffectiveSchedulingPolicy: schedulingPolicyToProto(job.EffectiveSchedulingPolicy),
 		QueueSequence:             job.QueueSequence,
-		SchedulingReason:          job.SchedulingReason,
+		SchedulingReason:          schedulingReasonToProto(job.SchedulingReason),
 	}
 	if job.Error != nil {
 		result.Error = &pb.JobError{
@@ -193,6 +193,66 @@ func schedulingPriorityFromProto(priority pb.SchedulingPriority) (model.JobPrior
 		return "", fmt.Errorf("priority must be high, normal, or low")
 	default:
 		return "", fmt.Errorf("priority must be high, normal, or low")
+	}
+}
+
+// SchedulingFromProto rebuilds the shared scheduling view from wire fields.
+func SchedulingFromProto(
+	policy *pb.SchedulingPolicy,
+	state string,
+	reason pb.SchedulingReason,
+) view.SchedulingView {
+	priority := ""
+	quiet := false
+	idleAfterSeconds := int32(0)
+	if policy != nil {
+		converted, err := schedulingPriorityFromProto(policy.GetPriority())
+		if err == nil {
+			priority = string(converted)
+		}
+		quiet = policy.GetQuiet()
+		idleAfterSeconds = policy.GetIdleAfterSeconds()
+	}
+	return view.ResolveScheduling(
+		priority,
+		quiet,
+		idleAfterSeconds,
+		state,
+		view.SchedulingReason(schedulingReasonFromProto(reason)),
+	)
+}
+
+func schedulingReasonToProto(reason model.SchedulingReason) pb.SchedulingReason {
+	switch model.CanonicalSchedulingReason(string(reason)) {
+	case model.SchedulingReasonHigherPriorityWork:
+		return pb.SchedulingReason_SCHEDULING_REASON_HIGHER_PRIORITY_WORK
+	case model.SchedulingReasonUserActive:
+		return pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE
+	case model.SchedulingReasonActivityUnavailable:
+		return pb.SchedulingReason_SCHEDULING_REASON_ACTIVITY_UNAVAILABLE
+	case model.SchedulingReasonThermalSafety:
+		return pb.SchedulingReason_SCHEDULING_REASON_THERMAL_SAFETY
+	case model.SchedulingReasonUnspecified:
+		return pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED
+	default:
+		return pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED
+	}
+}
+
+func schedulingReasonFromProto(reason pb.SchedulingReason) model.SchedulingReason {
+	switch reason {
+	case pb.SchedulingReason_SCHEDULING_REASON_HIGHER_PRIORITY_WORK:
+		return model.SchedulingReasonHigherPriorityWork
+	case pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE:
+		return model.SchedulingReasonUserActive
+	case pb.SchedulingReason_SCHEDULING_REASON_ACTIVITY_UNAVAILABLE:
+		return model.SchedulingReasonActivityUnavailable
+	case pb.SchedulingReason_SCHEDULING_REASON_THERMAL_SAFETY:
+		return model.SchedulingReasonThermalSafety
+	case pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED:
+		return model.SchedulingReasonUnspecified
+	default:
+		return model.SchedulingReasonUnspecified
 	}
 }
 

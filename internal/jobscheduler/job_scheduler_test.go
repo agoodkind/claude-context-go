@@ -90,8 +90,8 @@ func TestQuietAdmissionRequiresConfiguredInputIdle(t *testing.T) {
 	defer cancel()
 	waitForSchedulerCounts(t, scheduler, model.JobPriorityNormal, 0, 1, 0)
 	entry := schedulerEntryForTest(t, scheduler, "quiet")
-	if entry.Reason != "input active" {
-		t.Fatalf("quiet wait reason = %q, want input active", entry.Reason)
+	if entry.Reason != ReasonWaitingForInputIdle {
+		t.Fatalf("quiet wait reason = %q, want user active", entry.Reason)
 	}
 
 	source.setSnapshot(platformactivity.Snapshot{
@@ -127,8 +127,8 @@ func TestQuietAdmissionPausesForActivityAndRecoversAutomatically(t *testing.T) {
 	scheduler.sampleActivity(context.Background())
 	waitForSchedulerPauseRequest(t, lease, true)
 	requested, reason := lease.Checkpoint()
-	if !requested || reason != "input active" {
-		t.Fatalf("activity pause = %v reason %q, want true and input active", requested, reason)
+	if !requested || reason != ReasonWaitingForInputIdle {
+		t.Fatalf("activity pause = %v reason %q, want true and user active", requested, reason)
 	}
 	if !lease.Yield(reason) {
 		t.Fatal("quiet lease did not yield for activity")
@@ -157,7 +157,7 @@ func TestQuietAdmissionPausesForActivityAndRecoversAutomatically(t *testing.T) {
 func TestActivityUnavailableKeepsQuietWorkQueuedWithStableReason(t *testing.T) {
 	source := &activityTestSource{snapshot: platformactivity.Snapshot{
 		InputAvailable:   false,
-		InputReason:      ReasonActivityUnavailable,
+		InputReason:      string(ReasonActivityUnavailable),
 		ThermalAvailable: false,
 	}}
 	scheduler := New(
@@ -180,7 +180,7 @@ func TestActivityUnavailableKeepsQuietWorkQueuedWithStableReason(t *testing.T) {
 		scheduler.sampleActivity(context.Background())
 		entry := schedulerEntryForTest(t, scheduler, "quiet")
 		if entry.Reason != ReasonActivityUnavailable {
-			t.Fatalf("unavailable reason = %q, want stable source reason", entry.Reason)
+			t.Fatalf("unavailable reason = %q, want activity unavailable", entry.Reason)
 		}
 	}
 	assertSchedulerAcquirePending(t, result)
@@ -231,8 +231,8 @@ func TestThermalSafetyPausesQuietWork(t *testing.T) {
 	scheduler.sampleActivity(context.Background())
 	waitForSchedulerPauseRequest(t, lease, true)
 	requested, reason := lease.Checkpoint()
-	if !requested || reason != "thermal pressure" {
-		t.Fatalf("thermal pause = %v reason %q, want true and thermal pressure", requested, reason)
+	if !requested || reason != ReasonThermalUnsafe {
+		t.Fatalf("thermal pause = %v reason %q, want true and thermal safety", requested, reason)
 	}
 }
 
@@ -264,7 +264,7 @@ func TestHighBypassesIdleButNotThermalSafety(t *testing.T) {
 	scheduler.sampleActivity(context.Background())
 	waitForSchedulerPauseRequest(t, lease, true)
 	requested, reason := lease.Checkpoint()
-	if !requested || reason != "thermal pressure" {
+	if !requested || reason != ReasonThermalUnsafe {
 		t.Fatalf("high quiet pause = %v reason %q, want thermal enforcement", requested, reason)
 	}
 }
@@ -578,8 +578,9 @@ func TestSchedulerRetryRoundAdmitsHighestPriorityFirst(t *testing.T) {
 	waitForSchedulerCounts(t, scheduler, model.JobPriorityHigh, 0, 0, 1)
 	scheduler.mutex.Lock()
 	scheduler.retryWaiting[lowLease.jobID] = time.Now()
+	retryGeneration := scheduler.retryGeneration
 	scheduler.mutex.Unlock()
-	scheduler.openRetryRound(scheduler.retryGeneration)
+	scheduler.openRetryRound(retryGeneration)
 
 	if err := receiveSchedulerError(t, highRetry); err != nil {
 		t.Fatalf("high retry: %v", err)
@@ -590,10 +591,6 @@ func TestSchedulerRetryRoundAdmitsHighestPriorityFirst(t *testing.T) {
 	default:
 	}
 	highLease.Release()
-	scheduler.mutex.Lock()
-	scheduler.retryWaiting[lowLease.jobID] = time.Now()
-	scheduler.scheduleNextRetryLocked(time.Now())
-	scheduler.mutex.Unlock()
 	if err := receiveSchedulerError(t, lowRetry); err != nil {
 		t.Fatalf("low retry: %v", err)
 	}
@@ -698,10 +695,10 @@ func TestSchedulerLeaseOperationsAreIdempotent(t *testing.T) {
 	scheduler := New(context.Background(), 1, nil)
 	lease := acquireSchedulerLease(t, scheduler, "low", model.JobPriorityLow, 1)
 
-	if !lease.Yield("watchdog") {
+	if !lease.Yield(model.SchedulingReasonUnspecified) {
 		t.Fatal("first yield = false, want true")
 	}
-	if lease.Yield("watchdog") {
+	if lease.Yield(model.SchedulingReasonUnspecified) {
 		t.Fatal("second yield = true, want false")
 	}
 	assertSchedulerCount(t, scheduler.Snapshot().Paused, model.JobPriorityLow, 1)
@@ -724,7 +721,7 @@ func TestSchedulerLeaseOperationsAreIdempotent(t *testing.T) {
 func TestStaleLeaseCannotMutateReusedJobID(t *testing.T) {
 	scheduler := New(context.Background(), 1, nil)
 	stale := acquireSchedulerLease(t, scheduler, "reused", model.JobPriorityLow, 1)
-	claim, claimed := stale.ClaimYield("")
+	claim, claimed := stale.ClaimYield(model.SchedulingReasonUnspecified)
 	if !claimed {
 		t.Fatal("ClaimYield = false, want true")
 	}

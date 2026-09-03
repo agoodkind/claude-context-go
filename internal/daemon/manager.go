@@ -739,21 +739,35 @@ func (manager *Manager) syncIndexWithPolicy(ctx context.Context, requestedPath s
 // GetJob resolves one tracked job by id.
 func (manager *Manager) GetJob(jobID string) (model.Job, bool) {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	job, found := manager.jobs[jobID]
-	return job, found
+	manager.mu.Unlock()
+	if !found {
+		return job, false
+	}
+	var schedulingReasons map[string]model.SchedulingReason
+	if manager.jobScheduler != nil {
+		schedulingReasons = manager.jobScheduler.Snapshot().Reasons
+	}
+	return jobWithSchedulerReason(job, schedulingReasons), true
 }
 
 // ListJobs returns tracked jobs, optionally filtered by codebase id.
 func (manager *Manager) ListJobs(codebaseID string) []model.Job {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 
 	jobs := make([]model.Job, 0, len(manager.jobs))
 	for _, job := range manager.jobs {
 		if codebaseID == "" || job.CodebaseID == codebaseID {
 			jobs = append(jobs, job)
 		}
+	}
+	manager.mu.Unlock()
+	var schedulingReasons map[string]model.SchedulingReason
+	if manager.jobScheduler != nil {
+		schedulingReasons = manager.jobScheduler.Snapshot().Reasons
+	}
+	for index := range jobs {
+		jobs[index] = jobWithSchedulerReason(jobs[index], schedulingReasons)
 	}
 	sort.Slice(jobs, func(i int, j int) bool {
 		return jobs[i].StartedAt.After(jobs[j].StartedAt)

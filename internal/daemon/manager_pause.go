@@ -38,8 +38,9 @@ func withJobSchedulerLease(
 
 func (manager *Manager) pauseJob(
 	jobID string,
-	reason string,
+	reason model.SchedulingReason,
 ) error {
+	reason = model.CanonicalSchedulingReason(string(reason))
 	_, _, err := manager.serializeJobTransition(
 		jobID,
 		"job_paused",
@@ -73,7 +74,7 @@ func (manager *Manager) resumeJob(jobID string) error {
 			}
 			now := clock.Now()
 			job.State = model.JobStateRunning
-			job.SchedulingReason = ""
+			job.SchedulingReason = model.SchedulingReasonUnspecified
 			job.UpdatedAt = now
 			job.Progress.Phase = "Preparing and scanning files..."
 			job.Progress.LastEventAt = now
@@ -115,8 +116,9 @@ func (manager *Manager) jobIsPaused(jobID string) bool {
 func (manager *Manager) setJobSchedulingReason(
 	ctx context.Context,
 	jobID string,
-	reason string,
+	reason model.SchedulingReason,
 ) {
+	reason = model.CanonicalSchedulingReason(string(reason))
 	_, _, err := manager.serializeJobTransition(
 		jobID,
 		"job_waiting",

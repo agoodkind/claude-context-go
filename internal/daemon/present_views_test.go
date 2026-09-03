@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
 	render "goodkind.io/lm-semantic-search/internal/render"
 	"goodkind.io/lm-semantic-search/internal/view"
@@ -23,6 +25,99 @@ func TestResolveStatusViewFallsBackToLiveChunkTotal(t *testing.T) {
 	}
 	if templateName != "incremental.md.tmpl" {
 		t.Fatalf("template = %q, want incremental", templateName)
+	}
+}
+
+func TestSchedulingReasonVocabulary(t *testing.T) {
+	t.Parallel()
+
+	policy := model.DefaultSchedulingPolicy()
+	testCases := map[string]model.SchedulingReason{
+		"higher-priority work":       model.SchedulingReasonHigherPriorityWork,
+		"input active":               model.SchedulingReasonUserActive,
+		"input activity unavailable": model.SchedulingReasonActivityUnavailable,
+		"thermal state unsafe":       model.SchedulingReasonThermalSafety,
+	}
+	for rawReason, want := range testCases {
+		scheduling := resolveSchedulingView(
+			policy,
+			model.JobStatePaused,
+			model.CanonicalSchedulingReason(rawReason),
+		)
+		if scheduling.Reason != view.SchedulingReason(want) {
+			t.Errorf("reason %q = %q, want %q", rawReason, scheduling.Reason, want)
+		}
+	}
+	if got := model.CanonicalSchedulingReason("free-form reason"); got != model.SchedulingReasonUnspecified {
+		t.Fatalf("unknown reason = %q, want unspecified", got)
+	}
+}
+
+func TestSchedulingReasonReadsCachedSchedulerState(t *testing.T) {
+	scheduler := jobscheduler.New(context.Background(), 1, nil)
+	highPolicy := model.DefaultSchedulingPolicy()
+	highPolicy.Priority = model.JobPriorityHigh
+	blocker, err := scheduler.Acquire(context.Background(), jobscheduler.Entry{
+		JobID:         "job-high",
+		Policy:        highPolicy,
+		QueueSequence: 1,
+	})
+	if err != nil {
+		t.Fatalf("Acquire blocker: %v", err)
+	}
+
+	lowPolicy := model.DefaultSchedulingPolicy()
+	lowPolicy.Priority = model.JobPriorityLow
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		lease, acquireErr := scheduler.Acquire(ctx, jobscheduler.Entry{
+			JobID:         "job-low",
+			Policy:        lowPolicy,
+			QueueSequence: 2,
+		})
+		if lease != nil {
+			lease.Release()
+		}
+		waiterDone <- acquireErr
+	}()
+	t.Cleanup(func() {
+		cancel()
+		blocker.Release()
+		<-waiterDone
+		scheduler.Close()
+	})
+	waitForCondition(t, func() bool {
+		return scheduler.Snapshot().Queued[model.JobPriorityLow] == 1
+	})
+
+	job := model.Job{
+		ID:                        "job-low",
+		State:                     model.JobStateQueued,
+		EffectiveSchedulingPolicy: lowPolicy,
+	}
+	manager := &Manager{
+		codebases:               map[string]model.Codebase{},
+		jobs:                    map[string]model.Job{job.ID: job},
+		pendingCodeJobs:         map[string]pendingCodeRequest{},
+		pendingConversationJobs: map[string]conversationJobPayload{},
+		jobScheduler:            scheduler,
+	}
+	resolved, found := manager.GetJob(job.ID)
+	if !found {
+		t.Fatal("GetJob did not find queued job")
+	}
+	if resolved.SchedulingReason != model.SchedulingReasonHigherPriorityWork {
+		t.Fatalf(
+			"queued reason = %q, want higher-priority work",
+			resolved.SchedulingReason,
+		)
+	}
+	statusSnapshot := manager.StatusSnapshot()
+	if len(statusSnapshot.ActiveJobs) != 1 ||
+		statusSnapshot.ActiveJobs[0].SchedulingReason !=
+			model.SchedulingReasonHigherPriorityWork {
+		t.Fatalf("status jobs = %+v, want canonical queued reason", statusSnapshot.ActiveJobs)
 	}
 }
 

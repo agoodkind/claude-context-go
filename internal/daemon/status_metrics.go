@@ -7,9 +7,11 @@ import (
 	"time"
 
 	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/metrics"
 	"goodkind.io/lm-semantic-search/internal/model"
 	"goodkind.io/lm-semantic-search/internal/pbconv"
+	"goodkind.io/lm-semantic-search/internal/platformactivity"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -19,6 +21,7 @@ const (
 	statusGroupDaemon     = "daemon"
 	statusGroupDependency = "dependency_health"
 	statusGroupJobs       = "jobs"
+	statusGroupScheduler  = "scheduler"
 	statusGroupEmbed      = "embed"
 	statusGroupConverge   = "converge"
 	statusGroupMilvus     = "milvus"
@@ -164,8 +167,8 @@ func buildStatusMetrics(daemon *StatusSnapshot, snapshot metrics.Snapshot, now t
 		)
 
 		list = append(list,
-			intMetric(statusGroupJobs, "index_slots_in_use", int64(daemon.IndexSlotsInUse), unitSlots),
-			intMetric(statusGroupJobs, "index_slots_total", int64(daemon.IndexSlotsTotal), unitSlots),
+			intMetric(statusGroupJobs, "index_slots_in_use", int64(schedulerRunningCount(daemon.Scheduler.Running)), unitSlots),
+			intMetric(statusGroupJobs, "index_slots_total", int64(daemon.Scheduler.Capacity), unitSlots),
 		)
 	}
 
@@ -211,10 +214,47 @@ func buildStatusMetrics(daemon *StatusSnapshot, snapshot metrics.Snapshot, now t
 	list = append(list, runtimeMetrics()...)
 
 	if daemon != nil {
+		list = append(list, schedulerPriorityMetrics(daemon.Scheduler)...)
 		list = append(list, codebaseMetrics(daemon.Codebases)...)
+		list = append(list, activitySourceMetrics(daemon.Scheduler.Activity)...)
 		list = append(list, activityCountMetrics(daemon)...)
 	}
 	return list
+}
+
+var schedulerPriorities = []model.JobPriority{
+	model.JobPriorityHigh,
+	model.JobPriorityNormal,
+	model.JobPriorityLow,
+}
+
+func schedulerPriorityMetrics(snapshot jobscheduler.Snapshot) []*pb.Metric {
+	list := make([]*pb.Metric, 0, len(schedulerPriorities)*3)
+	for _, priority := range schedulerPriorities {
+		suffix := ".priority=" + string(priority)
+		list = append(list,
+			intMetric(statusGroupScheduler, "scheduler.running"+suffix, int64(snapshot.Running[priority]), unitJobs),
+			intMetric(statusGroupScheduler, "scheduler.queued"+suffix, int64(snapshot.Queued[priority]), unitJobs),
+			intMetric(statusGroupScheduler, "scheduler.paused"+suffix, int64(snapshot.Paused[priority]), unitJobs),
+		)
+	}
+	return list
+}
+
+func schedulerRunningCount(counts map[model.JobPriority]int) int {
+	total := 0
+	for _, priority := range schedulerPriorities {
+		total += counts[priority]
+	}
+	return total
+}
+
+func activitySourceMetrics(snapshot platformactivity.Snapshot) []*pb.Metric {
+	return []*pb.Metric{
+		boolMetric(statusGroupActivity, "activity.input_available", snapshot.InputAvailable),
+		boolMetric(statusGroupActivity, "activity.thermal_available", snapshot.ThermalAvailable),
+		boolMetric(statusGroupActivity, "activity.thermal_unsafe", snapshot.ThermalUnsafe),
+	}
 }
 
 // activityCountMetrics summarises the rows so a reader sees how much work is
@@ -228,6 +268,8 @@ func buildStatusMetrics(daemon *StatusSnapshot, snapshot metrics.Snapshot, now t
 func activityCountMetrics(daemon *StatusSnapshot) []*pb.Metric {
 	running := 0
 	queued := 0
+	// Preserve the legacy aggregate: it counted every non-queued job as running
+	// before paused had its own per-priority metric.
 	for _, job := range daemon.ActiveJobs {
 		if job.State == model.JobStateQueued {
 			queued++
@@ -349,6 +391,11 @@ func buildStatusActivity(daemon *StatusSnapshot) []*pb.ActivityRow {
 func jobActivityRow(job model.Job) *pb.ActivityRow {
 	wire := pbconv.ToJob(job)
 	progress := wire.GetProgress()
+	scheduling := pbconv.SchedulingFromProto(
+		wire.GetEffectiveSchedulingPolicy(),
+		wire.GetState(),
+		wire.GetSchedulingReason(),
+	)
 	return &pb.ActivityRow{Metrics: []*pb.Metric{
 		stringMetric(statusGroupActivity, "job_id", wire.GetId()),
 		stringMetric(statusGroupActivity, "source", activitySourceJob),
@@ -356,6 +403,14 @@ func jobActivityRow(job model.Job) *pb.ActivityRow {
 		stringMetric(statusGroupActivity, "canonical_path", wire.GetCanonicalPath()),
 		stringMetric(statusGroupActivity, "operation", wire.GetOperation()),
 		stringMetric(statusGroupActivity, "state", wire.GetState()),
+		stringMetric(statusGroupActivity, "priority", scheduling.Priority),
+		boolMetric(statusGroupActivity, "quiet", scheduling.Quiet),
+		intMetric(
+			statusGroupActivity,
+			"idle_after_seconds",
+			int64(wire.GetEffectiveSchedulingPolicy().GetIdleAfterSeconds()),
+			unitSeconds,
+		),
 		stringMetric(statusGroupActivity, "trigger", wire.GetTrigger()),
 		boolMetric(statusGroupActivity, "forced", wire.GetForced()),
 		stringMetric(statusGroupActivity, "phase", progress.GetPhase()),

@@ -29,9 +29,14 @@ func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndex
 		wire := server.codebaseWireView(ctx, codebaseView.Codebase)
 		response.Indexes = append(response.Indexes, wire.codebase)
 		rows = append(rows, view.CodebaseRowView{
-			ID:                codebaseView.Codebase.ID,
-			CanonicalPath:     codebaseView.Codebase.CanonicalPath,
-			Display:           view.Display(wire.display),
+			ID:            codebaseView.Codebase.ID,
+			CanonicalPath: codebaseView.Codebase.CanonicalPath,
+			Display:       view.Display(wire.display),
+			Scheduling: pbconv.SchedulingFromProto(
+				wire.codebase.GetSchedulingPolicy(),
+				"",
+				pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED,
+			),
 			ReuseSiblingCount: wire.reuseSiblingCount,
 			Active:            wire.active,
 			Breakdown:         wire.breakdown,

@@ -113,9 +113,10 @@ func TestLoadNormalizesLegacySchedulingPolicy(t *testing.T) {
 		t.Fatalf("WriteRegistry returned error: %v", err)
 	}
 	legacyJob := model.Job{
-		ID:         "legacy-job",
-		CodebaseID: legacyCodebase.ID,
-		State:      model.JobStateCompleted,
+		ID:               "legacy-job",
+		CodebaseID:       legacyCodebase.ID,
+		State:            model.JobStateCompleted,
+		SchedulingReason: model.SchedulingReason("free-form reason"),
 	}
 	if err := store.AppendJobEvent(cfg.JobsPath, model.JobEvent{Event: "job_completed", Job: legacyJob}); err != nil {
 		t.Fatalf("AppendJobEvent returned error: %v", err)
@@ -144,5 +145,8 @@ func TestLoadNormalizesLegacySchedulingPolicy(t *testing.T) {
 	}
 	if jobs[0].EffectiveSchedulingPolicy != model.DefaultSchedulingPolicy() {
 		t.Fatalf("legacy job policy = %+v, want %+v", jobs[0].EffectiveSchedulingPolicy, model.DefaultSchedulingPolicy())
+	}
+	if jobs[0].SchedulingReason != model.SchedulingReasonUnspecified {
+		t.Fatalf("legacy job reason = %q, want unspecified", jobs[0].SchedulingReason)
 	}
 }
