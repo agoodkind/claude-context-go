@@ -82,6 +82,8 @@ func (manager *Manager) discoverWorktree(ctx context.Context, info gitworktree.I
 		}
 	}
 
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
 	manager.mu.Lock()
 	if existing, found := manager.findCodebaseByExactRoot(info.WorktreeRoot); found {
 		manager.mu.Unlock()

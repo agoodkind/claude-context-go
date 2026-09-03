@@ -2,6 +2,7 @@
 package pbconv
 
 import (
+	"fmt"
 	"time"
 
 	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
@@ -51,19 +52,57 @@ func FromStartIndexBudget(request *pb.StartIndexRequest) model.AdmissionBudget {
 	}
 }
 
+// FromSchedulingPolicyPatch preserves protobuf field presence while validating
+// every supplied value before it reaches the daemon manager.
+func FromSchedulingPolicyPatch(
+	patch *pb.SchedulingPolicyPatch,
+) (model.SchedulingPolicyPatch, error) {
+	var empty model.SchedulingPolicyPatch
+	if patch == nil {
+		return empty, nil
+	}
+
+	converted := model.SchedulingPolicyPatch{
+		Priority:         nil,
+		Quiet:            nil,
+		IdleAfterSeconds: nil,
+	}
+	if patch.Priority != nil {
+		priority, err := schedulingPriorityFromProto(patch.GetPriority())
+		if err != nil {
+			return empty, err
+		}
+		converted.Priority = &priority
+	}
+	if patch.Quiet != nil {
+		quiet := patch.GetQuiet()
+		converted.Quiet = &quiet
+	}
+	if patch.IdleAfterSeconds != nil {
+		idleAfterSeconds := patch.GetIdleAfterSeconds()
+		if idleAfterSeconds <= 0 {
+			return empty, fmt.Errorf("idle after seconds must be positive")
+		}
+		converted.IdleAfterSeconds = &idleAfterSeconds
+	}
+	return converted, nil
+}
+
 // ToCodebase converts one daemon codebase record into its protobuf form.
 func ToCodebase(codebase model.Codebase) *pb.Codebase {
 	result := &pb.Codebase{
-		Id:                    codebase.ID,
-		CanonicalPath:         codebase.CanonicalPath,
-		Status:                string(codebase.Status),
-		ActiveJobId:           codebase.ActiveJobID,
-		EffectiveConfig:       toIndexConfig(codebase.EffectiveConfig),
-		CollectionName:        codebase.CollectionName,
-		LegacyCollectionNames: append([]string{}, codebase.LegacyCollectionNames...),
-		MerkleSnapshotPath:    codebase.MerkleSnapshotPath,
-		InodeTrackingDisabled: codebase.InodeTrackingDisabled,
-		UpdatedAt:             ts(codebase.UpdatedAt),
+		Id:                          codebase.ID,
+		CanonicalPath:               codebase.CanonicalPath,
+		Status:                      string(codebase.Status),
+		ActiveJobId:                 codebase.ActiveJobID,
+		EffectiveConfig:             toIndexConfig(codebase.EffectiveConfig),
+		CollectionName:              codebase.CollectionName,
+		LegacyCollectionNames:       append([]string{}, codebase.LegacyCollectionNames...),
+		MerkleSnapshotPath:          codebase.MerkleSnapshotPath,
+		InodeTrackingDisabled:       codebase.InodeTrackingDisabled,
+		UpdatedAt:                   ts(codebase.UpdatedAt),
+		SchedulingPolicy:            schedulingPolicyToProto(codebase.SchedulingPolicy),
+		PolicyPendingInitialization: codebase.PolicyPendingInitialization,
 	}
 	if codebase.LastSuccessfulRun != nil {
 		result.LastSuccessfulRun = &pb.IndexRunSummary{
@@ -97,16 +136,19 @@ func ToJob(job model.Job) *pb.Job {
 			Name: job.Client.Name,
 			Pid:  job.Client.PID,
 		},
-		Operation:   job.Operation,
-		State:       string(job.State),
-		Forced:      job.Forced,
-		Trigger:     jobTrigger(job),
-		Progress:    ToProgress(job.Progress),
-		Config:      toIndexConfig(job.Config),
-		StartedAt:   ts(job.StartedAt),
-		UpdatedAt:   ts(job.UpdatedAt),
-		CompletedAt: tsp(job.CompletedAt),
-		Outcome:     jobOutcome(job.State),
+		Operation:                 job.Operation,
+		State:                     string(job.State),
+		Forced:                    job.Forced,
+		Trigger:                   jobTrigger(job),
+		Progress:                  ToProgress(job.Progress),
+		Config:                    toIndexConfig(job.Config),
+		StartedAt:                 ts(job.StartedAt),
+		UpdatedAt:                 ts(job.UpdatedAt),
+		CompletedAt:               tsp(job.CompletedAt),
+		Outcome:                   jobOutcome(job.State),
+		EffectiveSchedulingPolicy: schedulingPolicyToProto(job.EffectiveSchedulingPolicy),
+		QueueSequence:             job.QueueSequence,
+		SchedulingReason:          job.SchedulingReason,
 	}
 	if job.Error != nil {
 		result.Error = &pb.JobError{
@@ -116,6 +158,42 @@ func ToJob(job model.Job) *pb.Job {
 		}
 	}
 	return result
+}
+
+func schedulingPolicyToProto(policy model.SchedulingPolicy) *pb.SchedulingPolicy {
+	return &pb.SchedulingPolicy{
+		Priority:         schedulingPriorityToProto(policy.Priority),
+		Quiet:            policy.Quiet,
+		IdleAfterSeconds: policy.IdleAfterSeconds,
+	}
+}
+
+func schedulingPriorityToProto(priority model.JobPriority) pb.SchedulingPriority {
+	switch priority {
+	case model.JobPriorityHigh:
+		return pb.SchedulingPriority_SCHEDULING_PRIORITY_HIGH
+	case model.JobPriorityNormal:
+		return pb.SchedulingPriority_SCHEDULING_PRIORITY_NORMAL
+	case model.JobPriorityLow:
+		return pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW
+	default:
+		return pb.SchedulingPriority_SCHEDULING_PRIORITY_UNSPECIFIED
+	}
+}
+
+func schedulingPriorityFromProto(priority pb.SchedulingPriority) (model.JobPriority, error) {
+	switch priority {
+	case pb.SchedulingPriority_SCHEDULING_PRIORITY_HIGH:
+		return model.JobPriorityHigh, nil
+	case pb.SchedulingPriority_SCHEDULING_PRIORITY_NORMAL:
+		return model.JobPriorityNormal, nil
+	case pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW:
+		return model.JobPriorityLow, nil
+	case pb.SchedulingPriority_SCHEDULING_PRIORITY_UNSPECIFIED:
+		return "", fmt.Errorf("priority must be high, normal, or low")
+	default:
+		return "", fmt.Errorf("priority must be high, normal, or low")
+	}
 }
 
 // ToProgress converts a job's model.Progress into the proto Progress, including

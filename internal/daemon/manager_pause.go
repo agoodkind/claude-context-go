@@ -262,6 +262,26 @@ func (manager *Manager) serializeJobTransitionLocked(
 	return job, true, nil
 }
 
+func (manager *Manager) prepareTerminalJobTransition(
+	jobID string,
+	event string,
+	mutate jobTransitionMutation,
+) (model.Job, model.JobEvent, bool) {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
+	manager.mu.Lock()
+	job, found := manager.jobs[jobID]
+	if !found || !mutate(&job) {
+		manager.mu.Unlock()
+		var emptyEvent model.JobEvent
+		return job, emptyEvent, false
+	}
+	jobEvent := model.JobEvent{Event: event, OccurredAt: clock.Now(), Job: job}
+	manager.jobs[jobID] = job
+	manager.mu.Unlock()
+	return job, jobEvent, true
+}
+
 func (manager *Manager) failJobTransition(
 	ctx context.Context,
 	jobID string,
@@ -306,6 +326,33 @@ func (manager *Manager) failJobTransition(
 		slog.ErrorContext(ctx, "append failed job event failed", "job_id", jobID, "err", journalErr)
 	}
 	return job, true
+}
+
+func (manager *Manager) prepareFailedJobTransition(
+	ctx context.Context,
+	jobID string,
+	runErr error,
+) (model.Job, model.JobEvent, bool) {
+	traceID := string(correlation.FromContext(ctx).TraceID)
+	transient := adapterr.IsTransient(runErr)
+	return manager.prepareTerminalJobTransition(
+		jobID,
+		"job_failed",
+		func(job *model.Job) bool {
+			if isTerminalJobState(job.State) {
+				return false
+			}
+			now := clock.Now()
+			job.State = model.JobStateFailed
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			job.Progress.Phase = "failed"
+			job.Progress.LastEventAt = now
+			job.Progress.HeartbeatAt = now
+			job.Error = &model.JobError{Message: adapterr.SafeMessage(runErr), Code: adapterr.Code(runErr), Retryable: transient, TraceID: traceID, JobID: jobID}
+			return true
+		},
+	)
 }
 
 func (manager *Manager) writeJobTransition(event model.JobEvent) error {

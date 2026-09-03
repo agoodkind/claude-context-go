@@ -63,25 +63,27 @@ type Snapshot struct {
 
 // Scheduler admits jobs and requests cooperative priority pauses.
 type Scheduler struct {
-	mutex               sync.Mutex
-	capacity            int
-	entries             map[string]*Entry
-	pauseGenerations    map[string]uint64
-	nextEntryGeneration uint64
-	pauseClaims         map[string]uint64
-	retryWaiting        map[string]time.Time
-	retryShared         map[string]bool
-	retryTimer          *time.Timer
-	retryTimerDeadline  time.Time
-	retryGeneration     uint64
-	yields              uint64
-	changed             chan struct{}
-	now                 func() time.Time
-	activitySource      platformactivity.Source
-	activity            platformactivity.Snapshot
-	activityCancel      context.CancelFunc
-	activityDone        chan struct{}
-	closeOnce           sync.Once
+	mutex                         sync.Mutex
+	capacity                      int
+	entries                       map[string]*Entry
+	registrationPolicies          map[string]model.SchedulingPolicyPatch
+	registrationPolicyGenerations map[string]uint64
+	pauseGenerations              map[string]uint64
+	nextEntryGeneration           uint64
+	pauseClaims                   map[string]uint64
+	retryWaiting                  map[string]time.Time
+	retryShared                   map[string]bool
+	retryTimer                    *time.Timer
+	retryTimerDeadline            time.Time
+	retryGeneration               uint64
+	yields                        uint64
+	changed                       chan struct{}
+	now                           func() time.Time
+	activitySource                platformactivity.Source
+	activity                      platformactivity.Snapshot
+	activityCancel                context.CancelFunc
+	activityDone                  chan struct{}
+	closeOnce                     sync.Once
 }
 
 // Lease owns one scheduler entry across running, paused, and waiting states.
@@ -106,21 +108,23 @@ func New(
 	activitySource platformactivity.Source,
 ) *Scheduler {
 	scheduler := &Scheduler{
-		mutex:               sync.Mutex{},
-		capacity:            capacity,
-		entries:             map[string]*Entry{},
-		pauseGenerations:    map[string]uint64{},
-		nextEntryGeneration: 0,
-		pauseClaims:         map[string]uint64{},
-		retryWaiting:        map[string]time.Time{},
-		retryShared:         map[string]bool{},
-		retryTimer:          nil,
-		retryTimerDeadline:  time.Time{},
-		retryGeneration:     0,
-		yields:              0,
-		changed:             make(chan struct{}),
-		now:                 time.Now,
-		activitySource:      activitySource,
+		mutex:                         sync.Mutex{},
+		capacity:                      capacity,
+		entries:                       map[string]*Entry{},
+		registrationPolicies:          map[string]model.SchedulingPolicyPatch{},
+		registrationPolicyGenerations: map[string]uint64{},
+		pauseGenerations:              map[string]uint64{},
+		nextEntryGeneration:           0,
+		pauseClaims:                   map[string]uint64{},
+		retryWaiting:                  map[string]time.Time{},
+		retryShared:                   map[string]bool{},
+		retryTimer:                    nil,
+		retryTimerDeadline:            time.Time{},
+		retryGeneration:               0,
+		yields:                        0,
+		changed:                       make(chan struct{}),
+		now:                           time.Now,
+		activitySource:                activitySource,
 		activity: platformactivity.Snapshot{
 			InputAvailable:   false,
 			InputIdleFor:     0,
@@ -235,12 +239,16 @@ func (scheduler *Scheduler) Acquire(
 	entry Entry,
 ) (*Lease, error) {
 	if err := ctx.Err(); err != nil {
+		if entry.JobID != "" {
+			scheduler.DiscardStagedPolicyUpdate(entry.JobID)
+		}
 		return nil, fmt.Errorf("acquire scheduler lease: %w", err)
 	}
 	if entry.JobID == "" {
 		return nil, fmt.Errorf("scheduler job id is required")
 	}
 	if err := model.ValidateSchedulingPolicy(entry.Policy); err != nil {
+		scheduler.DiscardStagedPolicyUpdate(entry.JobID)
 		slog.Warn("validate scheduler policy failed", "job_id", entry.JobID, "err", err)
 		return nil, fmt.Errorf("validate scheduler policy: %w", err)
 	}
@@ -249,6 +257,23 @@ func (scheduler *Scheduler) Acquire(
 	if _, found := scheduler.entries[entry.JobID]; found {
 		scheduler.mutex.Unlock()
 		return nil, fmt.Errorf("scheduler job %s already exists", entry.JobID)
+	}
+	if registrationPolicy, found := scheduler.registrationPolicies[entry.JobID]; found {
+		policy, err := model.ApplySchedulingPolicyPatch(
+			entry.Policy,
+			registrationPolicy,
+		)
+		if err != nil {
+			delete(scheduler.registrationPolicies, entry.JobID)
+			delete(scheduler.registrationPolicyGenerations, entry.JobID)
+			scheduler.mutex.Unlock()
+			wrappedErr := fmt.Errorf("apply scheduler registration policy: %w", err)
+			slog.Warn("apply scheduler registration policy failed", "job_id", entry.JobID, "err", wrappedErr)
+			return nil, wrappedErr
+		}
+		entry.Policy = policy
+		delete(scheduler.registrationPolicies, entry.JobID)
+		delete(scheduler.registrationPolicyGenerations, entry.JobID)
 	}
 	scheduler.nextEntryGeneration++
 	entry.generation = scheduler.nextEntryGeneration
@@ -296,10 +321,6 @@ func (scheduler *Scheduler) updatePolicyLocked(
 	scheduler.notifyLocked()
 	return nil
 }
-
-// DiscardStagedPolicyUpdate is a no-op until policy updates can precede
-// scheduler registration. It keeps cancellation safe for that future path.
-func (scheduler *Scheduler) DiscardStagedPolicyUpdate(string) {}
 
 // Snapshot returns a consistent copy of scheduler counts.
 func (scheduler *Scheduler) Snapshot() Snapshot {
@@ -595,6 +616,8 @@ func (scheduler *Scheduler) cancelWaitLocked(
 ) {
 	if remove {
 		delete(scheduler.entries, entry.JobID)
+		delete(scheduler.registrationPolicies, entry.JobID)
+		delete(scheduler.registrationPolicyGenerations, entry.JobID)
 		delete(scheduler.pauseClaims, entry.JobID)
 		delete(scheduler.pauseGenerations, entry.JobID)
 		delete(scheduler.retryWaiting, entry.JobID)

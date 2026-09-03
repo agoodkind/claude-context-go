@@ -24,6 +24,7 @@ const (
 	SemanticSearchDaemonService_ClearIndex_FullMethodName                        = "/lmsemanticsearch.v1.SemanticSearchDaemonService/ClearIndex"
 	SemanticSearchDaemonService_CancelJob_FullMethodName                         = "/lmsemanticsearch.v1.SemanticSearchDaemonService/CancelJob"
 	SemanticSearchDaemonService_SyncIndex_FullMethodName                         = "/lmsemanticsearch.v1.SemanticSearchDaemonService/SyncIndex"
+	SemanticSearchDaemonService_UpdateCodebasePolicy_FullMethodName              = "/lmsemanticsearch.v1.SemanticSearchDaemonService/UpdateCodebasePolicy"
 	SemanticSearchDaemonService_GetIndex_FullMethodName                          = "/lmsemanticsearch.v1.SemanticSearchDaemonService/GetIndex"
 	SemanticSearchDaemonService_ListIndexes_FullMethodName                       = "/lmsemanticsearch.v1.SemanticSearchDaemonService/ListIndexes"
 	SemanticSearchDaemonService_GetJob_FullMethodName                            = "/lmsemanticsearch.v1.SemanticSearchDaemonService/GetJob"
@@ -52,6 +53,7 @@ type SemanticSearchDaemonServiceClient interface {
 	ClearIndex(ctx context.Context, in *ClearIndexRequest, opts ...grpc.CallOption) (*ClearIndexResponse, error)
 	CancelJob(ctx context.Context, in *CancelJobRequest, opts ...grpc.CallOption) (*CancelJobResponse, error)
 	SyncIndex(ctx context.Context, in *SyncIndexRequest, opts ...grpc.CallOption) (*SyncIndexResponse, error)
+	UpdateCodebasePolicy(ctx context.Context, in *UpdateCodebasePolicyRequest, opts ...grpc.CallOption) (*UpdateCodebasePolicyResponse, error)
 	GetIndex(ctx context.Context, in *GetIndexRequest, opts ...grpc.CallOption) (*GetIndexResponse, error)
 	ListIndexes(ctx context.Context, in *ListIndexesRequest, opts ...grpc.CallOption) (*ListIndexesResponse, error)
 	GetJob(ctx context.Context, in *GetJobRequest, opts ...grpc.CallOption) (*GetJobResponse, error)
@@ -132,6 +134,16 @@ func (c *semanticSearchDaemonServiceClient) SyncIndex(ctx context.Context, in *S
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SyncIndexResponse)
 	err := c.cc.Invoke(ctx, SemanticSearchDaemonService_SyncIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *semanticSearchDaemonServiceClient) UpdateCodebasePolicy(ctx context.Context, in *UpdateCodebasePolicyRequest, opts ...grpc.CallOption) (*UpdateCodebasePolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateCodebasePolicyResponse)
+	err := c.cc.Invoke(ctx, SemanticSearchDaemonService_UpdateCodebasePolicy_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -332,6 +344,7 @@ type SemanticSearchDaemonServiceServer interface {
 	ClearIndex(context.Context, *ClearIndexRequest) (*ClearIndexResponse, error)
 	CancelJob(context.Context, *CancelJobRequest) (*CancelJobResponse, error)
 	SyncIndex(context.Context, *SyncIndexRequest) (*SyncIndexResponse, error)
+	UpdateCodebasePolicy(context.Context, *UpdateCodebasePolicyRequest) (*UpdateCodebasePolicyResponse, error)
 	GetIndex(context.Context, *GetIndexRequest) (*GetIndexResponse, error)
 	ListIndexes(context.Context, *ListIndexesRequest) (*ListIndexesResponse, error)
 	GetJob(context.Context, *GetJobRequest) (*GetJobResponse, error)
@@ -381,6 +394,9 @@ func (UnimplementedSemanticSearchDaemonServiceServer) CancelJob(context.Context,
 }
 func (UnimplementedSemanticSearchDaemonServiceServer) SyncIndex(context.Context, *SyncIndexRequest) (*SyncIndexResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncIndex not implemented")
+}
+func (UnimplementedSemanticSearchDaemonServiceServer) UpdateCodebasePolicy(context.Context, *UpdateCodebasePolicyRequest) (*UpdateCodebasePolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateCodebasePolicy not implemented")
 }
 func (UnimplementedSemanticSearchDaemonServiceServer) GetIndex(context.Context, *GetIndexRequest) (*GetIndexResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetIndex not implemented")
@@ -539,6 +555,24 @@ func _SemanticSearchDaemonService_SyncIndex_Handler(srv interface{}, ctx context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SemanticSearchDaemonServiceServer).SyncIndex(ctx, req.(*SyncIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SemanticSearchDaemonService_UpdateCodebasePolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateCodebasePolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SemanticSearchDaemonServiceServer).UpdateCodebasePolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SemanticSearchDaemonService_UpdateCodebasePolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SemanticSearchDaemonServiceServer).UpdateCodebasePolicy(ctx, req.(*UpdateCodebasePolicyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -846,6 +880,10 @@ var SemanticSearchDaemonService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SyncIndex",
 			Handler:    _SemanticSearchDaemonService_SyncIndex_Handler,
+		},
+		{
+			MethodName: "UpdateCodebasePolicy",
+			Handler:    _SemanticSearchDaemonService_UpdateCodebasePolicy_Handler,
 		},
 		{
 			MethodName: "GetIndex",

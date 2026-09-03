@@ -284,6 +284,10 @@ func (client *mockDaemonClient) SyncIndex(context.Context, *pb.SyncIndexRequest,
 	return nil, errors.New("not implemented")
 }
 
+func (client *mockDaemonClient) UpdateCodebasePolicy(context.Context, *pb.UpdateCodebasePolicyRequest, ...grpc.CallOption) (*pb.UpdateCodebasePolicyResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (client *mockDaemonClient) ListIndexes(context.Context, *pb.ListIndexesRequest, ...grpc.CallOption) (*pb.ListIndexesResponse, error) {
 	return nil, errors.New("not implemented")
 }

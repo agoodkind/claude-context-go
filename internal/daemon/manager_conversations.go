@@ -74,6 +74,9 @@ type conversationJobPayload struct {
 // RegisterConversationCollection records a virtual document collection that is
 // addressed by logical collection id rather than a filesystem directory.
 func (manager *Manager) RegisterConversationCollection(ctx context.Context, collectionID string) (model.Codebase, error) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	trimmedCollectionID := strings.TrimSpace(collectionID)
 	if trimmedCollectionID == "" {
 		return model.Codebase{}, errors.New("collection id is required")
@@ -380,6 +383,14 @@ func (manager *Manager) deleteConversation(ctx context.Context, collectionID str
 }
 
 func (manager *Manager) queueConversationJob(ctx context.Context, codebase model.Codebase, client model.ClientInfo, payload conversationJobPayload) (model.Job, error) {
+	manager.policyMutationMutex.Lock()
+	policyLocked := true
+	defer func() {
+		if policyLocked {
+			manager.policyMutationMutex.Unlock()
+		}
+	}()
+
 	var emptyJob model.Job
 
 	manager.mu.Lock()
@@ -420,6 +431,8 @@ func (manager *Manager) queueConversationJob(ctx context.Context, codebase model
 		correlation.IdentityAttribute{Key: "job_id", Value: job.ID},
 		correlation.IdentityAttribute{Key: "codebase_id", Value: current.ID},
 	)
+	manager.policyMutationMutex.Unlock()
+	policyLocked = false
 	manager.runJobAsync(ctx, job.ID)
 	return job, nil
 }
@@ -508,6 +521,9 @@ func (manager *Manager) runConversationDelete(ctx context.Context, job model.Job
 }
 
 func (manager *Manager) finishConversationDelete(ctx context.Context, jobID string) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.transitionMutex.Lock()
 	manager.mu.Lock()
 	job, found := manager.jobs[jobID]

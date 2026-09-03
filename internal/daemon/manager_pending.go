@@ -160,6 +160,41 @@ func (manager *Manager) mergePendingCodeRequestLocked(codebaseID string, incomin
 	manager.pendingCodeJobs[codebaseID] = incoming
 }
 
+// queueDeduplicatedPolicyOverride preserves a policy override that arrives
+// after equivalent work has already started. The active job retains its
+// admitted policy, and the depth-1 successor applies the override once that
+// job reaches a terminal state.
+func (manager *Manager) queueDeduplicatedPolicyOverride(
+	job model.Job,
+	requestedPath string,
+	canonicalPath string,
+	client model.ClientInfo,
+	indexConfig model.IndexConfig,
+	force bool,
+	policyPatch model.SchedulingPolicyPatch,
+) {
+	if policyPatch.Priority == nil &&
+		policyPatch.Quiet == nil &&
+		policyPatch.IdleAfterSeconds == nil {
+		return
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	current, found := manager.jobs[job.ID]
+	if !found || isTerminalJobState(current.State) {
+		return
+	}
+	manager.mergePendingCodeRequestLocked(current.CodebaseID, pendingCodeRequest{
+		requestedPath: requestedPath,
+		canonicalPath: canonicalPath,
+		client:        client,
+		indexConfig:   indexConfig,
+		force:         force,
+		policyPatch:   policyPatch,
+	})
+}
+
 // enqueueConversationJobLocked writes the registry mutations for a fresh
 // conversation job and returns it queued. It is the shared body of the first-time
 // admission in queueConversationJob and the coalesced drain, so both queue a
