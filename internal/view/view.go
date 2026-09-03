@@ -592,6 +592,7 @@ const (
 	AckClear                = "clear"
 	AckCancel               = "cancel"
 	AckSync                 = "sync"
+	AckUpdatePolicy         = "update_policy"
 	AckRegisterConversation = "register_conversation"
 	AckUpsertConversation   = "upsert_conversation"
 	AckDeleteConversation   = "delete_conversation"

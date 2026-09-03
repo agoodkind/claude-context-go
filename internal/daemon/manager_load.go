@@ -12,6 +12,9 @@ import (
 )
 
 func (manager *Manager) load(ctx context.Context) error {
+	if err := manager.recoverPendingPolicyUpdate(ctx); err != nil {
+		return err
+	}
 	registry, err := store.ReadRegistry(manager.config.RegistryPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.ErrorContext(ctx, "read registry failed", "path", manager.config.RegistryPath, "err", err)
@@ -51,6 +54,8 @@ func (manager *Manager) load(ctx context.Context) error {
 		job.EffectiveSchedulingPolicy = normalizedPolicy
 		manager.jobs[id] = job
 	}
+	manager.policyMutationMutex.Lock()
 	manager.reconcileJournalOnStartLocked()
+	manager.policyMutationMutex.Unlock()
 	return nil
 }

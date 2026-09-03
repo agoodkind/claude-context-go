@@ -126,6 +126,9 @@ func physicallyMissingPaths(root string, relativePaths []string) []string {
 }
 
 func (manager *Manager) markCodebaseMissing(ctx context.Context, codebaseID string) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -175,6 +178,9 @@ func applyQuarantineState(codebase model.Codebase, signal quarantineSignal) mode
 }
 
 func (manager *Manager) quarantineCodebase(ctx context.Context, codebaseID string, signal quarantineSignal) int32 {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -199,6 +205,9 @@ func quarantineJobMessage(signal quarantineSignal) string {
 }
 
 func (manager *Manager) updateJobQuarantined(ctx context.Context, jobID string, signal quarantineSignal) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	traceID := string(correlation.FromContext(ctx).TraceID)
 	job, transitioned, journalErr := manager.serializeJobTransition(
 		jobID,
@@ -248,6 +257,9 @@ func (manager *Manager) updateJobQuarantined(ctx context.Context, jobID string, 
 }
 
 func (manager *Manager) clearCodebaseQuarantine(ctx context.Context, codebaseID string, status model.CodebaseStatus) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 

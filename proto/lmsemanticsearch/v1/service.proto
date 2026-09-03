@@ -12,6 +12,7 @@ service SemanticSearchDaemonService {
   rpc ClearIndex(ClearIndexRequest) returns (ClearIndexResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc SyncIndex(SyncIndexRequest) returns (SyncIndexResponse);
+  rpc UpdateCodebasePolicy(UpdateCodebasePolicyRequest) returns (UpdateCodebasePolicyResponse);
   rpc GetIndex(GetIndexRequest) returns (GetIndexResponse);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
@@ -76,6 +77,25 @@ message IndexConfig {
   string vector_backend = 9;
   bool hybrid = 10;
   repeated string include_submodules = 11;
+}
+
+enum SchedulingPriority {
+  SCHEDULING_PRIORITY_UNSPECIFIED = 0;
+  SCHEDULING_PRIORITY_HIGH = 1;
+  SCHEDULING_PRIORITY_NORMAL = 2;
+  SCHEDULING_PRIORITY_LOW = 3;
+}
+
+message SchedulingPolicy {
+  SchedulingPriority priority = 1;
+  bool quiet = 2;
+  int32 idle_after_seconds = 3;
+}
+
+message SchedulingPolicyPatch {
+  optional SchedulingPriority priority = 1;
+  optional bool quiet = 2;
+  optional int32 idle_after_seconds = 3;
 }
 
 message Progress {
@@ -230,6 +250,8 @@ message Codebase {
   // the same per-row tree the status surface shows. Nil when there is no active
   // job.
   Progress active_progress = 18;
+  SchedulingPolicy scheduling_policy = 19;
+  bool policy_pending_initialization = 20;
 }
 
 message Job {
@@ -270,6 +292,9 @@ message Job {
   // "canceled", and empty while the job is still live. Machine consumers read
   // this instead of deriving terminality from the raw state field.
   string outcome = 20;
+  SchedulingPolicy effective_scheduling_policy = 21;
+  uint64 queue_sequence = 22;
+  string scheduling_reason = 23;
 }
 
 message SearchResult {
@@ -361,6 +386,7 @@ message StartIndexRequest {
   repeated string include_submodules = 6;
   int32 max_job_chunks = 7;
   int64 max_job_bytes = 8;
+  SchedulingPolicyPatch scheduling_policy = 9;
 }
 
 message StartIndexResponse {
@@ -401,6 +427,7 @@ message CancelJobResponse {
 message SyncIndexRequest {
   string path = 1;
   ClientInfo client = 2;
+  SchedulingPolicyPatch scheduling_policy = 3;
 }
 
 message SyncIndexResponse {
@@ -408,6 +435,17 @@ message SyncIndexResponse {
   string codebase_id = 2;
   string state = 3;
   string display_text = 4;
+}
+
+message UpdateCodebasePolicyRequest {
+  string path = 1;
+  SchedulingPolicyPatch patch = 2;
+  ClientInfo client = 3;
+}
+
+message UpdateCodebasePolicyResponse {
+  Codebase codebase = 1;
+  string display_text = 2;
 }
 
 message GetIndexRequest {

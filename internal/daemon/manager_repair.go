@@ -120,6 +120,8 @@ func (manager *Manager) planMissingCollectionRepairs(ctx context.Context) ([]mis
 		collectionSet[collectionName] = struct{}{}
 	}
 
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -299,6 +301,9 @@ func (manager *Manager) reconcileCodebaseCollection(
 }
 
 func (manager *Manager) noteAutomaticRepairStartFailure(ctx context.Context, codebaseID string, startErr error) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 

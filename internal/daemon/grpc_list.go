@@ -4,6 +4,7 @@ import (
 	"context"
 
 	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
+	"goodkind.io/lm-semantic-search/internal/model"
 	"goodkind.io/lm-semantic-search/internal/pbconv"
 	render "goodkind.io/lm-semantic-search/internal/render"
 	"goodkind.io/lm-semantic-search/internal/view"
@@ -25,49 +26,63 @@ func (server *GRPCServer) ListIndexes(ctx context.Context, request *pb.ListIndex
 	}
 	rows := make([]view.CodebaseRowView, 0, len(views))
 	for _, codebaseView := range views {
-		readiness, _ := server.manager.pathCollectionObservation(
-			ctx,
-			codebaseView.Codebase.CanonicalPath,
-			ownsLiveCollection(codebaseView.Codebase),
-		)
-		codebaseView.Display = server.manager.displayForCollectionReadiness(
-			codebaseView.Codebase,
-			readiness,
-		)
-		pbCodebase := pbconv.ToCodebase(codebaseView.Codebase)
-		applyDisplayTokens(pbCodebase, codebaseView.Display)
-		reuseSiblingCount := int32(0)
-		if codebaseView.Display == displayDiscovered {
-			reuseSiblingCount = server.manager.worktreeReuseForecast(codebaseView.Codebase)
-		}
-		applyReuseForecast(pbCodebase, reuseSiblingCount)
-
-		// An actively-indexing codebase carries its live breakdown so the list
-		// row, the TUI, and get_indexing_status all render the same tree from one
-		// resolver. The breakdown rides on active_progress for the TUI and is
-		// resolved here for the text rows.
-		active := false
-		breakdown := view.ZeroBreakdown()
-		if jobID := codebaseView.Codebase.ActiveJobID; jobID != "" {
-			if activeJob, ok := server.manager.GetJob(jobID); ok {
-				pbCodebase.ActiveProgress = pbconv.ToProgress(activeJob.Progress)
-				breakdown = resolveOutcomeBreakdown(activeJob.Progress)
-				active = len(breakdown.FileRows) > 0 || len(breakdown.ChunkRows) > 0
-			}
-		}
-
-		response.Indexes = append(response.Indexes, pbCodebase)
+		wire := server.codebaseWireView(ctx, codebaseView.Codebase)
+		response.Indexes = append(response.Indexes, wire.codebase)
 		rows = append(rows, view.CodebaseRowView{
 			ID:                codebaseView.Codebase.ID,
 			CanonicalPath:     codebaseView.Codebase.CanonicalPath,
-			Display:           view.Display(codebaseView.Display),
-			ReuseSiblingCount: reuseSiblingCount,
-			Active:            active,
-			Breakdown:         breakdown,
+			Display:           view.Display(wire.display),
+			ReuseSiblingCount: wire.reuseSiblingCount,
+			Active:            wire.active,
+			Breakdown:         wire.breakdown,
 		})
 	}
 	health := server.manager.DependencyHealth()
 	response.DependencyHealth = toDependencyHealth(health)
 	response.DisplayText = server.envelopeText(ctx, health, render.ListIndexes(rows))
 	return response, nil
+}
+
+type resolvedCodebaseWireView struct {
+	codebase          *pb.Codebase
+	display           displayStatus
+	reuseSiblingCount int32
+	active            bool
+	breakdown         view.OutcomeBreakdown
+}
+
+func (server *GRPCServer) codebaseWireView(
+	ctx context.Context,
+	codebase model.Codebase,
+) resolvedCodebaseWireView {
+	readiness, _ := server.manager.pathCollectionObservation(
+		ctx,
+		codebase.CanonicalPath,
+		ownsLiveCollection(codebase),
+	)
+	display := server.manager.displayForCollectionReadiness(codebase, readiness)
+	pbCodebase := pbconv.ToCodebase(codebase)
+	applyDisplayTokens(pbCodebase, display)
+	reuseSiblingCount := int32(0)
+	if display == displayDiscovered {
+		reuseSiblingCount = server.manager.worktreeReuseForecast(codebase)
+	}
+	applyReuseForecast(pbCodebase, reuseSiblingCount)
+
+	active := false
+	breakdown := view.ZeroBreakdown()
+	if codebase.ActiveJobID != "" {
+		if activeJob, found := server.manager.GetJob(codebase.ActiveJobID); found {
+			pbCodebase.ActiveProgress = pbconv.ToProgress(activeJob.Progress)
+			breakdown = resolveOutcomeBreakdown(activeJob.Progress)
+			active = len(breakdown.FileRows) > 0 || len(breakdown.ChunkRows) > 0
+		}
+	}
+	return resolvedCodebaseWireView{
+		codebase:          pbCodebase,
+		display:           display,
+		reuseSiblingCount: reuseSiblingCount,
+		active:            active,
+		breakdown:         breakdown,
+	}
 }

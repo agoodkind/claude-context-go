@@ -323,6 +323,9 @@ func (manager *Manager) recordGraphIndexNonFatal(ctx context.Context, codebaseID
 }
 
 func (manager *Manager) updateGraphState(ctx context.Context, codebaseID string, graphState model.GraphState, snapshotHash string) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 

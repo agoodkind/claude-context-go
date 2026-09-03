@@ -614,6 +614,9 @@ func (syncer *BackgroundSync) registerConvergeJob(
 	codebase model.Codebase,
 	relativePaths []string,
 ) (convergeJobRegistration, context.Context, error) {
+	syncer.manager.policyMutationMutex.Lock()
+	defer syncer.manager.policyMutationMutex.Unlock()
+
 	now := clock.Now()
 	job := newQueuedJob(
 		codebase.ID,

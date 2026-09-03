@@ -1,10 +1,114 @@
 package pbconv
 
 import (
+	"strings"
 	"testing"
 
+	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
 	"goodkind.io/lm-semantic-search/internal/model"
 )
+
+func TestFromSchedulingPolicyPatchPreservesOmissionAndExplicitFalse(t *testing.T) {
+	t.Parallel()
+
+	omitted, err := FromSchedulingPolicyPatch(nil)
+	if err != nil {
+		t.Fatalf("FromSchedulingPolicyPatch(nil): %v", err)
+	}
+	if omitted.Priority != nil || omitted.Quiet != nil || omitted.IdleAfterSeconds != nil {
+		t.Fatalf("omitted patch = %+v, want every field nil", omitted)
+	}
+
+	quiet := false
+	converted, err := FromSchedulingPolicyPatch(&pb.SchedulingPolicyPatch{Quiet: &quiet})
+	if err != nil {
+		t.Fatalf("FromSchedulingPolicyPatch(false): %v", err)
+	}
+	if converted.Quiet == nil || *converted.Quiet {
+		t.Fatalf("quiet = %v, want explicit false", converted.Quiet)
+	}
+	if converted.Priority != nil || converted.IdleAfterSeconds != nil {
+		t.Fatalf("unprovided fields changed: %+v", converted)
+	}
+}
+
+func TestFromSchedulingPolicyPatchRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		patch   *pb.SchedulingPolicyPatch
+		message string
+	}{
+		{
+			name: "unspecified priority",
+			patch: &pb.SchedulingPolicyPatch{
+				Priority: pb.SchedulingPriority_SCHEDULING_PRIORITY_UNSPECIFIED.Enum(),
+			},
+			message: "priority",
+		},
+		{
+			name: "unknown priority",
+			patch: &pb.SchedulingPolicyPatch{
+				Priority: pb.SchedulingPriority(99).Enum(),
+			},
+			message: "priority",
+		},
+		{
+			name: "zero idle duration",
+			patch: &pb.SchedulingPolicyPatch{
+				IdleAfterSeconds: new(int32),
+			},
+			message: "idle after seconds",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := FromSchedulingPolicyPatch(test.patch)
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("error = %v, want text %q", err, test.message)
+			}
+		})
+	}
+}
+
+func TestSchedulingPolicyViewsCarryStoredAndEffectiveValues(t *testing.T) {
+	t.Parallel()
+
+	stored := model.SchedulingPolicy{
+		Priority:         model.JobPriorityHigh,
+		Quiet:            true,
+		IdleAfterSeconds: 900,
+	}
+	codebase := ToCodebase(model.Codebase{
+		SchedulingPolicy:            stored,
+		PolicyPendingInitialization: true,
+	})
+	if codebase.GetSchedulingPolicy().GetPriority() != pb.SchedulingPriority_SCHEDULING_PRIORITY_HIGH ||
+		!codebase.GetSchedulingPolicy().GetQuiet() ||
+		codebase.GetSchedulingPolicy().GetIdleAfterSeconds() != 900 ||
+		!codebase.GetPolicyPendingInitialization() {
+		t.Fatalf("codebase policy view = %+v, pending=%v", codebase.GetSchedulingPolicy(), codebase.GetPolicyPendingInitialization())
+	}
+
+	job := ToJob(model.Job{
+		EffectiveSchedulingPolicy: model.SchedulingPolicy{
+			Priority:         model.JobPriorityLow,
+			Quiet:            false,
+			IdleAfterSeconds: 120,
+		},
+		QueueSequence:    42,
+		SchedulingReason: "waiting for input idle",
+	})
+	if job.GetEffectiveSchedulingPolicy().GetPriority() != pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW ||
+		job.GetEffectiveSchedulingPolicy().GetQuiet() ||
+		job.GetEffectiveSchedulingPolicy().GetIdleAfterSeconds() != 120 ||
+		job.GetQueueSequence() != 42 ||
+		job.GetSchedulingReason() != "waiting for input idle" {
+		t.Fatalf("job policy view = %+v sequence=%d reason=%q", job.GetEffectiveSchedulingPolicy(), job.GetQueueSequence(), job.GetSchedulingReason())
+	}
+}
 
 func TestToProgressBackfillsLegacyChunkCounters(t *testing.T) {
 	t.Parallel()

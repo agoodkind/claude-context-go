@@ -318,6 +318,9 @@ func (manager *Manager) startStagingResume(ctx context.Context, plan resumePlan,
 // embedded and the re-queued build restarts cleanly. Clearing the index is the
 // only way to stop the retry.
 func (manager *Manager) parkUnresumableForRetry(ctx context.Context, codebaseID string) {
+	manager.policyMutationMutex.Lock()
+	defer manager.policyMutationMutex.Unlock()
+
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
