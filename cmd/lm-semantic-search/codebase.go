@@ -30,6 +30,8 @@ func newCodebaseCmd(options *rootOptions) *cobra.Command {
 	codebase.AddCommand(newCodebaseStatusCmd(options))
 	codebase.AddCommand(newCodebaseIndexCmd(options))
 	codebase.AddCommand(newCodebaseSyncCmd(options))
+	codebase.AddCommand(newCodebasePriorityCmd(options))
+	codebase.AddCommand(newCodebaseQuietCmd(options))
 	codebase.AddCommand(newCodebaseWaitCmd(options))
 	codebase.AddCommand(newCodebaseSearchCmd(options))
 	codebase.AddCommand(newCodebaseClearCmd(options))
@@ -89,6 +91,7 @@ func newCodebaseIndexCmd(options *rootOptions) *cobra.Command {
 	var ignorePatterns []string
 	var includeSubmodules []string
 	var waitTimeout time.Duration
+	var schedulingFlags schedulingFlagValues
 
 	cmd := &cobra.Command{
 		Use:   "index PATH|ID",
@@ -114,12 +117,17 @@ func newCodebaseIndexCmd(options *rootOptions) *cobra.Command {
 			if waitTimeout > 0 && cliOpts.outputMode != response.ModeHuman {
 				return errors.New("--wait requires human output mode")
 			}
+			schedulingPolicy, err := schedulingPolicyPatch(cmd, schedulingFlags)
+			if err != nil {
+				return err
+			}
 			request := &pb.StartIndexRequest{
 				Path:              args[0],
 				Force:             force,
 				IgnorePatterns:    ignorePatterns,
 				IncludeSubmodules: includeSubmodules,
 				Client:            clientInfo,
+				SchedulingPolicy:  schedulingPolicy,
 			}
 			if splitterType != "" {
 				request.Splitter = &pb.SplitterConfig{Type: splitterType}
@@ -149,11 +157,13 @@ func newCodebaseIndexCmd(options *rootOptions) *cobra.Command {
 	cmd.Flags().StringArrayVar(&includeSubmodules, "include-submodule", nil, "submodule name or path to include")
 	cmd.Flags().DurationVar(&waitTimeout, "wait", 0, "attach to the job and render progress; value needs the = form (--wait=30s), bare --wait uses 5m")
 	cmd.Flags().Lookup("wait").NoOptDefVal = "5m"
+	schedulingFlags.addFlags(cmd)
 	return cmd
 }
 
 func newCodebaseSyncCmd(options *rootOptions) *cobra.Command {
 	var waitTimeout time.Duration
+	var schedulingFlags schedulingFlagValues
 
 	cmd := &cobra.Command{
 		Use:   "sync PATH|ID",
@@ -177,8 +187,16 @@ func newCodebaseSyncCmd(options *rootOptions) *cobra.Command {
 			if waitTimeout > 0 && cliOpts.outputMode != response.ModeHuman {
 				return errors.New("--wait requires human output mode")
 			}
+			schedulingPolicy, err := schedulingPolicyPatch(cmd, schedulingFlags)
+			if err != nil {
+				return err
+			}
 			result, err := callDaemon(cliOpts, func(ctx context.Context, client pb.SemanticSearchDaemonServiceClient) (protoMessage, error) {
-				return client.SyncIndex(ctx, &pb.SyncIndexRequest{Path: args[0], Client: clientInfo})
+				return client.SyncIndex(ctx, &pb.SyncIndexRequest{
+					Path:             args[0],
+					Client:           clientInfo,
+					SchedulingPolicy: schedulingPolicy,
+				})
 			})
 			if err != nil {
 				return err
@@ -198,6 +216,7 @@ func newCodebaseSyncCmd(options *rootOptions) *cobra.Command {
 	}
 	cmd.Flags().DurationVar(&waitTimeout, "wait", 0, "attach to the job and render progress; value needs the = form (--wait=30s), bare --wait uses 5m")
 	cmd.Flags().Lookup("wait").NoOptDefVal = "5m"
+	schedulingFlags.addFlags(cmd)
 	return cmd
 }
 

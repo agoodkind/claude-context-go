@@ -26,7 +26,16 @@ func TestGroupNameListsSubcommands(t *testing.T) {
 		t.Fatalf("codebase help: %v", err)
 	}
 	out := stdout.String()
-	for _, name := range []string{"list", "status", "index", "sync", "search", "clear"} {
+	for _, name := range []string{
+		"list",
+		"status",
+		"index",
+		"sync",
+		"priority",
+		"quiet",
+		"search",
+		"clear",
+	} {
 		if !strings.Contains(out, name) {
 			t.Errorf("codebase help missing subcommand %q:\n%s", name, out)
 		}
@@ -74,6 +83,9 @@ func TestLeafHelpShowsArgumentsExamplesAndEnum(t *testing.T) {
 		"Examples:",
 		"lm-semantic-search codebase index",
 		"ast|langchain",
+		"priority",
+		"quiet",
+		"idle-after",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("codebase index help missing %q:\n%s", want, out)
