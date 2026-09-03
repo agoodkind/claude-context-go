@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
 )
 
 const (
@@ -609,6 +611,138 @@ type scenarioHInput struct {
 	ClydeStatus   func(context.Context) (clydeStatusObservation, error)
 	Recorder      *evidenceRecorder
 	Timeouts      scenarioHTimeouts
+}
+
+type scenarioIInput struct {
+	StartLow             func(context.Context) (*pb.StartIndexResponse, error)
+	WaitForLowBoundary   func(context.Context) error
+	StartHigh            func(context.Context) (*pb.StartIndexResponse, error)
+	ReleaseLowBoundary   func()
+	WaitForLowPaused     func(context.Context, string) (*pb.Job, error)
+	CaptureLowJobs       func(context.Context, string) (map[string]struct{}, error)
+	StopDaemon           func(context.Context) error
+	StartDaemon          func(context.Context) error
+	WaitForLowSuccessor  func(context.Context, string, map[string]struct{}) (*pb.Job, error)
+	VerifyCloneInventory func(context.Context) error
+	Recorder             *evidenceRecorder
+	Timeouts             scenarioTimeouts
+}
+
+type scenarioIResult struct {
+	PausedJobID    string
+	SuccessorJobID string
+}
+
+func runScenarioI(ctx context.Context, input scenarioIInput) (result scenarioIResult, runErr error) {
+	if err := validateScenarioIInput(input); err != nil {
+		return scenarioIResult{}, err
+	}
+	timeouts := input.Timeouts.resolved()
+	low, err := input.StartLow(ctx)
+	if err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I start low-priority job: %w", err)
+	}
+	if low.GetJobId() == "" || low.GetCodebaseId() == "" {
+		return scenarioIResult{}, fmt.Errorf("scenario I low-priority job response is incomplete")
+	}
+	if err := input.WaitForLowBoundary(ctx); err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I wait for low-priority file boundary: %w", err)
+	}
+	lowBoundaryReleased := false
+	defer func() {
+		if !lowBoundaryReleased {
+			input.ReleaseLowBoundary()
+		}
+	}()
+	high, err := input.StartHigh(ctx)
+	if err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I start high-priority job: %w", err)
+	}
+	if high.GetJobId() == "" || high.GetCodebaseId() == "" || high.GetCodebaseId() == low.GetCodebaseId() {
+		return scenarioIResult{}, fmt.Errorf("scenario I high-priority job response is incomplete")
+	}
+	input.ReleaseLowBoundary()
+	lowBoundaryReleased = true
+	paused, err := input.WaitForLowPaused(ctx, low.GetJobId())
+	if err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I wait for low-priority pause: %w", err)
+	}
+	if paused.GetState() != "paused" {
+		return scenarioIResult{}, fmt.Errorf("scenario I low-priority state = %q, want paused", paused.GetState())
+	}
+	if !sameSchedulingPolicy(paused.GetEffectiveSchedulingPolicy(), lowPolicy()) {
+		return scenarioIResult{}, fmt.Errorf("scenario I paused policy = %+v, want low priority", paused.GetEffectiveSchedulingPolicy())
+	}
+	before, err := input.CaptureLowJobs(ctx, low.GetCodebaseId())
+	if err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I capture paused job set: %w", err)
+	}
+	if err := input.StopDaemon(ctx); err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I stop installed daemon: %w", err)
+	}
+	daemonRestarted := false
+	defer func() {
+		if daemonRestarted {
+			return
+		}
+		restartContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeouts.Recovery)
+		defer cancel()
+		if err := input.StartDaemon(restartContext); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("scenario I restore installed daemon after failure: %w", err))
+		}
+	}()
+	if err := input.StartDaemon(ctx); err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I restart installed daemon: %w", err)
+	}
+	daemonRestarted = true
+	resumeContext, cancel := context.WithTimeout(ctx, timeouts.Recovery)
+	defer cancel()
+	successor, err := input.WaitForLowSuccessor(resumeContext, low.GetCodebaseId(), before)
+	if err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I wait for low-priority successor: %w", err)
+	}
+	if successor.GetState() != "completed" {
+		return scenarioIResult{}, fmt.Errorf("scenario I successor state = %q, want completed", successor.GetState())
+	}
+	if !sameSchedulingPolicy(successor.GetEffectiveSchedulingPolicy(), lowPolicy()) {
+		return scenarioIResult{}, fmt.Errorf("scenario I successor policy = %+v, want low priority", successor.GetEffectiveSchedulingPolicy())
+	}
+	if err := input.VerifyCloneInventory(ctx); err != nil {
+		return scenarioIResult{}, fmt.Errorf("scenario I verify isolated Milvus inventory: %w", err)
+	}
+	result = scenarioIResult{PausedJobID: paused.GetId(), SuccessorJobID: successor.GetId()}
+	if err := recordScenario(input.Recorder, "i", map[string]string{
+		"paused_job_id":    result.PausedJobID,
+		"successor_job_id": result.SuccessorJobID,
+		"policy":           "low",
+	}); err != nil {
+		return scenarioIResult{}, err
+	}
+	return result, nil
+}
+
+func validateScenarioIInput(input scenarioIInput) error {
+	if input.StartLow == nil || input.WaitForLowBoundary == nil || input.StartHigh == nil || input.ReleaseLowBoundary == nil || input.WaitForLowPaused == nil || input.CaptureLowJobs == nil || input.StopDaemon == nil || input.StartDaemon == nil || input.WaitForLowSuccessor == nil || input.VerifyCloneInventory == nil || input.Recorder == nil {
+		return fmt.Errorf("scenario I requires low and high jobs, daemon restart, inventory, and evidence controls")
+	}
+	return nil
+}
+
+func lowPolicy() *pb.SchedulingPolicy {
+	return &pb.SchedulingPolicy{
+		Priority:         pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW,
+		Quiet:            false,
+		IdleAfterSeconds: 300,
+	}
+}
+
+func sameSchedulingPolicy(left *pb.SchedulingPolicy, right *pb.SchedulingPolicy) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.GetPriority() == right.GetPriority() &&
+		left.GetQuiet() == right.GetQuiet() &&
+		left.GetIdleAfterSeconds() == right.GetIdleAfterSeconds()
 }
 
 type scenarioHOrderResult struct {

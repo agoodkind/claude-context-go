@@ -148,7 +148,7 @@ func ToJob(job model.Job) *pb.Job {
 		Outcome:                   jobOutcome(job.State),
 		EffectiveSchedulingPolicy: schedulingPolicyToProto(job.EffectiveSchedulingPolicy),
 		QueueSequence:             job.QueueSequence,
-		SchedulingReason:          schedulingReasonToProto(job.SchedulingReason),
+		SchedulingReason:          SchedulingReasonToProto(job.SchedulingReason),
 	}
 	if job.Error != nil {
 		result.Error = &pb.JobError{
@@ -222,7 +222,8 @@ func SchedulingFromProto(
 	)
 }
 
-func schedulingReasonToProto(reason model.SchedulingReason) pb.SchedulingReason {
+// SchedulingReasonToProto converts one closed model reason to its wire enum.
+func SchedulingReasonToProto(reason model.SchedulingReason) pb.SchedulingReason {
 	switch model.CanonicalSchedulingReason(string(reason)) {
 	case model.SchedulingReasonHigherPriorityWork:
 		return pb.SchedulingReason_SCHEDULING_REASON_HIGHER_PRIORITY_WORK

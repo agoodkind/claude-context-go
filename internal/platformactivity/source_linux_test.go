@@ -9,6 +9,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"goodkind.io/lm-semantic-search/internal/model"
 )
 
 type stubLoginSessionReader struct {
@@ -67,8 +69,8 @@ func TestLoginSessionRequiresEverySelectedSessionIdle(t *testing.T) {
 	if snapshot.InputIdleFor != 0 {
 		t.Fatalf("InputIdleFor = %s, want 0", snapshot.InputIdleFor)
 	}
-	if snapshot.InputReason != "input active" {
-		t.Fatalf("InputReason = %q, want input active", snapshot.InputReason)
+	if snapshot.InputReason != model.SchedulingReasonUserActive {
+		t.Fatalf("InputReason = %q, want user active", snapshot.InputReason)
 	}
 }
 
@@ -221,7 +223,7 @@ func assertInputUnavailable(t *testing.T, snapshot Snapshot) {
 	if snapshot.InputIdleFor != 0 {
 		t.Fatalf("InputIdleFor = %s, want 0", snapshot.InputIdleFor)
 	}
-	if snapshot.InputReason != "input activity unavailable" {
-		t.Fatalf("InputReason = %q, want input activity unavailable", snapshot.InputReason)
+	if snapshot.InputReason != model.SchedulingReasonActivityUnavailable {
+		t.Fatalf("InputReason = %q, want activity unavailable", snapshot.InputReason)
 	}
 }

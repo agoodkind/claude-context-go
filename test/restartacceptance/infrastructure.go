@@ -717,7 +717,7 @@ func retryCloneCensus(
 	}
 }
 
-var caseNamePattern = regexp.MustCompile(`^[a-h](-[a-z0-9]+)?$`)
+var caseNamePattern = regexp.MustCompile(`^[a-i](-[a-z0-9]+)?$`)
 
 func resolveCaseRoot(casesRoot string, caseName string) (string, error) {
 	if !caseNamePattern.MatchString(caseName) {

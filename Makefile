@@ -125,7 +125,7 @@ build install release: | daemon-entitlements-signer
 # Project-local
 # ---------------------------------------------------------------------------
 
-.PHONY: daemon-entitlements-signer go-mk-cgo-dep-cbm go-mk-cgo-dep-onnxruntime go-mk-cgo-dep-tokenizers deploy deploy-service daemon-wait daemon-status kill-orphans live offline-live restart-acceptance-unit restart-acceptance proto
+.PHONY: daemon-entitlements-signer go-mk-cgo-dep-cbm go-mk-cgo-dep-onnxruntime go-mk-cgo-dep-tokenizers deploy deploy-service daemon-wait daemon-status kill-orphans live offline-live service-activity-live restart-acceptance-unit restart-acceptance proto
 
 # live runs the opt-in conversation-marker validation suite against a real local
 # Milvus, fully isolated from the operator's daemon (build tag `live`). It reuses
@@ -139,6 +139,11 @@ live: | $(GO_MK_PREREQS)
 # an isolated in-process daemon, embedded vector store, and embedded ONNX model.
 offline-live: | $(GO_MK_PREREQS)
 	go test -tags offlinelive -count=1 ./test/offlinelive/
+
+# service-activity-live reads the default installed daemon only. It never starts
+# a replacement process or writes operator indexing state.
+service-activity-live: | $(GO_MK_PREREQS)
+	go test -tags serviceactivitylive -count=1 ./test/serviceactivity/
 
 # restart-acceptance-unit runs the deterministic restart acceptance tests.
 restart-acceptance-unit: | $(GO_MK_PREREQS)

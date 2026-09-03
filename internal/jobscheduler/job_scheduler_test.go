@@ -157,7 +157,7 @@ func TestQuietAdmissionPausesForActivityAndRecoversAutomatically(t *testing.T) {
 func TestActivityUnavailableKeepsQuietWorkQueuedWithStableReason(t *testing.T) {
 	source := &activityTestSource{snapshot: platformactivity.Snapshot{
 		InputAvailable:   false,
-		InputReason:      string(ReasonActivityUnavailable),
+		InputReason:      ReasonActivityUnavailable,
 		ThermalAvailable: false,
 	}}
 	scheduler := New(

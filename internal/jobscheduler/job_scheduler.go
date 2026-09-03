@@ -127,25 +127,16 @@ func New(
 		changed:                       make(chan struct{}),
 		now:                           time.Now,
 		activitySource:                activitySource,
-		activity: platformactivity.Snapshot{
-			InputAvailable:   false,
-			InputIdleFor:     0,
-			InputReason:      string(ReasonActivityUnavailable),
-			ThermalAvailable: false,
-			ThermalUnsafe:    false,
-			ThermalReason:    "",
-		},
-		activityCancel: nil,
-		activityDone:   nil,
-		closeOnce:      sync.Once{},
+		activity:                      unavailableActivitySnapshot(),
+		activityCancel:                nil,
+		activityDone:                  nil,
+		closeOnce:                     sync.Once{},
 	}
 	if activitySource == nil {
 		return scheduler
 	}
 	if activity, sampled := sampleActivitySource(ctx, activitySource); sampled {
 		scheduler.activity = activity
-	} else {
-		scheduler.activity = unavailableActivitySnapshot()
 	}
 	activityContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	scheduler.activityCancel = cancel
@@ -210,10 +201,10 @@ func unavailableActivitySnapshot() platformactivity.Snapshot {
 	return platformactivity.Snapshot{
 		InputAvailable:   false,
 		InputIdleFor:     0,
-		InputReason:      string(ReasonActivityUnavailable),
+		InputReason:      ReasonActivityUnavailable,
 		ThermalAvailable: false,
 		ThermalUnsafe:    false,
-		ThermalReason:    string(ReasonActivityUnavailable),
+		ThermalReason:    ReasonActivityUnavailable,
 	}
 }
 
