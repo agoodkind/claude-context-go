@@ -31,6 +31,15 @@ type SchedulingPolicyPatch struct {
 	IdleAfterSeconds *int32       `json:"idle_after_seconds,omitempty"`
 }
 
+// PolicyUpdateTransaction retains the durable state needed to roll back one
+// interrupted stored-policy mutation.
+type PolicyUpdateTransaction struct {
+	CodebaseID      string   `json:"codebase_id"`
+	OldCodebase     Codebase `json:"old_codebase"`
+	OldActiveJob    *Job     `json:"old_active_job,omitempty"`
+	OldDetachedJobs []Job    `json:"old_detached_jobs,omitempty"`
+}
+
 // DefaultSchedulingPolicy returns the policy for new and legacy records.
 func DefaultSchedulingPolicy() SchedulingPolicy {
 	return SchedulingPolicy{

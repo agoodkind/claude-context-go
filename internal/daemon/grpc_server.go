@@ -18,6 +18,7 @@ import (
 	"goodkind.io/lm-semantic-search/internal/pbconv"
 	render "goodkind.io/lm-semantic-search/internal/render"
 	"goodkind.io/lm-semantic-search/internal/view"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -216,6 +217,10 @@ func (server *GRPCServer) Version(ctx context.Context, request *pb.VersionReques
 func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndexRequest) (resp *pb.StartIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "StartIndex")
 	defer done(&err)
+	policyPatch, policyErr := pbconv.FromSchedulingPolicyPatch(request.GetSchedulingPolicy())
+	if policyErr != nil {
+		return nil, status.Error(codes.InvalidArgument, policyErr.Error())
+	}
 	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
 		return nil, argErr
 	}
@@ -223,7 +228,7 @@ func (server *GRPCServer) StartIndex(ctx context.Context, request *pb.StartIndex
 	if pathErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewInvalidPath(pathErr.Error(), pathErr)))
 	}
-	job, codebase, deduplicated, overlapsCodebaseID, callErr := server.manager.StartIndex(ctx, requestedPath, pbClient(request.GetClient()), pbconv.FromStartIndexConfig(request), request.GetForce(), pbconv.FromStartIndexBudget(request))
+	job, codebase, deduplicated, overlapsCodebaseID, callErr := server.manager.StartIndexWithPolicy(ctx, requestedPath, pbClient(request.GetClient()), pbconv.FromStartIndexConfig(request), request.GetForce(), pbconv.FromStartIndexBudget(request), policyPatch)
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(requestedPath, callErr)))
 	}
@@ -325,6 +330,10 @@ func (server *GRPCServer) CancelJob(ctx context.Context, request *pb.CancelJobRe
 func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRequest) (resp *pb.SyncIndexResponse, err error) {
 	ctx, done := beginRPC(ctx, "SyncIndex")
 	defer done(&err)
+	policyPatch, policyErr := pbconv.FromSchedulingPolicyPatch(request.GetSchedulingPolicy())
+	if policyErr != nil {
+		return nil, status.Error(codes.InvalidArgument, policyErr.Error())
+	}
 	if argErr := requireNonEmpty(ctx, request.GetPath(), "absolutePath", true); argErr != nil {
 		return nil, argErr
 	}
@@ -332,7 +341,7 @@ func (server *GRPCServer) SyncIndex(ctx context.Context, request *pb.SyncIndexRe
 	if pathErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, adapterr.NewInvalidPath(pathErr.Error(), pathErr)))
 	}
-	job, codebase, deduplicated, callErr := server.manager.SyncIndex(ctx, requestedPath, pbClient(request.GetClient()))
+	job, codebase, deduplicated, callErr := server.manager.SyncIndexWithPolicy(ctx, requestedPath, pbClient(request.GetClient()), policyPatch)
 	if callErr != nil {
 		return nil, status.Error(adapterr.Respond(ctx, classifyManagerError(requestedPath, callErr)))
 	}
@@ -909,16 +918,6 @@ func (server *GRPCServer) Shutdown(ctx context.Context, request *pb.ShutdownRequ
 		}()
 	}
 	return &pb.ShutdownResponse{Accepted: true}, nil
-}
-
-func pbClient(client *pb.ClientInfo) model.ClientInfo {
-	if client == nil {
-		return model.ClientInfo{Name: "", PID: 0}
-	}
-	return model.ClientInfo{
-		Name: client.GetName(),
-		PID:  client.GetPid(),
-	}
 }
 
 func pbConversationDocuments(documents []*pb.ConversationDocument) []model.ConversationDocument {

@@ -37,9 +37,11 @@ func (manager *Manager) adoptUnregisteredCodebase(ctx context.Context, canonical
 		collectionName = manager.semantic.CollectionName(canonicalPath)
 	}
 
+	manager.policyMutationMutex.Lock()
 	manager.mu.Lock()
 	if existing, found := manager.findCodebaseByExactRoot(canonicalPath); found {
 		manager.mu.Unlock()
+		manager.policyMutationMutex.Unlock()
 		return existing, true
 	}
 	record := newCodebaseRecord(canonicalPath)
@@ -53,6 +55,7 @@ func (manager *Manager) adoptUnregisteredCodebase(ctx context.Context, canonical
 	if err := manager.saveLocked(); err != nil {
 		delete(manager.codebases, record.ID)
 		manager.mu.Unlock()
+		manager.policyMutationMutex.Unlock()
 		slog.ErrorContext(ctx, "adopt: persist registry failed", "path", canonicalPath, "err", err)
 		var empty model.Codebase
 		return empty, false
@@ -62,6 +65,7 @@ func (manager *Manager) adoptUnregisteredCodebase(ctx context.Context, canonical
 	// from the registry source of truth.
 	manager.observer.Invalidate(record.ID)
 	manager.mu.Unlock()
+	manager.policyMutationMutex.Unlock()
 
 	manager.seedAdoptedMerkle(ctx, record)
 	notifyCtx := correlation.WithContext(context.WithoutCancel(ctx), correlation.FromContext(ctx).Child())
