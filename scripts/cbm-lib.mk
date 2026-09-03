@@ -1,5 +1,6 @@
 LMS_AR ?= $(AR)
 LMS_OBJCOPY ?= objcopy
+LMS_NM ?= nm
 
 # Mirror the engine binary's own source set (PROD_SRCS plus the extraction and
 # vendored-compression sources), excluding only src/main.c, which is the CLI
@@ -8,10 +9,10 @@ LMS_OBJCOPY ?= objcopy
 # cbm_compare_versions) that the retained core objects reference, so dropping them
 # leaves the archive with undefined symbols. The keep-list still localizes the
 # final archive to the 14 cbm_* API symbols at the relocatable link.
-LMS_LIB_C_SRCS := $(filter %.c,$(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC))
+LMS_API_C_SRCS := internal/cbm/cbm.c src/store/store.c src/pipeline/pipeline.c src/mcp/mcp.c src/cypher/cypher.c
+LMS_LIB_C_SRCS := $(filter-out $(LMS_API_C_SRCS),$(filter %.c,$(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)))
 LMS_OBJ_DIR := $(BUILD_DIR)/lms
 LMS_LIB_OBJS := $(patsubst %.c,$(LMS_OBJ_DIR)/%.o,$(LMS_LIB_C_SRCS))
-LMS_API_C_SRCS := internal/cbm/cbm.c src/store/store.c src/pipeline/pipeline.c src/mcp/mcp.c src/cypher/cypher.c
 LMS_API_OBJS := $(patsubst %.c,$(LMS_OBJ_DIR)/%.o,$(LMS_API_C_SRCS))
 LMS_VENDORED_OBJS := $(filter-out $(MIMALLOC_OBJ_PROD),$(OBJS_VENDORED_PROD)) $(LMS_OBJ_DIR)/lms_mimalloc.o
 LMS_KEEP_LIST := $(LMS_OBJ_DIR)/cbm-exported-symbols.txt
@@ -69,13 +70,13 @@ $(LMS_KEEP_LIST): | $(BUILD_DIR)
 	} >$@
 
 ifeq ($(LMS_TARGET_GOOS),darwin)
-$(LMS_COMBINED_OBJ): $(LMS_LIB_OBJS) $(LMS_VENDORED_OBJS) $(LMS_KEEP_LIST) | $(BUILD_DIR)
+$(LMS_COMBINED_OBJ): $(LMS_LIB_OBJS) $(LMS_API_OBJS) $(LMS_VENDORED_OBJS) $(LMS_KEEP_LIST) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) -r -arch $(LMS_DARWIN_ARCH) -Wl,-exported_symbols_list,$(LMS_KEEP_LIST) -o $@ $(LMS_LIB_OBJS) $(LMS_VENDORED_OBJS)
+	$(CC) -r -arch $(LMS_DARWIN_ARCH) -Wl,-exported_symbols_list,$(LMS_KEEP_LIST) -o $@ $(LMS_LIB_OBJS) $(LMS_API_OBJS) $(LMS_VENDORED_OBJS)
 else ifeq ($(LMS_TARGET_GOOS),linux)
-$(LMS_COMBINED_OBJ): $(LMS_LIB_OBJS) $(LMS_VENDORED_OBJS) $(LMS_KEEP_LIST) | $(BUILD_DIR)
+$(LMS_COMBINED_OBJ): $(LMS_LIB_OBJS) $(LMS_API_OBJS) $(LMS_VENDORED_OBJS) $(LMS_KEEP_LIST) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) -r -nostdlib -o $@ $(LMS_LIB_OBJS) $(LMS_VENDORED_OBJS)
+	$(CC) -r -nostdlib -o $@ $(LMS_LIB_OBJS) $(LMS_API_OBJS) $(LMS_VENDORED_OBJS)
 	$(LMS_OBJCOPY) --keep-global-symbols=$(LMS_KEEP_LIST) $@
 endif
 
@@ -83,3 +84,11 @@ lms-cbm-lib: $(LMS_COMBINED_OBJ)
 	mkdir -p $(dir $(LMS_ARCHIVE))
 	rm -f $(LMS_ARCHIVE)
 	$(LMS_AR) crs $(LMS_ARCHIVE) $(LMS_COMBINED_OBJ)
+	@symbols="$$($(LMS_NM) $(if $(filter darwin,$(LMS_TARGET_GOOS)),-gU,-g --defined-only) $(LMS_ARCHIVE))"; \
+	while IFS= read -r symbol; do \
+		count="$$(printf '%s\n' "$$symbols" | awk -v symbol="$$symbol" '$$NF == symbol { count += 1 } END { print count + 0 }')"; \
+		if [ "$$count" -ne 1 ]; then \
+			printf '%s\\n' "lms-cbm-lib: expected exactly one definition of $$symbol, found $$count" >&2; \
+			exit 1; \
+		fi; \
+	done <$(LMS_KEEP_LIST)
