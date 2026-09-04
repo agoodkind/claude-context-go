@@ -247,6 +247,9 @@ func (manager *Manager) updateJobQuarantined(ctx context.Context, jobID string, 
 	if !found {
 		return
 	}
+	if codebase.ActiveJobID != job.ID {
+		return
+	}
 	codebase.ActiveJobID = ""
 	codebase.LastFailedRun = nil
 	codebase = applyQuarantineState(codebase, signal)
