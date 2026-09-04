@@ -34,7 +34,7 @@ func TestActivitySnapshotUnavailableSource(t *testing.T) {
 }
 
 func TestNewReturnsSource(t *testing.T) {
-	source := New()
+	source := New(context.Background())
 	if source == nil {
 		t.Fatal("New returned nil source")
 	}

@@ -39,7 +39,7 @@ func TestLinuxActivitySelectsLocalActiveUserLoginSessions(t *testing.T) {
 		{UID: currentUID, Class: "user", IdleHint: false, IdleSinceMonotonicUsec: 300},
 		{UID: currentUID, Active: true, Class: "manager", IdleHint: false, IdleSinceMonotonicUsec: 300},
 	}}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 500, nil
 	})
 
@@ -59,7 +59,7 @@ func TestLoginSessionRequiresEverySelectedSessionIdle(t *testing.T) {
 		{UID: currentUID, Active: true, Class: "user", IdleHint: true, IdleSinceMonotonicUsec: 100},
 		{UID: currentUID, Active: true, Class: "user", IdleHint: false, IdleSinceMonotonicUsec: 200},
 	}}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 500, nil
 	})
 
@@ -78,7 +78,7 @@ func TestLoginSessionRequiresEverySelectedSessionIdle(t *testing.T) {
 
 func TestLoginSessionNoSelectedSessionIsUnavailable(t *testing.T) {
 	reader := &stubLoginSessionReader{}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 500, nil
 	})
 
@@ -88,7 +88,7 @@ func TestLoginSessionNoSelectedSessionIsUnavailable(t *testing.T) {
 }
 
 func TestLinuxActivityFallbackExplainsUnavailableThermalState(t *testing.T) {
-	source := newLinuxSource(nil, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), nil, t.TempDir(), func() (uint64, error) {
 		return 0, nil
 	})
 
@@ -108,7 +108,7 @@ func TestLinuxActivityFallbackExplainsUnavailableThermalState(t *testing.T) {
 
 func TestLoginSessionBusFailureIsUnavailable(t *testing.T) {
 	reader := &stubLoginSessionReader{err: errors.New("system bus unavailable")}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 500, nil
 	})
 
@@ -125,7 +125,7 @@ func TestLoginSessionInvalidMonotonicTimeIsUnavailable(t *testing.T) {
 		IdleHint:               true,
 		IdleSinceMonotonicUsec: 501,
 	}}}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 500, nil
 	})
 
@@ -143,7 +143,7 @@ func TestLoginSessionDurationOverflowIsUnavailable(t *testing.T) {
 		IdleSinceMonotonicUsec: 0,
 	}}}
 	overflowUsec := uint64(math.MaxInt64/int64(time.Microsecond)) + 1
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return overflowUsec, nil
 	})
 
@@ -210,7 +210,7 @@ func TestLoginSessionDoesNotRequireIdlePropertiesForUnselectedSession(t *testing
 
 func TestLinuxActivityCloseClosesLoginConnection(t *testing.T) {
 	reader := &stubLoginSessionReader{}
-	source := newLinuxSource(reader, t.TempDir(), func() (uint64, error) {
+	source := newLinuxSource(context.Background(), reader, t.TempDir(), func() (uint64, error) {
 		return 0, nil
 	})
 

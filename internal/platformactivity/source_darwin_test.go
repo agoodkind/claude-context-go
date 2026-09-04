@@ -19,7 +19,7 @@ func TestDarwinActivityReportsValidIdleAndNominalThermalState(t *testing.T) {
 		thermalUnsafe:    false,
 	})
 
-	source := New()
+	source := New(context.Background())
 	snapshot := source.Sample(context.Background())
 
 	if !snapshot.InputAvailable {
@@ -69,7 +69,7 @@ func TestNativeActivityRejectsInvalidOrUnavailableIdle(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			stubNativeActivityReader(t, result)
 
-			snapshot := New().Sample(context.Background())
+			snapshot := New(context.Background()).Sample(context.Background())
 
 			if snapshot.InputAvailable {
 				t.Fatal("InputAvailable = true, want false")
@@ -97,7 +97,7 @@ func TestDarwinActivityReportsSeriousAndCriticalThermalStatesUnsafe(t *testing.T
 				thermalUnsafe:    true,
 			})
 
-			snapshot := New().Sample(context.Background())
+			snapshot := New(context.Background()).Sample(context.Background())
 
 			if !snapshot.ThermalAvailable {
 				t.Fatal("ThermalAvailable = false, want true")

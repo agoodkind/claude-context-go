@@ -35,7 +35,7 @@ type nativeActivityResult struct {
 var readNativeActivity = readNativeActivityBridge
 
 // New returns the native macOS activity source.
-func New() Source {
+func New(context.Context) Source {
 	return &darwinSource{unavailable: NewUnavailable(inputUnavailableReason)}
 }
 

@@ -209,7 +209,7 @@ func newManagerWithSemanticFactory(
 ) (*Manager, error) {
 	return newManagerWithDependencies(ctx, cfg, managerDependencies{
 		semanticFactory: semanticFactory,
-		activitySource:  platformactivity.New(),
+		activitySource:  platformactivity.New(ctx),
 	})
 }
 

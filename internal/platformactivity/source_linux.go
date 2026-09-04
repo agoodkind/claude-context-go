@@ -42,15 +42,16 @@ type linuxSource struct {
 }
 
 // New returns the native Linux activity source.
-func New() Source {
+func New(ctx context.Context) Source {
 	sessions, err := newLogin1SessionReader()
 	if err != nil {
 		sessions = nil
 	}
-	return newLinuxSource(sessions, linuxThermalRoot, readMonotonicUsec)
+	return newLinuxSource(ctx, sessions, linuxThermalRoot, readMonotonicUsec)
 }
 
 func newLinuxSource(
+	ctx context.Context,
 	sessions loginSessionReader,
 	thermalRoot string,
 	monotonicNow monotonicClock,
@@ -59,7 +60,7 @@ func newLinuxSource(
 		sessions:     sessions,
 		thermalRoot:  thermalRoot,
 		monotonicNow: monotonicNow,
-		fallback:     NewUnavailable(inputUnavailableReason).Sample(context.Background()),
+		fallback:     NewUnavailable(inputUnavailableReason).Sample(ctx),
 	}
 }
 
