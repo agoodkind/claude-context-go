@@ -199,7 +199,7 @@ func resolveQuarantineSurface(codebase model.Codebase) view.QuarantineSurface {
 // It is the relocated body of the render-side builder, so the templates keep
 // their exact output. templateName selects among preparing, building,
 // incremental, idle, ready, and waiting.
-func resolveStatusView(codebase model.Codebase, activeJob *model.Job, display displayStatus, waitLabel string) (view.StatusView, string) {
+func resolveStatusView(codebase model.Codebase, activeJob *model.Job, display displayStatus, dependency dependencyMode) (view.StatusView, string) {
 	statusView := blankStatusView(filepath.Base(codebase.CanonicalPath), formatStampWithRelative(codebase.UpdatedAt))
 	statusView.Path = codebase.CanonicalPath
 	statusView.Scheduling = resolveSchedulingView(
@@ -541,7 +541,7 @@ func (manager *Manager) resolveGetIndexView(
 	getIndex.Display = view.Display(display)
 	getIndex.Failure = resolveCodebaseFailure(*codebase)
 	getIndex.Quarantine = resolveQuarantineSurface(*codebase)
-	statusView, templateName := resolveStatusView(*codebase, activeJob, display, waitingLabel(health.Mode))
+	statusView, templateName := resolveStatusView(*codebase, activeJob, display, health.Mode)
 	if display == displayIndexed {
 		statusView.CurrentIndex = manager.currentIndexCounts(ctx, *codebase, observedRows)
 	}
@@ -795,7 +795,7 @@ func resolveSearchStatusView(codebase model.Codebase, activeJob *model.Job, heal
 		return blankStatusView("", ""), "", false
 	}
 	display := computeDisplayStatus(codebase, activeJob, health.Mode, status.CollectionNotApplicable)
-	statusView, templateName := resolveStatusView(codebase, activeJob, display, waitingLabel(health.Mode))
+	statusView, templateName := resolveStatusView(codebase, activeJob, display, health.Mode)
 	resolveGraphStatusFields(&statusView, codebase, graphBuilding)
 	return statusView, templateName, isBackgroundSyncReconcile(&codebase, activeJob)
 }

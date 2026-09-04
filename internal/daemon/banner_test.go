@@ -110,12 +110,12 @@ func TestRenderWaitingNamesDependency(t *testing.T) {
 	t.Parallel()
 	codebase := &model.Codebase{CanonicalPath: "/Users/agoodkind/Sites/swift-makefile"}
 
-	embedderView, embedderTemplate := resolveStatusView(*codebase, nil, displayWaiting, waitingLabel(dependencyEmbedderUnreachable))
+	embedderView, embedderTemplate := resolveStatusView(*codebase, nil, displayWaiting, dependencyEmbedderUnreachable)
 	embedderOut := render.GetIndex(view.GetIndexView{Tracked: true, TemplateName: embedderTemplate, Status: embedderView})
 	if !strings.Contains(embedderOut, "⏳ Waiting for the embedding server") {
 		t.Fatalf("embedder waiting body wrong:\n%s", embedderOut)
 	}
-	storeView, storeTemplate := resolveStatusView(*codebase, nil, displayWaiting, waitingLabel(dependencyStoreUnavailable))
+	storeView, storeTemplate := resolveStatusView(*codebase, nil, displayWaiting, dependencyStoreUnavailable)
 	storeOut := render.GetIndex(view.GetIndexView{Tracked: true, TemplateName: storeTemplate, Status: storeView})
 	if !strings.Contains(storeOut, "⏳ Waiting for the vector store") {
 		t.Fatalf("store waiting body wrong:\n%s", storeOut)

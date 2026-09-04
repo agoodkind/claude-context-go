@@ -382,7 +382,7 @@ func TestConvergePathsReportsSlowClassificationProgress(t *testing.T) {
 		},
 		func(string) (os.FileInfo, error) {
 			statCalls++
-			if statCalls == 1 {
+			if statCalls <= 2 {
 				currentTime = currentTime.Add(convergeProgressTimeInterval)
 			}
 			return nil, os.ErrNotExist
@@ -397,14 +397,17 @@ func TestConvergePathsReportsSlowClassificationProgress(t *testing.T) {
 	if outcome.PathsProcessed != 3 {
 		t.Fatalf("PathsProcessed = %d, want 3", outcome.PathsProcessed)
 	}
-	if len(updates) != 2 {
-		t.Fatalf("progress updates = %d, want 2", len(updates))
+	if len(updates) != 3 {
+		t.Fatalf("progress updates = %d, want 3", len(updates))
 	}
 	if updates[0].PathsProcessed != 0 {
 		t.Fatalf("slow classification progress = %d, want 0 before a path finishes", updates[0].PathsProcessed)
 	}
-	if updates[1].PathsProcessed != 3 {
-		t.Fatalf("final classification progress = %d, want 3", updates[1].PathsProcessed)
+	if updates[1].PathsProcessed != 0 {
+		t.Fatalf("classification heartbeat progress = %d, want 0 before a path finishes", updates[1].PathsProcessed)
+	}
+	if updates[2].PathsProcessed != 3 {
+		t.Fatalf("final classification progress = %d, want 3", updates[2].PathsProcessed)
 	}
 }
 
@@ -528,6 +531,45 @@ func TestConvergePathsReportsFinalProgressAfterClassificationCancellation(t *tes
 	}
 	if !os.SameFile(checkpointInfo, afterInfo) {
 		t.Fatal("classification cancellation replaced the checkpoint atomically")
+	}
+}
+
+func TestConvergePathsStopsAfterHandledPathCancellation(t *testing.T) {
+	manager, _, repoPath := newTestManager(t)
+	codebase := seedConvergeCodebase(t, manager, repoPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var reindexCalls atomic.Int32
+	manager.semantic = &fakeSemantic{
+		reindex: func(context.Context, string, []model.StoredChunk, []string) error {
+			if reindexCalls.Add(1) == 1 {
+				cancel()
+			}
+			return nil
+		},
+	}
+	for _, name := range []string{"first.go", "second.go"} {
+		if err := os.WriteFile(filepath.Join(repoPath, name), []byte("package cancel\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	outcome, err := manager.convergePathsWithLstat(
+		ctx,
+		codebase.ID,
+		[]string{"first.go", "second.go"},
+		nil,
+		os.Lstat,
+	)
+	if err != nil {
+		t.Fatalf("converge after handled cancellation returned error: %v", err)
+	}
+	if outcome.PathsProcessed != 1 {
+		t.Fatalf("PathsProcessed = %d, want one handled path", outcome.PathsProcessed)
+	}
+	if reindexCalls.Load() != 1 {
+		t.Fatalf("Reindex calls = %d, want one handled path", reindexCalls.Load())
 	}
 }
 
@@ -810,7 +852,11 @@ func TestConvergeViaWatcherRegistersRunningJob(t *testing.T) {
 			t.Error("watcher converge did not stop during cleanup")
 		}
 	})
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher converge did not start")
+	}
 
 	jobs := manager.ListJobs(codebase.ID)
 	if len(jobs) != 1 {

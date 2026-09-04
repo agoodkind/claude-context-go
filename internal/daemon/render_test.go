@@ -521,7 +521,7 @@ func renderListJobsForTest(jobs []model.Job, degraded bool) string {
 }
 
 func renderStatusForTest(codebase *model.Codebase, activeJob *model.Job, display displayStatus) string {
-	statusView, templateName := resolveStatusView(*codebase, activeJob, display, waitingLabel(dependencyHealthy))
+	statusView, templateName := resolveStatusView(*codebase, activeJob, display, dependencyHealthy)
 	return render.GetIndex(view.GetIndexView{
 		Tracked:      true,
 		TemplateName: templateName,
@@ -561,7 +561,7 @@ func renderGetIndexBodyForTest(requestedPath string, tracked bool, codebase *mod
 		getIndex.Display = view.Display(display)
 		getIndex.Failure = resolveCodebaseFailure(*codebase)
 		getIndex.Quarantine = resolveQuarantineSurface(*codebase)
-		statusView, templateName := resolveStatusView(*codebase, activeJob, display, waitingLabel(health.Mode))
+		statusView, templateName := resolveStatusView(*codebase, activeJob, display, health.Mode)
 		getIndex.Status = statusView
 		getIndex.TemplateName = templateName
 		getIndex.Narrative = resolveStatusNarrative(display, codebase.CanonicalPath, collectionNotApplicable, getIndex.Failure, getIndex.Quarantine, statusView)
