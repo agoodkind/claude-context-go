@@ -19,12 +19,31 @@ func TestResolveStatusViewFallsBackToLiveChunkTotal(t *testing.T) {
 		Operation: "sync",
 		Progress:  model.Progress{FilesInCodebase: 100, FilesModified: 2},
 	}
-	statusView, templateName := resolveStatusView(codebase, &job, displayIndexing, "")
+	statusView, templateName := resolveStatusView(codebase, &job, displayIndexing, dependencyHealthy)
 	if statusView.Breakdown.ChunksTotal != 33240 {
 		t.Fatalf("ChunksTotal = %d, want the live total 33240", statusView.Breakdown.ChunksTotal)
 	}
 	if templateName != "incremental.md.tmpl" {
 		t.Fatalf("template = %q, want incremental", templateName)
+	}
+}
+
+func TestResolveStatusViewPreservesDependencyWaitLabelForPausedJob(t *testing.T) {
+	t.Parallel()
+
+	codebase := model.Codebase{CanonicalPath: "/repo"}
+	job := model.Job{
+		State:            model.JobStatePaused,
+		SchedulingReason: model.SchedulingReasonThermalSafety,
+	}
+	statusView, _ := resolveStatusView(
+		codebase,
+		&job,
+		displayWaiting,
+		dependencyStoreUnavailable,
+	)
+	if statusView.WaitLabel != "Waiting for the vector store" {
+		t.Fatalf("WaitLabel = %q, want dependency blocker", statusView.WaitLabel)
 	}
 }
 
@@ -128,7 +147,7 @@ func TestSchedulingReasonReadsCachedSchedulerState(t *testing.T) {
 func TestResolveStatusViewDiscoveredSelectsTemplate(t *testing.T) {
 	t.Parallel()
 	codebase := model.Codebase{Status: model.CodebaseStatusDiscovered, CanonicalPath: "/x"}
-	statusView, templateName := resolveStatusView(codebase, nil, displayDiscovered, "")
+	statusView, templateName := resolveStatusView(codebase, nil, displayDiscovered, dependencyHealthy)
 	if templateName != "discovered.md.tmpl" {
 		t.Fatalf("template = %q, want discovered.md.tmpl", templateName)
 	}

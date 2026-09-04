@@ -128,7 +128,7 @@ func (manager *Manager) convergePathsWithLstatAndNow(ctx context.Context, codeba
 	}
 	defer reportProgress(true, false)
 	classifiedPaths, classifyErr := classifyConvergePathsWithProgress(ctx, codebase.CanonicalPath, relativePaths, lstat, func(int32) error {
-		if reportProgress(false, false) {
+		if reportProgress(false, true) {
 			return nil
 		}
 		return ctx.Err()
