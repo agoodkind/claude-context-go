@@ -119,7 +119,13 @@ func login1SessionPropertiesFromVariants(
 	if err != nil {
 		return login1SessionProperties{}, err
 	}
-	parsed := login1SessionProperties{remote: remote, active: active, class: class}
+	parsed := login1SessionProperties{
+		remote:                 remote,
+		active:                 active,
+		class:                  class,
+		idleHint:               false,
+		idleSinceMonotonicUsec: 0,
+	}
 	if remote || !active || class != "user" {
 		return parsed, nil
 	}
