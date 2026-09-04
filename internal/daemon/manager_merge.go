@@ -148,6 +148,18 @@ func (manager *Manager) redirectIndexToAncestor(
 		var emptyCodebase model.Codebase
 		return emptyJob, emptyCodebase, err
 	}
+	if intent.Initialize {
+		initialized, initializeErr := manager.resolveAndPersistIndexPolicy(
+			codebase.ID,
+			intent,
+		)
+		if initializeErr != nil {
+			var emptyJob model.Job
+			var emptyCodebase model.Codebase
+			return emptyJob, emptyCodebase, initializeErr
+		}
+		codebase = initialized
+	}
 	slog.InfoContext(ctx, "merge.redirect_to_ancestor", "component", "daemon", "subcomponent", "merge", "requested", requestedPath, "ancestor_codebase_id", ancestor.ID)
 	return job, codebase, nil
 }
