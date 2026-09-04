@@ -4,6 +4,7 @@ package restartacceptance
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +82,79 @@ func TestRunScenarioIPreservesPausedLowPriorityPolicyAfterRestart(t *testing.T) 
 		t.Fatalf("events = %v, want %v", events, wantEvents)
 	}
 	assertSingleScenarioRecord(t, evidencePaths.EventsJSONL, "scenario_i")
+}
+
+func TestRunScenarioIReleasesLowBoundaryAfterStartHighFailure(t *testing.T) {
+	recorder, _ := scenarioTestRecorder(t)
+	releases := 0
+	_, err := runScenarioI(context.Background(), scenarioIInput{
+		StartLow: func(context.Context) (*pb.StartIndexResponse, error) {
+			return &pb.StartIndexResponse{JobId: "low", CodebaseId: "low-codebase"}, nil
+		},
+		WaitForLowBoundary: func(context.Context) error { return nil },
+		StartHigh:          func(context.Context) (*pb.StartIndexResponse, error) { return nil, errors.New("start high") },
+		ReleaseLowBoundary: func() { releases++ },
+		WaitForLowPaused: func(context.Context, string) (*pb.Job, error) {
+			return nil, errors.New("must not wait for pause")
+		},
+		CaptureLowJobs: func(context.Context, string) (map[string]struct{}, error) {
+			return nil, errors.New("must not capture jobs")
+		},
+		StopDaemon:  func(context.Context) error { return errors.New("must not stop daemon") },
+		StartDaemon: func(context.Context) error { return errors.New("must not start daemon") },
+		WaitForLowSuccessor: func(context.Context, string, map[string]struct{}) (*pb.Job, error) {
+			return nil, errors.New("must not wait for successor")
+		},
+		VerifyCloneInventory: func(context.Context) error { return errors.New("must not verify inventory") },
+		Recorder:             recorder,
+	})
+	if err == nil || !strings.Contains(err.Error(), "start high") {
+		t.Fatalf("runScenarioI error = %v, want start-high failure", err)
+	}
+	if releases != 1 {
+		t.Fatalf("low boundary releases = %d, want 1", releases)
+	}
+}
+
+func TestRunScenarioIRestartsDaemonAfterRestartFailure(t *testing.T) {
+	recorder, _ := scenarioTestRecorder(t)
+	startCalls := 0
+	_, err := runScenarioI(context.Background(), scenarioIInput{
+		StartLow: func(context.Context) (*pb.StartIndexResponse, error) {
+			return &pb.StartIndexResponse{JobId: "low", CodebaseId: "low-codebase"}, nil
+		},
+		WaitForLowBoundary: func(context.Context) error { return nil },
+		StartHigh: func(context.Context) (*pb.StartIndexResponse, error) {
+			return &pb.StartIndexResponse{JobId: "high", CodebaseId: "high-codebase"}, nil
+		},
+		ReleaseLowBoundary: func() {},
+		WaitForLowPaused: func(context.Context, string) (*pb.Job, error) {
+			return &pb.Job{Id: "low", State: "paused", EffectiveSchedulingPolicy: lowPolicy()}, nil
+		},
+		CaptureLowJobs: func(context.Context, string) (map[string]struct{}, error) {
+			return map[string]struct{}{"low": {}}, nil
+		},
+		StopDaemon: func(context.Context) error { return nil },
+		StartDaemon: func(context.Context) error {
+			startCalls++
+			if startCalls == 1 {
+				return errors.New("restart failed")
+			}
+			return nil
+		},
+		WaitForLowSuccessor: func(context.Context, string, map[string]struct{}) (*pb.Job, error) {
+			return nil, errors.New("must not wait for successor")
+		},
+		VerifyCloneInventory: func(context.Context) error { return errors.New("must not verify inventory") },
+		Recorder:             recorder,
+		Timeouts:             scenarioTimeouts{Recovery: time.Second},
+	})
+	if err == nil || !strings.Contains(err.Error(), "restart failed") {
+		t.Fatalf("runScenarioI error = %v, want restart failure", err)
+	}
+	if startCalls != 2 {
+		t.Fatalf("daemon starts = %d, want failed start and restoring start", startCalls)
+	}
 }
 
 func TestRunScenarioEKeepsClydeAliveAndRecoversSearchAndFeeder(t *testing.T) {
