@@ -44,7 +44,9 @@ func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
 		defer func() {
 			cancel()
 			if recovered := recover(); recovered != nil {
-				slog.ErrorContext(backgroundContext, "indexing goroutine panic", "err", fmt.Errorf("panic: %v", recovered), "job_id", jobID)
+				panicErr := fmt.Errorf("indexing goroutine panic: %v", recovered)
+				slog.ErrorContext(backgroundContext, "indexing goroutine panic", "err", panicErr, "job_id", jobID)
+				manager.updateJobFailed(context.WithoutCancel(backgroundContext), jobID, panicErr)
 			}
 			manager.mu.Lock()
 			delete(manager.cancels, jobID)
