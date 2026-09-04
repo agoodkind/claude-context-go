@@ -156,9 +156,6 @@ func (manager *Manager) convergePathsWithLstatAndNow(ctx context.Context, codeba
 			}
 			return outcome, wrappedWriteErr
 		}
-		if checkpointErr := manager.checkpointJob(ctx); checkpointErr != nil {
-			return outcome, checkpointErr
-		}
 	}
 	if convergeErr != nil {
 		return outcome, convergeErr
@@ -207,6 +204,9 @@ func (manager *Manager) convergeClassifiedPaths(
 		if converged {
 			changed = true
 			outcome.PathsConverged++
+			if checkpointErr := manager.checkpointJob(ctx); checkpointErr != nil {
+				return changed, checkpointErr
+			}
 		}
 		outcome.PathsProcessed++
 		if !reportProgress(false, true) {
