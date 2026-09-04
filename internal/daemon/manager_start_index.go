@@ -87,6 +87,9 @@ func (manager *Manager) startIndexWithRecovery(
 		}
 	}
 
+	// The force-cancellation loop releases the policy lock so the prior worker
+	// can reach its terminal transition. Re-probe after that loop because the
+	// collection can change while the lock is released.
 	evidence := manager.probeCollectionEvidence(ctx, canonicalPath, "StartIndex")
 	job, codebase, deduped, overlapsCodebaseID, err := manager.commitStartIndexLocked(
 		ctx,
