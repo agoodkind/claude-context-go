@@ -192,7 +192,11 @@ func TestStartIndexQueuedBehindCapReportsQueuedThenRunning(t *testing.T) {
 	if _, _, _, _, err := manager.StartIndex(context.Background(), firstRepo, testClientInfo(), defaultIndexConfig(), false, emptyAdmissionBudget); err != nil {
 		t.Fatalf("first StartIndex returned error: %v", err)
 	}
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first scheduler admission did not enter the runner")
+	}
 
 	secondJob, _, _, _, err := manager.StartIndex(context.Background(), secondRepo, testClientInfo(), defaultIndexConfig(), false, emptyAdmissionBudget)
 	if err != nil {

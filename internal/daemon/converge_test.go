@@ -932,7 +932,11 @@ func TestCancelJobStopsWatcherConverge(t *testing.T) {
 			t.Error("watcher converge did not stop during cleanup")
 		}
 	})
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher converge did not start")
+	}
 
 	jobs := manager.ListJobs(codebase.ID)
 	if len(jobs) != 1 {

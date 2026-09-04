@@ -68,11 +68,14 @@ func (manager *Manager) forgetJobJournalLocked(jobID string) {
 // is push-driven and is not resumed from the registry.
 func (manager *Manager) reconcileJournalOnStartLocked() {
 	now := clock.Now()
-	documentCodebaseChanged := false
+	registryChanged := false
 	for id, job := range manager.jobs {
 		switch job.State {
 		case model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling:
 		case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
+			if manager.clearTerminalJobOwnershipLocked(id, job, now) {
+				registryChanged = true
+			}
 			continue
 		default:
 			continue
@@ -101,13 +104,41 @@ func (manager *Manager) reconcileJournalOnStartLocked() {
 			codebase.ActiveJobID = ""
 			codebase.UpdatedAt = now
 			manager.codebases[codebase.ID] = codebase
-			documentCodebaseChanged = true
+			registryChanged = true
 		}
 		slog.Warn("orphan job sanitized in journal after restart", "job_id", id, "codebase_id", job.CodebaseID, "files_processed", job.Progress.FilesProcessed, "chunks_embedded", job.Progress.ChunksEmbedded)
 	}
-	if documentCodebaseChanged {
+	if registryChanged {
 		if err := manager.saveLocked(); err != nil {
-			slog.Error("write registry after document orphan recovery failed", "err", err)
+			slog.Error("write registry after journal recovery failed", "err", err)
 		}
 	}
+}
+
+func (manager *Manager) clearTerminalJobOwnershipLocked(
+	jobID string,
+	job model.Job,
+	now time.Time,
+) bool {
+	codebase, found := manager.codebases[job.CodebaseID]
+	if !found || codebase.ActiveJobID != jobID {
+		return false
+	}
+	codebase.ActiveJobID = ""
+	switch job.State {
+	case model.JobStateCompleted:
+		codebase.Status = model.CodebaseStatusIndexed
+	case model.JobStateFailed:
+		codebase.Status = model.CodebaseStatusFailed
+	case model.JobStateCancelled:
+		codebase.Status = codebaseStatusAfterCancellation(codebase)
+	case model.JobStateQueued,
+		model.JobStateRunning,
+		model.JobStatePaused,
+		model.JobStateCancelling:
+		return false
+	}
+	codebase.UpdatedAt = now
+	manager.codebases[codebase.ID] = codebase
+	return true
 }

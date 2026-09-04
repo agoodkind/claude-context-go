@@ -403,7 +403,7 @@ func (manager *Manager) updateJobCompleted(ctx context.Context, jobID string, re
 	manager.policyMutationMutex.Lock()
 	followup := manager.updateJobCompletedWithPolicy(ctx, jobID, result)
 	manager.policyMutationMutex.Unlock()
-	manager.runDrainedFollowup(ctx, followup)
+	manager.runCancellationFollowup(ctx, followup)
 }
 
 func (manager *Manager) updateJobCompletedWithPolicy(ctx context.Context, jobID string, result indexer.Result) cancellationFollowup {
@@ -489,9 +489,10 @@ func (manager *Manager) updateJobCompletedWithPolicy(ctx context.Context, jobID 
 	}
 	manager.notifyIndexReady(ctx, codebase)
 	return cancellationFollowup{
-		codebaseID:   codebase.ID,
-		drainedJobID: drainedJobID,
-		drained:      drained,
+		codebaseID:    codebase.ID,
+		drainedJobID:  drainedJobID,
+		drained:       drained,
+		notifyStopped: false,
 	}
 }
 
@@ -729,16 +730,6 @@ func emptyCancellationFollowup() cancellationFollowup {
 		drained:       false,
 		notifyStopped: false,
 	}
-}
-
-func (manager *Manager) runDrainedFollowup(
-	ctx context.Context,
-	followup cancellationFollowup,
-) {
-	if !followup.drained {
-		return
-	}
-	manager.runDrainedJob(ctx, followup.codebaseID, followup.drainedJobID)
 }
 
 func (manager *Manager) runCancellationFollowup(
