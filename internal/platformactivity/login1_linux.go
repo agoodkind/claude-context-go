@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"time"
 
 	"github.com/coreos/go-systemd/v22/login1"
@@ -32,7 +31,10 @@ func (reader *login1SessionReader) Read(ctx context.Context) ([]sessionActivity,
 	if err != nil {
 		return nil, fmt.Errorf("list login1 sessions: %w", err)
 	}
-	currentUID := uint32(os.Getuid())
+	currentUID, available := currentUserID()
+	if !available {
+		return nil, fmt.Errorf("read current user ID")
+	}
 	activities := make([]sessionActivity, 0, len(sessions))
 	for _, session := range sessions {
 		if session.UID != currentUID {
