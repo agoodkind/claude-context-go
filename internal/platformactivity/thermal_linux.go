@@ -4,6 +4,7 @@ package platformactivity
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,10 +63,12 @@ func readThermalActivity(root string) thermalActivity {
 func readThermalInteger(path string) (int64, error) {
 	value, err := os.ReadFile(path)
 	if err != nil {
+		slog.Error("read thermal value", "error", err)
 		return 0, fmt.Errorf("read thermal value %s: %w", path, err)
 	}
 	reading, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
 	if err != nil {
+		slog.Error("parse thermal value", "error", err)
 		return 0, fmt.Errorf("parse thermal value %s: %w", path, err)
 	}
 	return reading, nil

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/godbus/dbus/v5"
+
 	"goodkind.io/lm-semantic-search/internal/model"
 )
 
@@ -151,52 +153,56 @@ func TestLoginSessionDurationOverflowIsUnavailable(t *testing.T) {
 }
 
 func TestLoginSessionInvalidPropertiesAreRejected(t *testing.T) {
-	valid := map[string]any{
-		"Remote":                 false,
-		"Active":                 true,
-		"Class":                  "user",
-		"IdleHint":               true,
-		"IdleSinceHintMonotonic": uint64(100),
+	valid := login1PropertyVariants{
+		login1RemoteProperty:                 dbus.MakeVariant(false),
+		login1ActiveProperty:                 dbus.MakeVariant(true),
+		login1ClassProperty:                  dbus.MakeVariant("user"),
+		login1IdleHintProperty:               dbus.MakeVariant(true),
+		login1IdleSinceMonotonicUsecProperty: dbus.MakeVariant(uint64(100)),
 	}
 	testCases := map[string]struct {
 		name  string
-		value any
+		value dbus.Variant
 	}{
-		"remote":         {name: "Remote", value: "false"},
-		"active":         {name: "Active", value: uint64(1)},
-		"class":          {name: "Class", value: true},
-		"idle hint":      {name: "IdleHint", value: "true"},
-		"idle timestamp": {name: "IdleSinceHintMonotonic", value: int64(100)},
+		"remote":    {name: login1RemoteProperty, value: dbus.MakeVariant("false")},
+		"active":    {name: login1ActiveProperty, value: dbus.MakeVariant(uint64(1))},
+		"class":     {name: login1ClassProperty, value: dbus.MakeVariant(true)},
+		"idle hint": {name: login1IdleHintProperty, value: dbus.MakeVariant("true")},
+		"idle timestamp": {
+			name:  login1IdleSinceMonotonicUsecProperty,
+			value: dbus.MakeVariant(int64(100)),
+		},
 	}
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
-			properties := make(map[string]any, len(valid))
+			properties := make(login1PropertyVariants, len(valid))
 			for propertyName, value := range valid {
 				properties[propertyName] = value
 			}
 			properties[testCase.name] = testCase.value
 
-			if _, err := sessionActivityFromProperties(501, properties); err == nil {
-				t.Fatal("sessionActivityFromProperties returned no error")
+			if _, err := login1SessionPropertiesFromVariants(properties); err == nil {
+				t.Fatal("login1SessionPropertiesFromVariants returned no error")
 			}
 		})
 	}
 }
 
 func TestLoginSessionDoesNotRequireIdlePropertiesForUnselectedSession(t *testing.T) {
-	properties := map[string]any{
-		"Remote":                 true,
-		"Active":                 true,
-		"Class":                  "user",
-		"IdleHint":               "invalid",
-		"IdleSinceHintMonotonic": "invalid",
+	properties := login1PropertyVariants{
+		login1RemoteProperty:                 dbus.MakeVariant(true),
+		login1ActiveProperty:                 dbus.MakeVariant(true),
+		login1ClassProperty:                  dbus.MakeVariant("user"),
+		login1IdleHintProperty:               dbus.MakeVariant("invalid"),
+		login1IdleSinceMonotonicUsecProperty: dbus.MakeVariant("invalid"),
 	}
 
-	activity, err := sessionActivityFromProperties(501, properties)
+	parsed, err := login1SessionPropertiesFromVariants(properties)
 	if err != nil {
-		t.Fatalf("sessionActivityFromProperties: %v", err)
+		t.Fatalf("login1SessionPropertiesFromVariants: %v", err)
 	}
+	activity := sessionActivityFromProperties(501, parsed)
 	if !activity.Remote {
 		t.Fatal("Remote = false, want true")
 	}
