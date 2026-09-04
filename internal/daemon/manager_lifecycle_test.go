@@ -94,6 +94,14 @@ func TestIndexLifecycleHooksCanCallBackIntoManager(t *testing.T) {
 					}
 				},
 				indexStopped: func(_ context.Context, _ string) {
+					if test.name == "cancelled update" || test.name == "cancel job" {
+						if !manager.policyMutationMutex.TryLock() {
+							t.Error("IndexStopped hook ran while policy mutation lock was held")
+							return
+						}
+						manager.policyMutationMutex.Unlock()
+						return
+					}
 					if _, found := manager.GetJob(job.ID); !found {
 						t.Errorf("GetJob(%s) not found from IndexStopped hook", job.ID)
 					}
