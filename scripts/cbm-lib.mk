@@ -1,6 +1,6 @@
 LMS_AR ?= $(AR)
 LMS_OBJCOPY ?= objcopy
-LMS_NM ?= $(NM)
+LMS_NM ?= $(if $(NM),$(NM),nm)
 
 # Mirror the engine binary's own source set (PROD_SRCS plus the extraction and
 # vendored-compression sources), excluding only src/main.c, which is the CLI
