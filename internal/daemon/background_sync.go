@@ -741,7 +741,7 @@ func (manager *Manager) startDetachedJob(jobID string) error {
 		manager.mu.Lock()
 		currentCodebase, found := manager.codebases[previousCodebase.ID]
 		if found && currentCodebase.ActiveJobID == jobID {
-			currentCodebase.ActiveJobID = previousCodebase.ActiveJobID
+			manager.codebases[previousCodebase.ID] = previousCodebase
 			if saveErr := manager.saveLocked(); saveErr != nil {
 				slog.Error("restore converge ownership failed", "job_id", jobID, "err", saveErr)
 			}
