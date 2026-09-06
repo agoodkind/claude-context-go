@@ -508,6 +508,7 @@ func (syncer *BackgroundSync) runWatcherConverge(
 			syncer.manager.updateDetachedJobFailed(terminalCtx, registration.job.ID, capacityErr)
 			slog.ErrorContext(registrationCtx, "watcher.sync_lock_failed", "component", "daemon", "subcomponent", "watcher", "codebase_id", codebaseID, "err", capacityErr)
 		} else {
+			syncer.requeuePaths(codebaseID, relativePaths)
 			syncer.manager.updateDetachedJobCancelled(terminalCtx, registration.job.ID)
 		}
 		return

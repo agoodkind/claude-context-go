@@ -28,6 +28,34 @@ func (manager *Manager) activeJobSnapshotLocked(codebase model.Codebase) *model.
 }
 
 func (manager *Manager) cancelActiveJobForPath(ctx context.Context, canonicalPath string) error {
+	for {
+		manager.mu.Lock()
+		codebase, found := manager.findCodebaseByExactRoot(canonicalPath)
+		manager.mu.Unlock()
+		if !found || codebase.ActiveJobID == "" {
+			return nil
+		}
+		jobID := codebase.ActiveJobID
+		jobDone, cancel, err := manager.beginActiveJobCancellation(codebase)
+		if err != nil {
+			return err
+		}
+		if !manager.activeJobMatches(codebase.ID, jobID) {
+			continue
+		}
+		if cancel == nil {
+			manager.updateJobCancelled(ctx, jobID)
+			return nil
+		}
+		cancel()
+		if err := waitForJobDone(ctx, jobDone); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func (manager *Manager) activeJobMatches(codebaseID string, jobID string) bool {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	codebase, found := manager.codebases[codebaseID]

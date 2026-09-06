@@ -262,7 +262,7 @@ func (capacity *jobCapacity) retryAfter(
 	}
 	capacity.releaseSyncLockLocked(context.WithoutCancel(ctx))
 	capacity.mu.Unlock()
-	if err := capacity.lease.RetryAfter(ctx, delay, reason); err != nil {
+	if err := capacity.lease.RetrySharedAfter(ctx, delay, reason); err != nil {
 		wrappedErr := fmt.Errorf("retry scheduler lease: %w", err)
 		slog.WarnContext(ctx, "retry scheduler lease stopped", "job_id", capacity.jobID, "err", wrappedErr)
 		return wrappedErr
@@ -322,11 +322,15 @@ func startStallRelease(
 		defer close(watchdog.finished)
 		defer func() {
 			if recovered := recover(); recovered != nil {
+				failure := fmt.Errorf("indexing capacity watchdog panic: %v", recovered)
 				slog.ErrorContext(ctx, "indexing capacity watchdog panic",
 					"component", "daemon",
 					"subcomponent", "capacity",
-					"err", fmt.Errorf("panic: %v", recovered),
+					"err", failure,
 				)
+				watchdog.err = failure
+				capacity.release(context.WithoutCancel(ctx))
+				capacity.manager.failScheduledJob(context.WithoutCancel(ctx), capacity.jobID, failure)
 			}
 		}()
 		graceTimer := time.NewTimer(grace)

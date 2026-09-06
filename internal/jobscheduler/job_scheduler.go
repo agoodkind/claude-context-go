@@ -61,11 +61,13 @@ type Scheduler struct {
 	nextEntryGeneration uint64
 	pauseClaims         map[string]uint64
 	retryWaiting        map[string]time.Time
+	retryShared         map[string]bool
 	retryTimer          *time.Timer
 	retryTimerDeadline  time.Time
 	retryGeneration     uint64
 	yields              uint64
 	changed             chan struct{}
+	now                 func() time.Time
 }
 
 // Lease owns one scheduler entry across running, paused, and waiting states.
@@ -93,11 +95,13 @@ func New(capacity int) *Scheduler {
 		pauseClaims:         map[string]uint64{},
 		nextEntryGeneration: 0,
 		retryWaiting:        map[string]time.Time{},
+		retryShared:         map[string]bool{},
 		retryTimer:          nil,
 		retryTimerDeadline:  time.Time{},
 		retryGeneration:     0,
 		yields:              0,
 		changed:             make(chan struct{}),
+		now:                 time.Now,
 	}
 }
 
@@ -286,6 +290,7 @@ func (claim *PauseClaim) Yield() bool {
 	}
 	delete(scheduler.pauseClaims, claim.lease.jobID)
 	delete(scheduler.retryWaiting, claim.lease.jobID)
+	delete(scheduler.retryShared, claim.lease.jobID)
 	entry.State = EntryPaused
 	entry.Reason = claim.reason
 	entry.PauseRequested = false
@@ -310,6 +315,26 @@ func (lease *Lease) RetryAfter(
 	delay time.Duration,
 	reason string,
 ) error {
+	return lease.retryAfter(ctx, delay, reason, false)
+}
+
+// RetrySharedAfter yields capacity until the next probe of a shared external
+// resource. Entries with the same reason join that round so admission still
+// selects the highest-priority waiter when the resource may be available.
+func (lease *Lease) RetrySharedAfter(
+	ctx context.Context,
+	delay time.Duration,
+	reason string,
+) error {
+	return lease.retryAfter(ctx, delay, reason, true)
+}
+
+func (lease *Lease) retryAfter(
+	ctx context.Context,
+	delay time.Duration,
+	reason string,
+	shared bool,
+) error {
 	if err := ctx.Err(); err != nil {
 		wrappedErr := fmt.Errorf("retry scheduler lease: %w", err)
 		slog.Warn("retry scheduler lease canceled", "job_id", lease.jobID, "err", wrappedErr)
@@ -333,9 +358,11 @@ func (lease *Lease) RetryAfter(
 	entry.State = EntryPaused
 	entry.Reason = reason
 	entry.PauseRequested = false
-	lease.scheduler.retryWaiting[lease.jobID] = time.Now().Add(delay)
+	now := lease.scheduler.now()
+	lease.scheduler.retryWaiting[lease.jobID] = now.Add(delay)
+	lease.scheduler.retryShared[lease.jobID] = shared
 	lease.scheduler.yields++
-	lease.scheduler.scheduleNextRetryLocked(time.Now())
+	lease.scheduler.scheduleNextRetryLocked(now)
 	lease.scheduler.rebalanceLocked()
 	lease.scheduler.notifyLocked()
 	lease.scheduler.mutex.Unlock()
@@ -363,6 +390,7 @@ func (lease *Lease) Reacquire(ctx context.Context) error {
 	}
 	if entry.State == EntryPaused {
 		delete(lease.scheduler.retryWaiting, lease.jobID)
+		delete(lease.scheduler.retryShared, lease.jobID)
 		entry.State = EntryWaiting
 		entry.PauseRequested = false
 		lease.scheduler.rebalanceLocked()
@@ -386,6 +414,7 @@ func (lease *Lease) Release() {
 	delete(lease.scheduler.pauseClaims, lease.jobID)
 	delete(lease.scheduler.pauseGenerations, lease.jobID)
 	delete(lease.scheduler.retryWaiting, lease.jobID)
+	delete(lease.scheduler.retryShared, lease.jobID)
 	lease.scheduler.rebalanceLocked()
 	lease.scheduler.notifyLocked()
 }
@@ -444,6 +473,7 @@ func (scheduler *Scheduler) cancelWaitLocked(
 		delete(scheduler.pauseClaims, entry.JobID)
 		delete(scheduler.pauseGenerations, entry.JobID)
 		delete(scheduler.retryWaiting, entry.JobID)
+		delete(scheduler.retryShared, entry.JobID)
 	} else {
 		entry.State = EntryPaused
 		entry.PauseRequested = false
@@ -460,7 +490,7 @@ func (scheduler *Scheduler) cancelWaitLocked(
 func (scheduler *Scheduler) startRetryRoundLocked(delay time.Duration) {
 	scheduler.retryGeneration++
 	generation := scheduler.retryGeneration
-	scheduler.retryTimerDeadline = time.Now().Add(delay)
+	scheduler.retryTimerDeadline = scheduler.now().Add(delay)
 	scheduler.retryTimer = time.AfterFunc(delay, func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -480,17 +510,34 @@ func (scheduler *Scheduler) openRetryRound(generation uint64) {
 	}
 	scheduler.retryTimer = nil
 	scheduler.retryTimerDeadline = time.Time{}
-	now := time.Now()
+	now := scheduler.now()
+	sharedReasons := map[string]struct{}{}
 	for jobID, deadline := range scheduler.retryWaiting {
-		if deadline.After(now) {
+		if deadline.After(now) || !scheduler.retryShared[jobID] {
 			continue
 		}
 		entry, found := scheduler.entries[jobID]
+		if found && entry.State == EntryPaused {
+			sharedReasons[entry.Reason] = struct{}{}
+		}
+	}
+	for jobID, deadline := range scheduler.retryWaiting {
+		entry, found := scheduler.entries[jobID]
+		if !found {
+			delete(scheduler.retryWaiting, jobID)
+			delete(scheduler.retryShared, jobID)
+			continue
+		}
+		_, sharedRound := sharedReasons[entry.Reason]
+		if deadline.After(now) && !sharedRound {
+			continue
+		}
 		if found && entry.State == EntryPaused {
 			entry.State = EntryWaiting
 			entry.PauseRequested = false
 		}
 		delete(scheduler.retryWaiting, jobID)
+		delete(scheduler.retryShared, jobID)
 	}
 	scheduler.scheduleNextRetryLocked(now)
 	scheduler.rebalanceLocked()
@@ -507,10 +554,7 @@ func (scheduler *Scheduler) scheduleNextRetryLocked(now time.Time) {
 			next = deadline
 		}
 	}
-	delay := next.Sub(now)
-	if delay < 0 {
-		delay = 0
-	}
+	delay := max(next.Sub(now), 0)
 	if scheduler.retryTimer != nil {
 		if !next.Before(scheduler.retryTimerDeadline) {
 			return

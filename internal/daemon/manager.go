@@ -77,6 +77,7 @@ type Manager struct {
 	conversationChunkByteBudget int
 	mu                          sync.Mutex
 	transitionMutex             sync.Mutex
+	policyMutationMutex         sync.Mutex
 	codebases                   map[string]model.Codebase
 	jobs                        map[string]model.Job
 	conversationJobs            map[string]conversationJobPayload
@@ -204,6 +205,7 @@ func newManagerWithSemanticFactory(
 		conversationChunkByteBudget: conversationChunkMaxBytes,
 		mu:                          sync.Mutex{},
 		transitionMutex:             sync.Mutex{},
+		policyMutationMutex:         sync.Mutex{},
 		codebases:                   map[string]model.Codebase{},
 		jobs:                        map[string]model.Job{},
 		conversationJobs:            map[string]conversationJobPayload{},

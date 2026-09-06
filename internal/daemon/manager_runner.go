@@ -25,10 +25,20 @@ func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
 	)
 	done := make(chan struct{})
 
+	manager.policyMutationMutex.Lock()
 	manager.mu.Lock()
+	job, found := manager.jobs[jobID]
+	if !found || isTerminalJobState(job.State) {
+		manager.mu.Unlock()
+		manager.policyMutationMutex.Unlock()
+		cancel()
+		close(done)
+		return
+	}
 	manager.cancels[jobID] = cancel
 	manager.done[jobID] = done
 	manager.mu.Unlock()
+	manager.policyMutationMutex.Unlock()
 
 	go func() {
 		defer func() {
@@ -99,6 +109,53 @@ func (manager *Manager) runJobAsync(ctx context.Context, jobID string) {
 			return
 		}
 	}()
+}
+
+func (manager *Manager) finishCapacityAdmissionFailure(
+	ctx context.Context,
+	jobID string,
+	outcome syncLockOutcome,
+	err error,
+) {
+	if outcome == syncLockFailed {
+		manager.updateJobFailed(ctx, jobID, err)
+		return
+	}
+	manager.updateJobCancelled(ctx, jobID)
+}
+
+func (manager *Manager) retryJobStart(
+	ctx context.Context,
+	jobID string,
+	retryStart bool,
+	attempt int,
+) bool {
+	if !retryStart || attempt >= jobStartRetryAttempts {
+		return false
+	}
+	select {
+	case <-time.After(jobStartRetryDelay):
+		return true
+	case <-ctx.Done():
+		manager.updateJobCancelled(ctx, jobID)
+		return false
+	}
+}
+
+func (manager *Manager) refreshSyncLockAfterAdmission(
+	ctx context.Context,
+	capacity *jobCapacity,
+	holdSyncLock bool,
+) (syncLockOutcome, error) {
+	if holdSyncLock || manager.semantic == nil || !manager.semantic.Available() {
+		return syncLockAcquired, nil
+	}
+	outcome, err := capacity.acquireSyncLock(ctx)
+	if outcome != syncLockAcquired {
+		return outcome, err
+	}
+	capacity.holdSyncLock = true
+	return syncLockAcquired, nil
 }
 
 func (manager *Manager) jobIsQueued(jobID string) bool {

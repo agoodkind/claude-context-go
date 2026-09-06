@@ -228,7 +228,7 @@ func TestSchedulerRetryRoundAdmitsHighestPriorityFirst(t *testing.T) {
 
 	lowRetry := make(chan error, 1)
 	go func() {
-		lowRetry <- lowLease.RetryAfter(
+		lowRetry <- lowLease.RetrySharedAfter(
 			context.Background(),
 			time.Hour,
 			"waiting for sync lock",
@@ -240,7 +240,7 @@ func TestSchedulerRetryRoundAdmitsHighestPriorityFirst(t *testing.T) {
 	defer highLease.Release()
 	highRetry := make(chan error, 1)
 	go func() {
-		highRetry <- highLease.RetryAfter(
+		highRetry <- highLease.RetrySharedAfter(
 			context.Background(),
 			time.Hour,
 			"waiting for sync lock",
@@ -248,7 +248,7 @@ func TestSchedulerRetryRoundAdmitsHighestPriorityFirst(t *testing.T) {
 	}()
 	waitForSchedulerCounts(t, scheduler, model.JobPriorityHigh, 0, 0, 1)
 	scheduler.mutex.Lock()
-	scheduler.retryWaiting[highLease.jobID] = time.Now()
+	scheduler.retryWaiting[lowLease.jobID] = time.Now()
 	scheduler.mutex.Unlock()
 	scheduler.openRetryRound(scheduler.retryGeneration)
 
