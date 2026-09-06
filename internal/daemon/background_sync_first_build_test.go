@@ -379,6 +379,37 @@ func TestRegisterConvergeJobRequeuesPathsWhenJournalQueuedFails(t *testing.T) {
 	}
 }
 
+func TestStartDetachedJobRestoresCodebaseAfterRunningJournalFailure(t *testing.T) {
+	manager, _, repoPath := newTestManager(t)
+	codebase := seedConvergeCodebase(t, manager, repoPath)
+	syncer := NewBackgroundSync(manager.config, manager)
+	registration, _, err := syncer.registerConvergeJob(
+		context.Background(),
+		codebase,
+		[]string{"main.go"},
+	)
+	if err != nil {
+		t.Fatalf("registerConvergeJob: %v", err)
+	}
+	defer registration.release()
+	manager.appendJobTransition = func(event model.JobEvent) error {
+		if event.Event == "job_running" {
+			return errors.New("journal unavailable")
+		}
+		return nil
+	}
+
+	if err := manager.startDetachedJob(registration.job.ID); err == nil {
+		t.Fatal("startDetachedJob returned nil after running journal failure")
+	}
+	manager.mu.Lock()
+	got := manager.codebases[codebase.ID]
+	manager.mu.Unlock()
+	if got.Status != codebase.Status || got.ActiveJobID != codebase.ActiveJobID {
+		t.Fatalf("codebase after running journal failure = %+v, want %+v", got, codebase)
+	}
+}
+
 func TestDetachedJobTerminalTransitionsPreserveFirstTerminalState(t *testing.T) {
 	testCases := []struct {
 		name   string
