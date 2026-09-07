@@ -274,11 +274,11 @@ func appendJobJournalEvent(
 
 func (manager *Manager) closeJobJournal() {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	if manager.jobJournal == nil {
-		return
-	}
-	manager.jobJournal.close()
+	journal := manager.jobJournal
 	manager.jobJournal = nil
+	manager.mu.Unlock()
+
+	if journal != nil {
+		journal.close()
+	}
 }

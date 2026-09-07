@@ -48,7 +48,7 @@ func TestPriorityPauseFinishesCurrentFileBeforeRelease(t *testing.T) {
 		t.Fatalf("write pause.go: %v", err)
 	}
 
-	scheduler := jobscheduler.New(1)
+	scheduler := jobscheduler.New(context.Background(), 1, nil)
 	lowLease := acquirePauseTestLease(t, scheduler, job.ID, model.JobPriorityLow, 1)
 	defer lowLease.Release()
 	highCancel, highResult := startPauseTestAcquire(scheduler, "job-high", model.JobPriorityHigh, 2)
@@ -82,7 +82,7 @@ func TestPriorityPauseFinishesCurrentFileBeforeRelease(t *testing.T) {
 func TestPausedJobReleasesLeaseAndResumesSameJob(t *testing.T) {
 	manager, _, repoPath := newTestManager(t)
 	job := seedPauseTestJob(t, manager, repoPath, model.CodebaseKindCode)
-	scheduler := jobscheduler.New(1)
+	scheduler := jobscheduler.New(context.Background(), 1, nil)
 	lease := acquirePauseTestLease(t, scheduler, job.ID, model.JobPriorityLow, 1)
 	defer lease.Release()
 	highCancel, highResult := startPauseTestAcquire(scheduler, "job-high", model.JobPriorityHigh, 2)
@@ -208,7 +208,7 @@ func TestPauseJournalFailureTerminatesBeforeRelease(t *testing.T) {
 	manager.appendJobTransition = func(model.JobEvent) error {
 		return errors.New("pause barrier failed")
 	}
-	scheduler := jobscheduler.New(1)
+	scheduler := jobscheduler.New(context.Background(), 1, nil)
 	lease := acquirePauseTestLease(t, scheduler, job.ID, model.JobPriorityLow, 1)
 	highCancel, highResult := startPauseTestAcquire(scheduler, "job-high", model.JobPriorityHigh, 2)
 	defer highCancel()
@@ -238,7 +238,7 @@ func TestResumeJournalFailureTerminatesAndReleasesLease(t *testing.T) {
 		}
 		return nil
 	}
-	scheduler := jobscheduler.New(1)
+	scheduler := jobscheduler.New(context.Background(), 1, nil)
 	lease := acquirePauseTestLease(t, scheduler, job.ID, model.JobPriorityLow, 1)
 	highCancel, highResult := startPauseTestAcquire(scheduler, "job-high", model.JobPriorityHigh, 2)
 	defer highCancel()

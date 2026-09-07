@@ -676,16 +676,18 @@ func (manager *Manager) updateJobCancelled(ctx context.Context, jobID string) {
 }
 
 type cancellationFollowup struct {
-	codebaseID   string
-	drainedJobID string
-	drained      bool
+	codebaseID    string
+	drainedJobID  string
+	drained       bool
+	notifyStopped bool
 }
 
 func emptyCancellationFollowup() cancellationFollowup {
 	return cancellationFollowup{
-		codebaseID:   "",
-		drainedJobID: "",
-		drained:      false,
+		codebaseID:    "",
+		drainedJobID:  "",
+		drained:       false,
+		notifyStopped: false,
 	}
 }
 
@@ -693,6 +695,9 @@ func (manager *Manager) runCancellationFollowup(
 	ctx context.Context,
 	followup cancellationFollowup,
 ) {
+	if followup.notifyStopped {
+		manager.notifyIndexStopped(ctx, followup.codebaseID)
+	}
 	if !followup.drained {
 		return
 	}
@@ -756,11 +761,11 @@ func (manager *Manager) updateJobCancelledWithPolicy(
 	drainedJobID, drained := manager.drainPendingJobLocked(ctx, codebase.ID)
 	codebaseID := codebase.ID
 	manager.mu.Unlock()
-	manager.notifyIndexStopped(ctx, codebaseID)
 	return cancellationFollowup{
-		codebaseID:   codebaseID,
-		drainedJobID: drainedJobID,
-		drained:      drained,
+		codebaseID:    codebaseID,
+		drainedJobID:  drainedJobID,
+		drained:       drained,
+		notifyStopped: true,
 	}
 }
 

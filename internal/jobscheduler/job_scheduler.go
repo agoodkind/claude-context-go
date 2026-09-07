@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"goodkind.io/lm-semantic-search/internal/model"
+	"goodkind.io/lm-semantic-search/internal/platformactivity"
 )
 
 const (
@@ -17,6 +18,13 @@ const (
 	ReasonWaitingForCapacity = "waiting for capacity"
 	// ReasonHigherPriorityWork means higher-priority work controls admission.
 	ReasonHigherPriorityWork = "higher-priority work"
+	// ReasonActivityUnavailable means quiet work cannot observe input idle time.
+	ReasonActivityUnavailable = "input activity unavailable"
+	// ReasonWaitingForInputIdle means the configured idle duration has not elapsed.
+	ReasonWaitingForInputIdle = "waiting for input idle"
+	// ReasonThermalUnsafe means quiet work cannot run under the current thermal state.
+	ReasonThermalUnsafe    = "thermal state unsafe"
+	activitySampleInterval = 2 * time.Second
 )
 
 // EntryState records one scheduler entry's private lifecycle.
@@ -50,6 +58,7 @@ type Snapshot struct {
 	Queued   map[model.JobPriority]int
 	Paused   map[model.JobPriority]int
 	Yields   uint64
+	Activity platformactivity.Snapshot
 }
 
 // Scheduler admits jobs and requests cooperative priority pauses.
@@ -68,6 +77,11 @@ type Scheduler struct {
 	yields              uint64
 	changed             chan struct{}
 	now                 func() time.Time
+	activitySource      platformactivity.Source
+	activity            platformactivity.Snapshot
+	activityCancel      context.CancelFunc
+	activityDone        chan struct{}
+	closeOnce           sync.Once
 }
 
 // Lease owns one scheduler entry across running, paused, and waiting states.
@@ -85,15 +99,19 @@ type PauseClaim struct {
 	reason     string
 }
 
-// New creates a scheduler with the supplied capacity.
-func New(capacity int) *Scheduler {
-	return &Scheduler{
+// New creates a scheduler that samples host activity when a source is supplied.
+func New(
+	ctx context.Context,
+	capacity int,
+	activitySource platformactivity.Source,
+) *Scheduler {
+	scheduler := &Scheduler{
 		mutex:               sync.Mutex{},
 		capacity:            capacity,
 		entries:             map[string]*Entry{},
 		pauseGenerations:    map[string]uint64{},
-		pauseClaims:         map[string]uint64{},
 		nextEntryGeneration: 0,
+		pauseClaims:         map[string]uint64{},
 		retryWaiting:        map[string]time.Time{},
 		retryShared:         map[string]bool{},
 		retryTimer:          nil,
@@ -102,7 +120,113 @@ func New(capacity int) *Scheduler {
 		yields:              0,
 		changed:             make(chan struct{}),
 		now:                 time.Now,
+		activitySource:      activitySource,
+		activity: platformactivity.Snapshot{
+			InputAvailable:   false,
+			InputIdleFor:     0,
+			InputReason:      ReasonActivityUnavailable,
+			ThermalAvailable: false,
+			ThermalUnsafe:    false,
+			ThermalReason:    "",
+		},
+		activityCancel: nil,
+		activityDone:   nil,
+		closeOnce:      sync.Once{},
 	}
+	if activitySource == nil {
+		return scheduler
+	}
+	if activity, sampled := sampleActivitySource(ctx, activitySource); sampled {
+		scheduler.activity = activity
+	} else {
+		scheduler.activity = unavailableActivitySnapshot()
+	}
+	activityContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	scheduler.activityCancel = cancel
+	scheduler.activityDone = make(chan struct{})
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error(
+					"activity sampler panic",
+					"err",
+					fmt.Errorf("panic: %v", recovered),
+				)
+			}
+		}()
+		scheduler.runActivitySampler(activityContext)
+	}()
+	return scheduler
+}
+
+// Close stops activity sampling and closes its source once.
+func (scheduler *Scheduler) Close() {
+	scheduler.closeOnce.Do(func() {
+		if scheduler.activityCancel == nil {
+			return
+		}
+		scheduler.activityCancel()
+		<-scheduler.activityDone
+		scheduler.activitySource.Close()
+	})
+}
+
+func (scheduler *Scheduler) runActivitySampler(ctx context.Context) {
+	defer close(scheduler.activityDone)
+	ticker := time.NewTicker(activitySampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scheduler.sampleActivity(ctx)
+		}
+	}
+}
+
+func (scheduler *Scheduler) sampleActivity(ctx context.Context) {
+	activity, sampled := sampleActivitySource(ctx, scheduler.activitySource)
+	if !sampled {
+		activity = unavailableActivitySnapshot()
+	}
+	scheduler.mutex.Lock()
+	defer scheduler.mutex.Unlock()
+	if scheduler.activity == activity {
+		return
+	}
+	scheduler.activity = activity
+	scheduler.rebalanceLocked()
+	scheduler.notifyLocked()
+}
+
+func unavailableActivitySnapshot() platformactivity.Snapshot {
+	return platformactivity.Snapshot{
+		InputAvailable:   false,
+		InputIdleFor:     0,
+		InputReason:      ReasonActivityUnavailable,
+		ThermalAvailable: false,
+		ThermalUnsafe:    false,
+		ThermalReason:    ReasonActivityUnavailable,
+	}
+}
+
+func sampleActivitySource(
+	ctx context.Context,
+	source platformactivity.Source,
+) (snapshot platformactivity.Snapshot, sampled bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error(
+				"activity source sample panic",
+				"err",
+				fmt.Errorf("panic: %v", recovered),
+			)
+			snapshot = unavailableActivitySnapshot()
+			sampled = false
+		}
+	}()
+	return source.Sample(ctx), true
 }
 
 // Acquire registers an entry and waits until it owns capacity or ctx ends.
@@ -188,6 +312,7 @@ func (scheduler *Scheduler) Snapshot() Snapshot {
 		Queued:   newSchedulerPriorityCounts(),
 		Paused:   newSchedulerPriorityCounts(),
 		Yields:   scheduler.yields,
+		Activity: scheduler.activity,
 	}
 	for _, entry := range scheduler.entries {
 		switch entry.State {
@@ -554,7 +679,8 @@ func (scheduler *Scheduler) scheduleNextRetryLocked(now time.Time) {
 			next = deadline
 		}
 	}
-	delay := max(next.Sub(now), 0)
+	delay := next.Sub(now)
+	delay = max(delay, 0)
 	if scheduler.retryTimer != nil {
 		if !next.Before(scheduler.retryTimerDeadline) {
 			return
@@ -567,7 +693,7 @@ func (scheduler *Scheduler) scheduleNextRetryLocked(now time.Time) {
 }
 
 func (scheduler *Scheduler) rebalanceLocked() {
-	waiting := scheduler.waitingEntriesLocked()
+	waiting := scheduler.eligibleWaitingEntriesLocked()
 	runningCount := scheduler.runningCountLocked()
 	for runningCount < scheduler.capacity && len(waiting) > 0 {
 		entry := waiting[0]
@@ -578,11 +704,11 @@ func (scheduler *Scheduler) rebalanceLocked() {
 		runningCount++
 	}
 
-	waiting = scheduler.waitingEntriesLocked()
 	for _, entry := range scheduler.entries {
 		if entry.State == EntryRunning {
-			entry.PauseRequested = false
-			entry.Reason = ""
+			reason := scheduler.quietBlockingReasonLocked(entry.Policy)
+			entry.PauseRequested = reason != ""
+			entry.Reason = reason
 		}
 		if entry.State == EntryWaiting {
 			entry.Reason = scheduler.waitingReasonLocked(entry)
@@ -590,7 +716,13 @@ func (scheduler *Scheduler) rebalanceLocked() {
 	}
 
 	selectedVictims := map[string]bool{}
-	freeSlots := scheduler.capacity - scheduler.runningCountLocked()
+	for _, entry := range scheduler.entries {
+		if entry.State == EntryRunning && entry.PauseRequested {
+			selectedVictims[entry.JobID] = true
+		}
+	}
+	freeSlots := scheduler.capacity - scheduler.runningCountLocked() + len(selectedVictims)
+	waiting = scheduler.eligibleWaitingEntriesLocked()
 	for _, waitingEntry := range waiting {
 		if freeSlots > 0 {
 			freeSlots--
@@ -607,6 +739,17 @@ func (scheduler *Scheduler) rebalanceLocked() {
 		victim.PauseRequested = true
 		victim.Reason = ReasonHigherPriorityWork
 	}
+}
+
+func (scheduler *Scheduler) eligibleWaitingEntriesLocked() []*Entry {
+	waiting := scheduler.waitingEntriesLocked()
+	eligible := make([]*Entry, 0, len(waiting))
+	for _, entry := range waiting {
+		if scheduler.quietBlockingReasonLocked(entry.Policy) == "" {
+			eligible = append(eligible, entry)
+		}
+	}
+	return eligible
 }
 
 func (scheduler *Scheduler) waitingEntriesLocked() []*Entry {
@@ -662,9 +805,15 @@ func schedulerVictimBefore(left *Entry, right *Entry) bool {
 }
 
 func (scheduler *Scheduler) waitingReasonLocked(entry *Entry) string {
+	if reason := scheduler.quietBlockingReasonLocked(entry.Policy); reason != "" {
+		return reason
+	}
 	entryRank := schedulerPriorityRank(entry.Policy.Priority)
 	for _, candidate := range scheduler.entries {
 		if candidate.JobID == entry.JobID || candidate.State == EntryPaused {
+			continue
+		}
+		if scheduler.quietBlockingReasonLocked(candidate.Policy) != "" {
 			continue
 		}
 		if schedulerPriorityRank(candidate.Policy.Priority) < entryRank {
@@ -672,6 +821,35 @@ func (scheduler *Scheduler) waitingReasonLocked(entry *Entry) string {
 		}
 	}
 	return ReasonWaitingForCapacity
+}
+
+func (scheduler *Scheduler) quietBlockingReasonLocked(
+	policy model.SchedulingPolicy,
+) string {
+	if !policy.Quiet {
+		return ""
+	}
+	if scheduler.activity.ThermalAvailable && scheduler.activity.ThermalUnsafe {
+		return reasonOrFallback(scheduler.activity.ThermalReason, ReasonThermalUnsafe)
+	}
+	if policy.Priority == model.JobPriorityHigh {
+		return ""
+	}
+	if !scheduler.activity.InputAvailable {
+		return reasonOrFallback(scheduler.activity.InputReason, ReasonActivityUnavailable)
+	}
+	idleThreshold := time.Duration(policy.IdleAfterSeconds) * time.Second
+	if scheduler.activity.InputIdleFor < idleThreshold {
+		return reasonOrFallback(scheduler.activity.InputReason, ReasonWaitingForInputIdle)
+	}
+	return ""
+}
+
+func reasonOrFallback(reason string, fallback string) string {
+	if reason != "" {
+		return reason
+	}
+	return fallback
 }
 
 func (scheduler *Scheduler) runningCountLocked() int {
