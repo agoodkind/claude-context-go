@@ -94,6 +94,19 @@ func TestGetIndexDiscoversWorktreeWithExistingCollectionInitialized(t *testing.T
 	}
 }
 
+func TestGetIndexDiscoversWorktreeWithoutCollectionEvidencePendingInitialization(t *testing.T) {
+	manager, worktreeRoot := indexedSiblingScene(t)
+	manager.semantic = nil
+
+	codebase, _, found, _, err := manager.GetIndex(context.Background(), worktreeRoot)
+	if err != nil || !found {
+		t.Fatalf("GetIndex(worktree) returned err=%v found=%v", err, found)
+	}
+	if !codebase.PolicyPendingInitialization {
+		t.Fatal("worktree without collection evidence PolicyPendingInitialization = false, want true")
+	}
+}
+
 // TestSearchCodeDiscoversWorktreeReturnsForecastNote proves a search of the same
 // untracked worktree returns no results, a non-empty discovery state note, and
 // starts no job. It must not fall back to the indexed sibling's results.

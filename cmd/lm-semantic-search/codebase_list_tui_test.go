@@ -106,6 +106,27 @@ func TestListViewShowsDegradedBanner(t *testing.T) {
 	}
 }
 
+func TestListVisibleRowsAccountsForRenderedBanner(t *testing.T) {
+	codebases := []*pb.Codebase{
+		{Id: "cb_1", CanonicalPath: "/tmp/alpha"},
+	}
+	healthy := newListModel(cliOptions{}, codebases, nil)
+	healthy.height = 7
+	if got := healthy.visibleRows(); got != 3 {
+		t.Fatalf("healthy visible rows = %d, want 3", got)
+	}
+
+	degraded := newListModel(
+		cliOptions{},
+		codebases,
+		&pb.DependencyHealth{Degraded: true, Mode: "embedder_unreachable"},
+	)
+	degraded.height = 7
+	if got := degraded.visibleRows(); got != 2 {
+		t.Fatalf("degraded visible rows = %d, want 2", got)
+	}
+}
+
 func TestFitHeadKeepsTail(t *testing.T) {
 	got := fitHead("/Users/agoodkind/Sites/lmd", 8)
 	if !strings.HasSuffix(got, "lmd") {

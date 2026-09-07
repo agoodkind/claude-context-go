@@ -4,6 +4,7 @@ package restartacceptance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"

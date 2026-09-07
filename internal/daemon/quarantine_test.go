@@ -379,6 +379,42 @@ func TestAssessDeltaDeleteWaveIgnoresPhysicallyPresentRemovedPaths(t *testing.T)
 	}
 }
 
+func TestQuarantineTerminalDoesNotClearSuccessor(t *testing.T) {
+	t.Parallel()
+
+	manager, _, repoPath := newTestManager(t)
+	codebase := newCodebaseRecord(repoPath)
+	codebase.Status = model.CodebaseStatusIndexing
+	codebase.ActiveJobID = "successor"
+	stale := model.Job{ID: "stale", CodebaseID: codebase.ID, State: model.JobStateRunning}
+	successor := model.Job{ID: "successor", CodebaseID: codebase.ID, State: model.JobStateRunning}
+	manager.mu.Lock()
+	manager.codebases[codebase.ID] = codebase
+	manager.jobs[stale.ID] = stale
+	manager.jobs[successor.ID] = successor
+	manager.mu.Unlock()
+
+	manager.updateJobQuarantined(context.Background(), stale.ID, quarantineSignal{
+		trigger:      "test",
+		missingCount: suspiciousRemovalAbsoluteThreshold,
+		totalCount:   suspiciousRemovalAbsoluteThreshold,
+	})
+
+	failed, found := manager.GetJob(stale.ID)
+	if !found || failed.State != model.JobStateFailed {
+		t.Fatalf("stale job = %+v, want failed", failed)
+	}
+	manager.mu.Lock()
+	current := manager.codebases[codebase.ID]
+	manager.mu.Unlock()
+	if current.ActiveJobID != successor.ID {
+		t.Fatalf("active job id = %q, want successor %q", current.ActiveJobID, successor.ID)
+	}
+	if current.Status != model.CodebaseStatusIndexing || current.Quarantine != nil {
+		t.Fatalf("successor codebase changed by stale quarantine: %+v", current)
+	}
+}
+
 // TestHandleQuarantinedCodebaseHoldsDuringVCSOperation confirms the
 // confirmation gate never clears a quarantine or advances toward destructive
 // sync while a git operation is in progress, even when the on-disk tree looks
