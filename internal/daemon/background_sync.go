@@ -739,9 +739,12 @@ func (manager *Manager) startDetachedJob(jobID string) error {
 	)
 	if err != nil {
 		manager.mu.Lock()
-		manager.codebases[previousCodebase.ID] = previousCodebase
-		if saveErr := manager.saveLocked(); saveErr != nil {
-			slog.Error("restore converge ownership failed", "job_id", jobID, "err", saveErr)
+		currentCodebase, found := manager.codebases[previousCodebase.ID]
+		if found && currentCodebase.ActiveJobID == jobID {
+			manager.codebases[previousCodebase.ID] = previousCodebase
+			if saveErr := manager.saveLocked(); saveErr != nil {
+				slog.Error("restore converge ownership failed", "job_id", jobID, "err", saveErr)
+			}
 		}
 		manager.mu.Unlock()
 		wrappedErr := fmt.Errorf("append running converge job event: %w", err)

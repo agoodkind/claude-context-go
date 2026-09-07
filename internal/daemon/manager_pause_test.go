@@ -169,7 +169,7 @@ func TestWatchdogPriorityRaceDoesNotDoubleRelease(t *testing.T) {
 			return nil
 		})
 	}()
-	<-operationStarted
+	waitPauseTestSignal(t, operationStarted)
 
 	checkpointDone := make(chan error, 1)
 	go func() {
@@ -353,7 +353,7 @@ func TestCancellationBetweenPauseSnapshotAndJournalStaysTerminal(t *testing.T) {
 	go func() {
 		pauseDone <- manager.pauseJob(job.ID, "priority")
 	}()
-	<-journalEntered
+	waitPauseTestSignal(t, journalEntered)
 	cancelDone := make(chan struct{})
 	go func() {
 		manager.updateDetachedJobCancelled(context.Background(), job.ID)
