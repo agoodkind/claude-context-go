@@ -69,6 +69,7 @@ func (manager *Manager) absorbDescendants(ctx context.Context, descendants []mod
 	if len(descendants) == 0 {
 		return
 	}
+	manager.policyMutationMutex.Lock()
 	manager.mu.Lock()
 	removed := make([]string, 0, len(descendants))
 	for _, child := range descendants {
@@ -88,6 +89,7 @@ func (manager *Manager) absorbDescendants(ctx context.Context, descendants []mod
 		}
 	}
 	manager.mu.Unlock()
+	manager.policyMutationMutex.Unlock()
 
 	for _, id := range removed {
 		if err := manager.clearGraphCache(ctx, id); err != nil {
@@ -128,15 +130,26 @@ func (manager *Manager) mergeUpTarget(canonicalPath string) (model.Codebase, boo
 // instead of building a second overlapping collection. It returns the parent
 // codebase and the sync job so the caller renders a redirect rather than a
 // fresh index.
-func (manager *Manager) redirectIndexToAncestor(ctx context.Context, requestedPath string, ancestor model.Codebase, client model.ClientInfo, policyPatch model.SchedulingPolicyPatch) (model.Job, model.Codebase, bool, string, error) {
-	job, codebase, _, err := manager.SyncIndexWithPolicy(ctx, ancestor.CanonicalPath, client, policyPatch)
+func (manager *Manager) redirectIndexToAncestor(
+	ctx context.Context,
+	requestedPath string,
+	ancestor model.Codebase,
+	client model.ClientInfo,
+	intent indexPolicyIntent,
+) (model.Job, model.Codebase, error) {
+	job, codebase, _, err := manager.syncIndexWithPolicy(
+		ctx,
+		ancestor.CanonicalPath,
+		client,
+		intent.Patch,
+	)
 	if err != nil {
 		var emptyJob model.Job
 		var emptyCodebase model.Codebase
-		return emptyJob, emptyCodebase, false, "", err
+		return emptyJob, emptyCodebase, err
 	}
 	slog.InfoContext(ctx, "merge.redirect_to_ancestor", "component", "daemon", "subcomponent", "merge", "requested", requestedPath, "ancestor_codebase_id", ancestor.ID)
-	return job, codebase, false, "", nil
+	return job, codebase, nil
 }
 
 // IndexedDescendants returns the indexed child codebases strictly inside the

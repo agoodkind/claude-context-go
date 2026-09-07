@@ -119,6 +119,8 @@ func renderMutationAck(ack view.MutationAckView) string {
 			return fmt.Sprintf("Sync request deduplicated onto active job %s for '%s'", ack.JobID, ack.Path)
 		}
 		return fmt.Sprintf("Started sync job %s for '%s'", ack.JobID, ack.Path)
+	case view.AckUpdatePolicy:
+		return fmt.Sprintf("Updated scheduling policy for codebase '%s'", ack.Path)
 	case view.AckRegisterConversation:
 		return fmt.Sprintf(
 			"Registered conversation collection '%s' as codebase %s using Milvus collection '%s'.",
