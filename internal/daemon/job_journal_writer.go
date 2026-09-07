@@ -19,16 +19,18 @@ const jobJournalQueueCapacity = 256
 const jobJournalCompactionThresholdBytes = 8 * 1024 * 1024
 
 type jobJournalWriteRequest struct {
-	event  model.JobEvent
-	result chan error
+	event   model.JobEvent
+	durable bool
+	result  chan error
 }
 
 type jobJournalWriter struct {
-	path           string
-	appendJobEvent appendJobEventFunc
-	queue          chan jobJournalWriteRequest
-	done           chan bool
-	closeOnce      sync.Once
+	path               string
+	appendJobEvent     appendJobEventFunc
+	appendJobEventSync appendJobEventFunc
+	queue              chan jobJournalWriteRequest
+	done               chan bool
+	closeOnce          sync.Once
 	// currentSizeBytes includes the existing journal so the first new event can
 	// compact an oversized file immediately after deployment.
 	currentSizeBytes int64
@@ -43,6 +45,7 @@ type jobJournalWriter struct {
 func newJobJournalWriter(
 	path string,
 	appendJobEvent appendJobEventFunc,
+	appendJobEventSync appendJobEventFunc,
 	queueCapacity int,
 	testCompactionThresholdBytes ...int64,
 ) *jobJournalWriter {
@@ -53,6 +56,7 @@ func newJobJournalWriter(
 	writer := &jobJournalWriter{
 		path:                     path,
 		appendJobEvent:           appendJobEvent,
+		appendJobEventSync:       appendJobEventSync,
 		queue:                    make(chan jobJournalWriteRequest, queueCapacity),
 		done:                     make(chan bool, 1),
 		closeOnce:                sync.Once{},
@@ -79,7 +83,7 @@ func newJobJournalWriter(
 }
 
 func (writer *jobJournalWriter) enqueue(event model.JobEvent) error {
-	request := jobJournalWriteRequest{event: event, result: nil}
+	request := jobJournalWriteRequest{event: event, durable: false, result: nil}
 	select {
 	case writer.queue <- request:
 		return nil
@@ -102,9 +106,19 @@ func (writer *jobJournalWriter) enqueue(event model.JobEvent) error {
 	return <-request.result
 }
 
+func (writer *jobJournalWriter) enqueueAndSync(event model.JobEvent) error {
+	request := jobJournalWriteRequest{
+		event:   event,
+		durable: true,
+		result:  make(chan error, 1),
+	}
+	writer.queue <- request
+	return <-request.result
+}
+
 func (writer *jobJournalWriter) run() {
 	for request := range writer.queue {
-		err := writer.write(request.event)
+		err := writer.write(request.event, request.durable)
 		if err == nil {
 			writer.recordSuccessfulAppend(request.event)
 		}
@@ -204,7 +218,7 @@ func initialJobJournalSize(path string) int64 {
 	return 0
 }
 
-func (writer *jobJournalWriter) write(event model.JobEvent) (err error) {
+func (writer *jobJournalWriter) write(event model.JobEvent, durable bool) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("append jobs journal %s: panic: %v", writer.path, recovered)
@@ -221,7 +235,11 @@ func (writer *jobJournalWriter) write(event model.JobEvent) (err error) {
 			)
 		}
 	}()
-	return appendJobJournalEvent(writer.path, writer.appendJobEvent, event)
+	appendJobEvent := writer.appendJobEvent
+	if durable {
+		appendJobEvent = writer.appendJobEventSync
+	}
+	return appendJobJournalEvent(writer.path, appendJobEvent, event)
 }
 
 func (writer *jobJournalWriter) close() {
