@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sort"
 
 	"goodkind.io/lm-semantic-search/internal/clock"
 	"goodkind.io/lm-semantic-search/internal/gitworktree"
@@ -20,14 +22,34 @@ const (
 )
 
 type resumePlan struct {
-	canonicalPath string
-	config        model.IndexConfig
-	codebaseID    string
-	checkpoint    resumeCheckpointKind
+	canonicalPath             string
+	config                    model.IndexConfig
+	codebaseID                string
+	checkpoint                resumeCheckpointKind
+	effectiveSchedulingPolicy model.SchedulingPolicy
+	schedulingOverride        model.SchedulingPolicyPatch
+	queueSequence             uint64
+	converge                  bool
+	interruptedJobID          string
 	// codebase is the record the probe reads its checkpoint through. The plan
 	// carries the whole record rather than a precomputed verdict so the probe
 	// reaches loadLiveCheckpoint with everything the one expectation rule needs.
 	codebase model.Codebase
+}
+
+func sortResumePlans(plans []resumePlan) {
+	sort.Slice(plans, func(first int, second int) bool {
+		if plans[first].queueSequence == 0 {
+			return false
+		}
+		if plans[second].queueSequence == 0 {
+			return true
+		}
+		if plans[first].queueSequence != plans[second].queueSequence {
+			return plans[first].queueSequence < plans[second].queueSequence
+		}
+		return plans[first].codebaseID < plans[second].codebaseID
+	})
 }
 
 // ResumeOrphanedJobs re-queues indexing for every codebase whose previous job
@@ -50,12 +72,43 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 		if codebase.Status != model.CodebaseStatusIndexing {
 			continue
 		}
+		effectivePolicy := codebase.SchedulingPolicy
+		override := model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil}
+		var queueSequence uint64
+		if interrupted, found := manager.jobs[codebase.ActiveJobID]; found {
+			effectivePolicy = interrupted.EffectiveSchedulingPolicy
+			override = interrupted.SchedulingOverride
+			queueSequence = interrupted.QueueSequence
+		}
 		plans = append(plans, resumePlan{
-			canonicalPath: codebase.CanonicalPath,
-			config:        codebase.EffectiveConfig,
-			codebaseID:    codebase.ID,
-			checkpoint:    resumeCheckpointNone,
-			codebase:      codebase,
+			canonicalPath:             codebase.CanonicalPath,
+			config:                    codebase.EffectiveConfig,
+			codebaseID:                codebase.ID,
+			checkpoint:                resumeCheckpointNone,
+			effectiveSchedulingPolicy: effectivePolicy,
+			schedulingOverride:        override,
+			queueSequence:             queueSequence,
+			converge:                  false,
+			interruptedJobID:          "",
+			codebase:                  codebase,
+		})
+	}
+	for _, interrupted := range manager.interruptedConvergeJobs {
+		codebase, found := manager.codebases[interrupted.CodebaseID]
+		if !found || codebase.Kind == model.CodebaseKindDocument {
+			continue
+		}
+		plans = append(plans, resumePlan{
+			canonicalPath:             codebase.CanonicalPath,
+			config:                    codebase.EffectiveConfig,
+			codebaseID:                codebase.ID,
+			checkpoint:                resumeCheckpointLive,
+			effectiveSchedulingPolicy: interrupted.EffectiveSchedulingPolicy,
+			schedulingOverride:        interrupted.SchedulingOverride,
+			queueSequence:             interrupted.QueueSequence,
+			converge:                  true,
+			interruptedJobID:          interrupted.ID,
+			codebase:                  codebase,
 		})
 	}
 	manager.mu.Unlock()
@@ -69,6 +122,10 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 
 	resumable := make([]resumePlan, 0, len(plans))
 	for _, plan := range plans {
+		if plan.converge {
+			resumable = append(resumable, plan)
+			continue
+		}
 		plan.checkpoint = manager.resumableCheckpointKind(ctx, plan.codebase, plan.config.IgnoreDigest)
 		if plan.checkpoint != resumeCheckpointNone {
 			resumable = append(resumable, plan)
@@ -80,6 +137,7 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 	if len(resumable) == 0 {
 		return
 	}
+	sortResumePlans(resumable)
 
 	paths := make([]string, 0, len(resumable))
 	for _, plan := range resumable {
@@ -89,18 +147,54 @@ func (manager *Manager) ResumeOrphanedJobs(ctx context.Context) {
 	for _, plan := range resumable {
 		client := model.ClientInfo{Name: "daemon-resume", PID: 0}
 		var err error
-		if plan.checkpoint == resumeCheckpointStaging {
+		switch {
+		case plan.checkpoint == resumeCheckpointStaging:
 			err = manager.startStagingResume(ctx, plan, client)
-		} else {
-			_, _, _, _, err = manager.StartIndex(ctx, plan.canonicalPath, client, plan.config, false, emptyAdmissionBudget)
+		case plan.converge:
+			err = manager.resumeConverge(ctx, plan, client)
+		default:
+			err = manager.startRecoveredIndex(ctx, plan, client)
 		}
 		if err != nil {
 			slog.ErrorContext(ctx, "resume orphaned job failed", "codebase_id", plan.codebaseID, "path", plan.canonicalPath, "err", err)
 			continue
 		}
-		metrics.JobResumed()
-		manager.logResumeLaunched(ctx, plan.codebaseID, plan.canonicalPath)
+		manager.recordResumeLaunched(ctx, plan)
 	}
+}
+
+func (manager *Manager) recordResumeLaunched(ctx context.Context, plan resumePlan) {
+	metrics.JobResumed()
+	manager.mu.Lock()
+	if plan.interruptedJobID != "" {
+		delete(manager.interruptedConvergeJobs, plan.interruptedJobID)
+	}
+	manager.mu.Unlock()
+	manager.logResumeLaunched(ctx, plan.codebaseID, plan.canonicalPath)
+}
+
+func (manager *Manager) resumeConverge(ctx context.Context, plan resumePlan, client model.ClientInfo) error {
+	job, _, _, err := manager.SyncIndexWithPolicy(ctx, plan.canonicalPath, client, plan.schedulingOverride)
+	if err != nil {
+		return err
+	}
+	manager.mu.Lock()
+	current, found := manager.jobs[job.ID]
+	if !found {
+		manager.mu.Unlock()
+		return fmt.Errorf("recovered converge successor %s is missing", job.ID)
+	}
+	current.EffectiveSchedulingPolicy = plan.effectiveSchedulingPolicy
+	current.SchedulingOverride = plan.schedulingOverride
+	current.QueueSequence = plan.queueSequence
+	manager.jobs[job.ID] = current
+	if err := manager.appendJobLocked("resume_converge_sync", current); err != nil {
+		manager.mu.Unlock()
+		manager.updateJobCancelled(context.WithoutCancel(ctx), job.ID)
+		return err
+	}
+	manager.mu.Unlock()
+	return nil
 }
 
 // resumableCheckpointKind reports which merkle checkpoint a codebase left
@@ -172,6 +266,11 @@ func (manager *Manager) startStagingResume(ctx context.Context, plan resumePlan,
 	codebase.UpdatedAt = clock.Now()
 
 	job := newQueuedJob(codebase.ID, plan.canonicalPath, plan.canonicalPath, client, string(jobOperationIndex), false, indexConfig, emptyAdmissionBudget, clock.Now())
+	queueSequence := plan.queueSequence
+	if queueSequence == 0 {
+		queueSequence = manager.nextQueueSequenceLocked()
+	}
+	applyJobSchedulingPolicy(&job, plan.effectiveSchedulingPolicy, plan.schedulingOverride, queueSequence)
 	codebase.ActiveJobID = job.ID
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {

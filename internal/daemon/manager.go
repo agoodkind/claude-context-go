@@ -87,9 +87,10 @@ type Manager struct {
 	// pendingCodeJobs holds at most one coalesced code sync request per codebase
 	// (depth 1), admitted when a non-matching-config index or sync request arrives
 	// while a code job is active and drained on terminal. Guarded by mu.
-	pendingCodeJobs map[string]pendingCodeRequest
-	cancels         map[string]context.CancelFunc
-	done            map[string]chan struct{}
+	pendingCodeJobs         map[string]pendingCodeRequest
+	interruptedConvergeJobs map[string]model.Job
+	cancels                 map[string]context.CancelFunc
+	done                    map[string]chan struct{}
 	// failedBuildRetries caps automatic retries for terminal failed builds per daemon lifetime; not persisted, guarded by mu.
 	failedBuildRetries map[string]int
 	// lastJobJournalAt throttles periodic job-progress journaling; not persisted, guarded by mu.
@@ -207,6 +208,7 @@ func newManagerWithSemanticFactory(
 		conversationSyncCursors:     map[string]string{},
 		pendingConversationJobs:     map[string]conversationJobPayload{},
 		pendingCodeJobs:             map[string]pendingCodeRequest{},
+		interruptedConvergeJobs:     map[string]model.Job{},
 		cancels:                     map[string]context.CancelFunc{},
 		done:                        map[string]chan struct{}{},
 		failedBuildRetries:          map[string]int{},
@@ -389,73 +391,6 @@ func newCodebaseRecord(canonicalPath string) model.Codebase {
 	}
 }
 
-func newQueuedJob(
-	codebaseID string,
-	requestedPath string,
-	canonicalPath string,
-	client model.ClientInfo,
-	operation string,
-	forced bool,
-	indexConfig model.IndexConfig,
-	budget model.AdmissionBudget,
-	now time.Time,
-) model.Job {
-	return model.Job{
-		ID:            newID("job"),
-		CodebaseID:    codebaseID,
-		RequestedPath: requestedPath,
-		CanonicalPath: canonicalPath,
-		Client:        client,
-		Operation:     operation,
-		State:         model.JobStateQueued,
-		Forced:        forced,
-		Progress: model.Progress{
-			Phase:                     "queued",
-			OverallPercent:            0,
-			Unit:                      "",
-			RunMode:                   "",
-			BootstrapReason:           "",
-			ScopeUnit:                 "",
-			FilesTotal:                0,
-			FilesProcessed:            0,
-			FilesAdded:                0,
-			FilesModified:             0,
-			FilesRemoved:              0,
-			FilesInCodebase:           0,
-			FilesEmbedded:             0,
-			FilesSkippedOversize:      0,
-			FilesSkippedUnreadable:    0,
-			FilesPending:              0,
-			ChunksTotal:               0,
-			ChunksProcessed:           0,
-			ChunksReused:              0,
-			ChunksEmbedded:            0,
-			ChunksGenerated:           0,
-			ChunksDropped:             0,
-			ReuseVectorsLoaded:        0,
-			EmbeddingBatchesTotal:     0,
-			EmbeddingBatchesCompleted: 0,
-			CollectionRowsWritten:     0,
-			LastEventAt:               now,
-			HeartbeatAt:               now,
-		},
-		Config:                    indexConfig,
-		Budget:                    budget,
-		EffectiveSchedulingPolicy: model.DefaultSchedulingPolicy(),
-		SchedulingOverride: model.SchedulingPolicyPatch{
-			Priority:         nil,
-			Quiet:            nil,
-			IdleAfterSeconds: nil,
-		},
-		QueueSequence:    0,
-		SchedulingReason: "",
-		StartedAt:        now,
-		UpdatedAt:        now,
-		CompletedAt:      nil,
-		Error:            nil,
-	}
-}
-
 // startIndexDecision captures one StartIndex call's resolved codebase plus
 // the routing decision derived from the current registry state.
 type startIndexDecision struct {
@@ -534,6 +469,22 @@ func (manager *Manager) decideStartIndexLocked(canonicalPath string, indexConfig
 // id of any existing codebase whose canonical path strictly prefix-covers
 // the new registration (empty when no overlap).
 func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, budget model.AdmissionBudget) (model.Job, model.Codebase, bool, string, error) {
+	return manager.StartIndexWithPolicy(ctx, requestedPath, client, indexConfig, force, budget, model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil})
+}
+
+// StartIndexWithPolicy starts an index with a per-run scheduling-policy patch.
+func (manager *Manager) StartIndexWithPolicy(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, budget model.AdmissionBudget, policyPatch model.SchedulingPolicyPatch) (model.Job, model.Codebase, bool, string, error) {
+	return manager.startIndexWithIntent(ctx, requestedPath, client, indexConfig, force, budget, indexPolicyIntent{
+		Patch:      policyPatch,
+		Initialize: true,
+	})
+}
+
+func (manager *Manager) startIndexWithIntent(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, budget model.AdmissionBudget, policyIntent indexPolicyIntent) (model.Job, model.Codebase, bool, string, error) {
+	return manager.startIndexWithRecovery(ctx, requestedPath, client, indexConfig, force, budget, policyIntent, nil)
+}
+
+func (manager *Manager) startIndexWithRecovery(ctx context.Context, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, budget model.AdmissionBudget, policyIntent indexPolicyIntent, recoveredPlan *resumePlan) (model.Job, model.Codebase, bool, string, error) {
 	var emptyJob model.Job
 	var emptyCodebase model.Codebase
 
@@ -560,14 +511,18 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 	// the parent's repo group but holds a different branch, so it stays its own
 	// codebase rather than merging into a sibling worktree.
 	if ancestor, found := manager.mergeUpTarget(canonicalPath); found && !manager.isWorktreeBoundary(canonicalPath, ancestor) {
-		return manager.redirectIndexToAncestor(ctx, requestedPath, ancestor, client)
+		return manager.redirectIndexToAncestor(ctx, requestedPath, ancestor, client, policyIntent.Patch)
 	}
 
 	indexConfig = manager.enrichIndexConfig(indexConfig)
 	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
 
 	if dedupedJob, dedupedCodebase, deduped := manager.dedupAgainstActiveJob(canonicalPath, indexConfig); deduped {
-		return dedupedJob, dedupedCodebase, true, "", nil
+		resolvedCodebase, resolveErr := manager.resolveAndPersistIndexPolicy(dedupedCodebase.ID, policyIntent)
+		if resolveErr != nil {
+			return emptyJob, emptyCodebase, false, "", resolveErr
+		}
+		return dedupedJob, resolvedCodebase, true, "", nil
 	}
 
 	if force {
@@ -578,7 +533,7 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 
 	evidence := manager.probeCollectionEvidence(ctx, canonicalPath, "StartIndex")
 
-	job, codebase, deduped, overlapsCodebaseID, err := manager.commitStartIndexLocked(ctx, canonicalPath, requestedPath, client, indexConfig, force, evidence.presence, budget)
+	job, codebase, deduped, overlapsCodebaseID, err := manager.commitStartIndexLocked(ctx, canonicalPath, requestedPath, client, indexConfig, force, evidence.presence, budget, policyIntent, recoveredPlan)
 	if err != nil || deduped {
 		return job, codebase, deduped, overlapsCodebaseID, err
 	}
@@ -604,7 +559,7 @@ func (manager *Manager) StartIndex(ctx context.Context, requestedPath string, cl
 // and queues the job event. The returned job has an empty ID when the
 // decision resolved as already-indexed; the caller treats that as a no-op
 // success.
-func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPath string, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, presence collectionPresence, budget model.AdmissionBudget) (model.Job, model.Codebase, bool, string, error) {
+func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPath string, requestedPath string, client model.ClientInfo, indexConfig model.IndexConfig, force bool, presence collectionPresence, budget model.AdmissionBudget, policyIntent indexPolicyIntent, recoveredPlan *resumePlan) (model.Job, model.Codebase, bool, string, error) {
 	var emptyJob model.Job
 	var emptyCodebase model.Codebase
 	manager.mu.Lock()
@@ -615,7 +570,16 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 		slog.ErrorContext(ctx, "resolve active job failed", "canonical_path", canonicalPath, "err", err)
 		return emptyJob, emptyCodebase, false, "", err
 	}
+	resolvedCodebase, effectivePolicy, err := manager.resolveIndexPolicyLocked(decision.codebase, policyIntent)
+	if err != nil {
+		return emptyJob, emptyCodebase, false, "", err
+	}
+	originalCodebase := decision.codebase
+	decision.codebase = resolvedCodebase
 	if decision.dedup {
+		if err := manager.persistResolvedIndexPolicyLocked(originalCodebase, resolvedCodebase); err != nil {
+			return emptyJob, emptyCodebase, false, "", err
+		}
 		return decision.activeJob, decision.codebase, true, "", nil
 	}
 	if decision.coalesce {
@@ -629,6 +593,7 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 			client:        client,
 			indexConfig:   indexConfig,
 			force:         force,
+			policyPatch:   policyIntent.Patch,
 		})
 		return decision.activeJob, decision.codebase, true, "", nil
 	}
@@ -637,6 +602,9 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 		overlapsCodebaseID = ancestor.ID
 	}
 	if decision.mode == startIndexModeAlreadyIndexed {
+		if err := manager.persistResolvedIndexPolicyLocked(originalCodebase, resolvedCodebase); err != nil {
+			return emptyJob, emptyCodebase, false, "", err
+		}
 		return emptyJob, decision.codebase, false, overlapsCodebaseID, nil
 	}
 
@@ -649,7 +617,6 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 		codebase.Status = model.CodebaseStatusIndexing
 	}
 	codebase.EffectiveConfig = indexConfig
-	codebase.PolicyPendingInitialization = false
 	codebase.InodeTrackingDisabled = detectInodeTrackingDisabled(ctx, canonicalPath)
 	if manager.semantic != nil && manager.semantic.Available() {
 		codebase.CollectionName = manager.semantic.CollectionName(canonicalPath)
@@ -664,6 +631,15 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 		operation = jobOperationStreamingReindex
 	}
 	job := newQueuedJob(codebase.ID, requestedPath, canonicalPath, client, string(operation), force, indexConfig, budget, clock.Now())
+	if recoveredPlan != nil {
+		queueSequence := recoveredPlan.queueSequence
+		if queueSequence == 0 {
+			queueSequence = manager.nextQueueSequenceLocked()
+		}
+		applyJobSchedulingPolicy(&job, recoveredPlan.effectiveSchedulingPolicy, recoveredPlan.schedulingOverride, queueSequence)
+	} else {
+		applyJobSchedulingPolicy(&job, effectivePolicy, policyIntent.Patch, manager.nextQueueSequenceLocked())
+	}
 	codebase.ActiveJobID = job.ID
 	manager.codebases[codebase.ID] = codebase
 	if err := manager.saveLocked(); err != nil {
@@ -681,6 +657,11 @@ func (manager *Manager) commitStartIndexLocked(ctx context.Context, canonicalPat
 
 // SyncIndex registers a new sync job for an existing tracked codebase.
 func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, client model.ClientInfo) (model.Job, model.Codebase, bool, error) {
+	return manager.SyncIndexWithPolicy(ctx, requestedPath, client, model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil})
+}
+
+// SyncIndexWithPolicy starts a sync with a per-run scheduling-policy patch.
+func (manager *Manager) SyncIndexWithPolicy(ctx context.Context, requestedPath string, client model.ClientInfo, policyPatch model.SchedulingPolicyPatch) (model.Job, model.Codebase, bool, error) {
 	canonicalPath, err := manager.resolveCanonicalPath(requestedPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "canonicalize path failed", "path", requestedPath, "err", err)
@@ -699,6 +680,17 @@ func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, cli
 		return emptyJob, emptyCodebase, false, errors.New("codebase not tracked: " + requestedPath)
 	}
 	codebase := matches[0]
+	resolvedCodebase, _, policyErr := manager.resolveIndexPolicyLocked(codebase, indexPolicyIntent{
+		Patch:      policyPatch,
+		Initialize: false,
+	})
+	if policyErr != nil {
+		manager.mu.Unlock()
+		var emptyJob model.Job
+		var emptyCodebase model.Codebase
+		return emptyJob, emptyCodebase, false, policyErr
+	}
+	codebase = resolvedCodebase
 
 	indexConfig := manager.enrichIndexConfig(codebase.EffectiveConfig)
 	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
@@ -726,6 +718,7 @@ func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, cli
 			client:        client,
 			indexConfig:   indexConfig,
 			force:         false,
+			policyPatch:   policyPatch,
 		})
 		manager.mu.Unlock()
 		return activeJob, codebase, true, nil
@@ -737,6 +730,7 @@ func (manager *Manager) SyncIndex(ctx context.Context, requestedPath string, cli
 		client:        client,
 		indexConfig:   indexConfig,
 		force:         false,
+		policyPatch:   policyPatch,
 	})
 	if err != nil {
 		manager.mu.Unlock()

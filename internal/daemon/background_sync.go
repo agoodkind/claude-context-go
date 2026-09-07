@@ -630,6 +630,18 @@ func (syncer *BackgroundSync) registerConvergeJob(
 		return convergeJobRegistration{}, fmt.Errorf("start converge job: codebase ownership changed")
 	}
 	syncer.manager.cancels[job.ID] = cancel
+	_, effectivePolicy, policyErr := syncer.manager.resolveIndexPolicyLocked(current, indexPolicyIntent{
+		Patch:      model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil},
+		Initialize: false,
+	})
+	if policyErr != nil {
+		delete(syncer.manager.cancels, job.ID)
+		syncer.manager.mu.Unlock()
+		cancel()
+		syncer.requeuePaths(codebase.ID, relativePaths)
+		return convergeJobRegistration{}, policyErr
+	}
+	applyJobSchedulingPolicy(&job, effectivePolicy, model.SchedulingPolicyPatch{Priority: nil, Quiet: nil, IdleAfterSeconds: nil}, syncer.manager.nextQueueSequenceLocked())
 	// A converge does not claim codebase.ActiveJobID, so
 	// beginActiveJobCancellationLocked cannot route a waiter to it.
 	// waitForJobDone accepts a nil channel, so manager.done needs no entry.

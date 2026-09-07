@@ -128,8 +128,8 @@ func (manager *Manager) mergeUpTarget(canonicalPath string) (model.Codebase, boo
 // instead of building a second overlapping collection. It returns the parent
 // codebase and the sync job so the caller renders a redirect rather than a
 // fresh index.
-func (manager *Manager) redirectIndexToAncestor(ctx context.Context, requestedPath string, ancestor model.Codebase, client model.ClientInfo) (model.Job, model.Codebase, bool, string, error) {
-	job, codebase, _, err := manager.SyncIndex(ctx, ancestor.CanonicalPath, client)
+func (manager *Manager) redirectIndexToAncestor(ctx context.Context, requestedPath string, ancestor model.Codebase, client model.ClientInfo, policyPatch model.SchedulingPolicyPatch) (model.Job, model.Codebase, bool, string, error) {
+	job, codebase, _, err := manager.SyncIndexWithPolicy(ctx, ancestor.CanonicalPath, client, policyPatch)
 	if err != nil {
 		var emptyJob model.Job
 		var emptyCodebase model.Codebase
