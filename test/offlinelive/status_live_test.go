@@ -68,6 +68,29 @@ func TestStatusReportsCountersOverTheWire(t *testing.T) {
 	}
 }
 
+func TestStatusReportsClosedActivityReasonsOverTheWire(t *testing.T) {
+	harness := newHarness(t)
+
+	response, err := harness.client.GetStatus(context.Background(), &pb.GetStatusRequest{})
+	if err != nil {
+		t.Fatalf("GetStatus returned error: %v", err)
+	}
+	source := response.GetActivitySource()
+	if source == nil {
+		t.Fatal("GetStatus omitted activity_source")
+	}
+	if source.GetInputAvailable() {
+		if reason := source.GetInputReason(); reason != pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED && reason != pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE {
+			t.Fatalf("available input reason = %s", reason)
+		}
+	} else if reason := source.GetInputReason(); reason != pb.SchedulingReason_SCHEDULING_REASON_ACTIVITY_UNAVAILABLE {
+		t.Fatalf("unavailable input reason = %s, want activity unavailable", reason)
+	}
+	if source.GetThermalUnsafe() && source.GetThermalReason() != pb.SchedulingReason_SCHEDULING_REASON_THERMAL_SAFETY {
+		t.Fatalf("unsafe thermal reason = %s, want thermal safety", source.GetThermalReason())
+	}
+}
+
 // assertZeroCountersSurviveJSON is the check the oneof exists for. protojson
 // omits a plain proto3 scalar at its zero value, so without the oneof a counter
 // reading zero would be indistinguishable from one the daemon never measured.

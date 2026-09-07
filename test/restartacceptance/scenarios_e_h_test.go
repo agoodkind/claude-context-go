@@ -13,10 +13,75 @@ import (
 	"testing"
 	"time"
 
+	pb "goodkind.io/lm-semantic-search/gen/go/lmsemanticsearch/v1"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestRunScenarioIPreservesPausedLowPriorityPolicyAfterRestart(t *testing.T) {
+	recorder, evidencePaths := scenarioTestRecorder(t)
+	events := make([]string, 0, 8)
+	lowJobs := map[string]struct{}{"low-original": {}}
+
+	result, err := runScenarioI(context.Background(), scenarioIInput{
+		StartLow: func(context.Context) (*pb.StartIndexResponse, error) {
+			events = append(events, "start-low")
+			return &pb.StartIndexResponse{JobId: "low-original", CodebaseId: "low-codebase"}, nil
+		},
+		WaitForLowBoundary: func(context.Context) error {
+			events = append(events, "low-boundary")
+			return nil
+		},
+		StartHigh: func(context.Context) (*pb.StartIndexResponse, error) {
+			events = append(events, "start-high")
+			return &pb.StartIndexResponse{JobId: "high-job", CodebaseId: "high-codebase"}, nil
+		},
+		ReleaseLowBoundary: func() {
+			events = append(events, "release-low")
+		},
+		WaitForLowPaused: func(context.Context, string) (*pb.Job, error) {
+			events = append(events, "low-paused")
+			return &pb.Job{Id: "low-original", State: "paused", EffectiveSchedulingPolicy: lowPolicy()}, nil
+		},
+		CaptureLowJobs: func(context.Context, string) (map[string]struct{}, error) {
+			events = append(events, "capture")
+			return lowJobs, nil
+		},
+		StopDaemon: func(context.Context) error {
+			events = append(events, "stop")
+			return nil
+		},
+		StartDaemon: func(context.Context) error {
+			events = append(events, "restart")
+			return nil
+		},
+		WaitForLowSuccessor: func(_ context.Context, codebaseID string, before map[string]struct{}) (*pb.Job, error) {
+			events = append(events, "successor")
+			if codebaseID != "low-codebase" || len(before) != 1 {
+				t.Fatalf("successor inputs = %q %+v", codebaseID, before)
+			}
+			return &pb.Job{Id: "low-successor", State: "completed", EffectiveSchedulingPolicy: lowPolicy()}, nil
+		},
+		VerifyCloneInventory: func(context.Context) error {
+			events = append(events, "inventory")
+			return nil
+		},
+		Recorder: recorder,
+		Timeouts: scenarioTimeouts{Recovery: time.Second},
+	})
+	if err != nil {
+		t.Fatalf("runScenarioI returned error: %v", err)
+	}
+	if result.PausedJobID != "low-original" || result.SuccessorJobID != "low-successor" {
+		t.Fatalf("result = %+v", result)
+	}
+	wantEvents := []string{"start-low", "low-boundary", "start-high", "release-low", "low-paused", "capture", "stop", "restart", "successor", "inventory"}
+	if !slices.Equal(events, wantEvents) {
+		t.Fatalf("events = %v, want %v", events, wantEvents)
+	}
+	assertSingleScenarioRecord(t, evidencePaths.EventsJSONL, "scenario_i")
+}
 
 func TestRunScenarioEKeepsClydeAliveAndRecoversSearchAndFeeder(t *testing.T) {
 	recorder, evidencePaths := scenarioTestRecorder(t)

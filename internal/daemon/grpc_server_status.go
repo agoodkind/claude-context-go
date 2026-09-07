@@ -11,6 +11,7 @@ import (
 	"goodkind.io/lm-semantic-search/internal/adapterr"
 	"goodkind.io/lm-semantic-search/internal/clock"
 	"goodkind.io/lm-semantic-search/internal/metrics"
+	"goodkind.io/lm-semantic-search/internal/pbconv"
 	render "goodkind.io/lm-semantic-search/internal/render"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -51,8 +52,15 @@ func (server *GRPCServer) GetStatus(ctx context.Context, request *pb.GetStatusRe
 			SocketPath: server.manager.config.SocketPath,
 			StartedAt:  timestamppb.New(daemon.StartedAt),
 		},
-		Metrics:     statusMetrics,
-		Activity:    activity,
+		Metrics:  statusMetrics,
+		Activity: activity,
+		ActivitySource: &pb.ActivitySourceStatus{
+			InputAvailable:   daemon.Scheduler.Activity.InputAvailable,
+			ThermalAvailable: daemon.Scheduler.Activity.ThermalAvailable,
+			ThermalUnsafe:    daemon.Scheduler.Activity.ThermalUnsafe,
+			InputReason:      pbconv.SchedulingReasonToProto(daemon.Scheduler.Activity.InputReason),
+			ThermalReason:    pbconv.SchedulingReasonToProto(daemon.Scheduler.Activity.ThermalReason),
+		},
 		DisplayText: "",
 	}
 	response.DisplayText = server.envelopeText(ctx, daemon.Health, render.StatusMetrics(response))
