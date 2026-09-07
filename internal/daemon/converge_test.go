@@ -244,12 +244,13 @@ func TestConvergePathsReportsHeartbeatDuringSlowPresentPath(t *testing.T) {
 		t.Fatalf("Reindex calls = %d, want %d", reindexCalls.Load(), pathCount)
 	}
 	if len(updates) != 2 {
-		t.Fatalf("progress updates = %d, want classification progress and one heartbeat", len(updates))
+		t.Fatalf("progress updates = %d, want one completed path and final progress", len(updates))
 	}
-	for _, update := range updates {
-		if update.PathsProcessed != pathCount {
-			t.Fatalf("PathsProcessed = %d, want %d", update.PathsProcessed, pathCount)
-		}
+	if updates[0].PathsProcessed != 1 {
+		t.Fatalf("first progress = %d, want 1 after the first path finishes", updates[0].PathsProcessed)
+	}
+	if updates[1].PathsProcessed != pathCount {
+		t.Fatalf("final progress = %d, want %d", updates[1].PathsProcessed, pathCount)
 	}
 }
 
@@ -399,8 +400,8 @@ func TestConvergePathsReportsSlowClassificationProgress(t *testing.T) {
 	if len(updates) != 2 {
 		t.Fatalf("progress updates = %d, want 2", len(updates))
 	}
-	if updates[0].PathsProcessed != 1 {
-		t.Fatalf("slow classification progress = %d, want 1", updates[0].PathsProcessed)
+	if updates[0].PathsProcessed != 0 {
+		t.Fatalf("slow classification progress = %d, want 0 before a path finishes", updates[0].PathsProcessed)
 	}
 	if updates[1].PathsProcessed != 3 {
 		t.Fatalf("final classification progress = %d, want 3", updates[1].PathsProcessed)
@@ -442,11 +443,11 @@ func TestConvergePathsReportsFinalProgressAfterClassificationError(t *testing.T)
 	if !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("error = %v, want permission error", err)
 	}
-	if outcome.PathsProcessed != 2 {
-		t.Fatalf("PathsProcessed = %d, want 2", outcome.PathsProcessed)
+	if outcome.PathsProcessed != 0 {
+		t.Fatalf("PathsProcessed = %d, want 0 before convergence begins", outcome.PathsProcessed)
 	}
-	if len(updates) != 1 || updates[0].PathsProcessed != 2 {
-		t.Fatalf("final progress = %+v, want one update for 2 paths", updates)
+	if len(updates) != 1 || updates[0].PathsProcessed != 0 {
+		t.Fatalf("final progress = %+v, want one update for no handled paths", updates)
 	}
 	if got := reindexCalls.Load(); got != 0 {
 		t.Fatalf("Reindex calls = %d, want 0 after classification failure", got)
@@ -505,11 +506,11 @@ func TestConvergePathsReportsFinalProgressAfterClassificationCancellation(t *tes
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context cancellation", err)
 	}
-	if outcome.PathsProcessed != 2 {
-		t.Fatalf("PathsProcessed = %d, want 2", outcome.PathsProcessed)
+	if outcome.PathsProcessed != 0 {
+		t.Fatalf("PathsProcessed = %d, want 0 before convergence begins", outcome.PathsProcessed)
 	}
-	if len(updates) != 1 || updates[0].PathsProcessed != 2 {
-		t.Fatalf("final progress = %+v, want one update for 2 paths", updates)
+	if len(updates) != 1 || updates[0].PathsProcessed != 0 {
+		t.Fatalf("final progress = %+v, want one update for no handled paths", updates)
 	}
 	if got := reindexCalls.Load(); got != 0 {
 		t.Fatalf("Reindex calls = %d, want 0 after classification cancellation", got)
@@ -911,6 +912,61 @@ func TestCancelJobStopsWatcherConverge(t *testing.T) {
 	}
 }
 
+func TestWatcherCancellationReportsHandledPathPrefix(t *testing.T) {
+	t.Parallel()
+
+	manager, cfg, repoPath := newTestManager(t)
+	codebase := seedConvergeCodebase(t, manager, repoPath)
+	entered := make(chan struct{})
+	stopped := make(chan struct{})
+	manager.semantic = &fakeSemantic{
+		reindex: func(ctx context.Context, _ string, _ []model.StoredChunk, _ []string) error {
+			close(entered)
+			<-ctx.Done()
+			close(stopped)
+			return nil
+		},
+	}
+	for _, name := range []string{"first.go", "second.go"} {
+		if err := os.WriteFile(filepath.Join(repoPath, name), []byte("package cancel\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	parentCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	syncer := NewBackgroundSync(cfg, manager)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		syncer.convergeViaWatcher(parentCtx, codebase.ID, []string{"first.go", "second.go"})
+	}()
+	<-entered
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher converge did not observe cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher converge did not finish after cancellation")
+	}
+
+	jobs := manager.ListJobs(codebase.ID)
+	if len(jobs) != 1 {
+		t.Fatalf("ListJobs returned %d jobs, want 1 cancelled converge", len(jobs))
+	}
+	job := jobs[0]
+	if job.State != model.JobStateCancelled {
+		t.Fatalf("State = %q, want %q", job.State, model.JobStateCancelled)
+	}
+	if job.Progress.FilesProcessed != 1 {
+		t.Fatalf("FilesProcessed = %d, want 1 handled path", job.Progress.FilesProcessed)
+	}
+}
+
 func TestCompletedWatcherConvergeKeepsDegradedDependency(t *testing.T) {
 	t.Parallel()
 
@@ -1003,15 +1059,18 @@ func TestConvergeViaWatcherHeartbeatsSlowPresentPathWithoutDuplicateProgressJour
 			job := jobs[0]
 			switch call {
 			case 1:
-				if job.Progress.FilesProcessed != pathCount {
-					t.Fatalf("classification progress = %d, want %d", job.Progress.FilesProcessed, pathCount)
+				if job.Progress.FilesProcessed != 0 {
+					t.Fatalf("progress before the first path finishes = %d, want 0", job.Progress.FilesProcessed)
 				}
 				progressUpdatedAt = job.UpdatedAt
 				progressHeartbeatAt = job.Progress.HeartbeatAt
 				time.Sleep(1100 * time.Millisecond)
 			case 2:
-				if !job.UpdatedAt.Equal(progressUpdatedAt) {
-					t.Fatalf("UpdatedAt changed from %s to %s for heartbeat-only update", progressUpdatedAt, job.UpdatedAt)
+				if job.Progress.FilesProcessed != 1 {
+					t.Fatalf("progress after the first path finishes = %d, want 1", job.Progress.FilesProcessed)
+				}
+				if !job.UpdatedAt.After(progressUpdatedAt) {
+					t.Fatalf("UpdatedAt = %s, want after %s", job.UpdatedAt, progressUpdatedAt)
 				}
 				if !job.Progress.HeartbeatAt.After(progressHeartbeatAt) {
 					t.Fatalf("HeartbeatAt = %s, want after %s", job.Progress.HeartbeatAt, progressHeartbeatAt)

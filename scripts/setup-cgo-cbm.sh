@@ -131,6 +131,12 @@ else
     LMS_OBJCOPY="$(tool_for_compiler objcopy)"
 fi
 
+if [[ -n "${NM:-}" ]]; then
+    LMS_NM="${NM}"
+else
+    LMS_NM="$(tool_for_compiler nm)"
+fi
+
 mkdir -p "${PREFIX}/include/mcp" "${PREFIX}/include/tree_sitter" \
     "${PREFIX}/lib/pkgconfig"
 
@@ -144,7 +150,8 @@ make -C "${CBM_DIR}" \
     LMS_TARGET_GOOS="${TARGET_GOOS}" \
     LMS_TARGET_GOARCH="${TARGET_GOARCH}" \
     LMS_AR="${LMS_AR}" \
-    LMS_OBJCOPY="${LMS_OBJCOPY}"
+    LMS_OBJCOPY="${LMS_OBJCOPY}" \
+    LMS_NM="${LMS_NM}"
 
 cp "${CBM_DIR}/internal/cbm/cbm.h" "${PREFIX}/include/cbm.h"
 cp "${CBM_DIR}/internal/cbm/arena.h" "${PREFIX}/include/arena.h"

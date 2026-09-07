@@ -127,8 +127,7 @@ func (manager *Manager) convergePathsWithLstatAndNow(ctx context.Context, codeba
 		return true
 	}
 	defer reportProgress(true, false)
-	classifiedPaths, classifyErr := classifyConvergePathsWithProgress(ctx, codebase.CanonicalPath, relativePaths, lstat, func(classified int32) error {
-		outcome.PathsProcessed = classified
+	classifiedPaths, classifyErr := classifyConvergePathsWithProgress(ctx, codebase.CanonicalPath, relativePaths, lstat, func(int32) error {
 		if reportProgress(false, false) {
 			return nil
 		}
@@ -182,7 +181,13 @@ func (manager *Manager) convergeClassifiedPaths(
 		// A cancel stops the walk here rather than mid-path, so the snapshot
 		// written below covers exactly the paths that reached the index. The
 		// paths not reached become drift, which the periodic sync repairs.
-		if ctx.Err() != nil || classifiedPath.Missing {
+		select {
+		case <-ctx.Done():
+			return changed, nil
+		default:
+		}
+		if classifiedPath.Missing {
+			outcome.PathsProcessed++
 			if !reportProgress(false, false) {
 				break
 			}
@@ -203,6 +208,7 @@ func (manager *Manager) convergeClassifiedPaths(
 			changed = true
 			outcome.PathsConverged++
 		}
+		outcome.PathsProcessed++
 		if !reportProgress(false, true) {
 			break
 		}
