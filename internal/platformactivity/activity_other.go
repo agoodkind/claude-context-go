@@ -2,15 +2,8 @@ package platformactivity
 
 import "context"
 
-const unavailableSourceReason = "platform activity source not installed"
-
 type unavailableSource struct {
 	reason string
-}
-
-// New returns the fallback source until a platform-specific source replaces it.
-func New() Source {
-	return NewUnavailable(unavailableSourceReason)
 }
 
 // NewUnavailable returns a source whose input and thermal signals stay unavailable.
