@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"goodkind.io/lm-semantic-search/internal/clock"
 	"goodkind.io/lm-semantic-search/internal/merkle"
@@ -48,12 +49,110 @@ func TestResumeOrphanedConvergePreservesPolicyAndDoesNotDuplicate(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
-	t.Cleanup(restarted.CloseGraphEngines)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := restarted.Close(closeCtx); err != nil {
+			t.Errorf("Close restarted manager: %v", err)
+		}
+	})
 	restarted.config.ResumeIndexingOnBoot = true
 	restarted.ResumeOrphanedJobs(context.Background())
 	assertRecoveredConverge(t, restarted, codebase.ID, policy, override, 17, 1)
 	restarted.ResumeOrphanedJobs(context.Background())
 	assertRecoveredConverge(t, restarted, codebase.ID, policy, override, 17, 1)
+}
+
+func TestBootRecoveryPreservesPausedPolicyAndQueueSequence(t *testing.T) {
+	manager, cfg, repoPath := newTestManager(t)
+	manager.config.ResumeIndexingOnBoot = true
+	cfg.ResumeIndexingOnBoot = true
+	canonicalPath, err := manager.resolveCanonicalPath(repoPath)
+	if err != nil {
+		t.Fatalf("resolveCanonicalPath: %v", err)
+	}
+	priority := model.JobPriorityHigh
+	quiet := true
+	idleAfterSeconds := int32(900)
+	policy := model.SchedulingPolicy{
+		Priority:         priority,
+		Quiet:            quiet,
+		IdleAfterSeconds: idleAfterSeconds,
+	}
+	override := model.SchedulingPolicyPatch{
+		Priority:         &priority,
+		Quiet:            &quiet,
+		IdleAfterSeconds: &idleAfterSeconds,
+	}
+	codebase := newCodebaseRecord(canonicalPath)
+	codebase.Status = model.CodebaseStatusIndexing
+	codebase.EffectiveConfig = defaultIndexConfig()
+	codebase.EffectiveConfig.IgnoreDigest = digestIndexConfig(codebase.EffectiveConfig)
+	job := newQueuedJob(
+		codebase.ID,
+		repoPath,
+		canonicalPath,
+		testClientInfo(),
+		string(jobOperationSync),
+		false,
+		codebase.EffectiveConfig,
+		emptyAdmissionBudget,
+		clock.Now(),
+	)
+	job.State = model.JobStatePaused
+	applyJobSchedulingPolicy(&job, policy, override, 23)
+	codebase.ActiveJobID = job.ID
+	manager.mu.Lock()
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		manager.mu.Unlock()
+		t.Fatalf("save paused codebase: %v", err)
+	}
+	if err := manager.appendJobLocked("job_paused", job); err != nil {
+		manager.mu.Unlock()
+		t.Fatalf("append paused job: %v", err)
+	}
+	manager.mu.Unlock()
+	if err := merkle.WriteSnapshot(manager.merklePath(codebase.ID), merkle.Snapshot{
+		ConfigDigest: codebase.EffectiveConfig.IgnoreDigest,
+		Files:        map[string]string{"main.go": hashText("package main\n")},
+	}); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	manager.closeJobJournal()
+
+	restarted, err := NewManager(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := restarted.Close(closeCtx); err != nil {
+			t.Errorf("Close restarted manager: %v", err)
+		}
+	})
+	restarted.ResumeOrphanedJobs(context.Background())
+
+	var successor model.Job
+	waitForCondition(t, func() bool {
+		for _, candidate := range restarted.ListJobs(codebase.ID) {
+			if candidate.ID != job.ID {
+				successor = candidate
+				return true
+			}
+		}
+		return false
+	})
+	if successor.EffectiveSchedulingPolicy != policy {
+		t.Fatalf("successor policy = %+v, want %+v", successor.EffectiveSchedulingPolicy, policy)
+	}
+	if !sameSchedulingOverride(successor.SchedulingOverride, override) {
+		t.Fatalf("successor override = %+v, want %+v", successor.SchedulingOverride, override)
+	}
+	if successor.QueueSequence != 23 {
+		t.Fatalf("successor queue sequence = %d, want 23", successor.QueueSequence)
+	}
 }
 
 func assertRecoveredConverge(t *testing.T, manager *Manager, codebaseID string, policy model.SchedulingPolicy, override model.SchedulingPolicyPatch, sequence uint64, wantCount int) {

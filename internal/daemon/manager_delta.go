@@ -632,6 +632,9 @@ func (manager *Manager) applyDeltaRemovals(ctx context.Context, job model.Job, s
 		delete(state.working, path)
 	}
 	manager.writeCheckpoint(ctx, state, "removals")
+	if err := manager.checkpointJob(ctx); err != nil {
+		return deltaOutcome{fallback: false, handled: true, progressed: false}
+	}
 	return deltaOutcome{fallback: false, handled: false, progressed: false}
 }
 
@@ -663,6 +666,9 @@ func (manager *Manager) applyDeltaChanges(ctx context.Context, job model.Job, st
 			state.working[relativePath] = seedHash
 			processed, reused, embedded, dropped, loaded := state.chunkSplit()
 			manager.reportDeltaProgress(job.ID, safeInt32(index+1), totalChanged, totalFiles, result, processed, reused, embedded, dropped, loaded, state.source.unit())
+			if err := manager.checkpointJob(ctx); err != nil {
+				return result, deltaOutcome{fallback: false, handled: true, progressed: false}
+			}
 			continue
 		}
 		outcome := manager.handleChangedFile(ctx, job, state, relativePath, &result)
@@ -678,6 +684,9 @@ func (manager *Manager) applyDeltaChanges(ctx context.Context, job model.Job, st
 		}
 		processed, reused, embedded, dropped, loaded := state.chunkSplit()
 		manager.reportDeltaProgress(job.ID, safeInt32(index+1), totalChanged, totalFiles, result, processed, reused, embedded, dropped, loaded, state.source.unit())
+		if err := manager.checkpointJob(ctx); err != nil {
+			return result, deltaOutcome{fallback: false, handled: true, progressed: false}
+		}
 	}
 	return result, deltaOutcome{fallback: false, handled: false, progressed: false}
 }
@@ -773,10 +782,10 @@ func effectiveRemoval(source itemSource, fileResult indexer.OneFileResult, relat
 // the source has no per-item reuse, and on a failed load it logs and falls
 // back to that map so the item embeds every chunk rather than failing.
 //
-// It has one terminal outcome of its own. A read that stalls long enough gives
-// up this job's indexing slot and sync-lock reference, and when the job cannot
-// take those back within the resume bound the returned jobCapacityReacquireError
-// ends the job rather than continuing without them.
+// It has one terminal outcome of its own. A stalled read durably pauses and
+// yields its scheduler lease. Cancellation or a permanent lock error while
+// resuming returns jobCapacityReacquireError instead of continuing without the
+// lease.
 func (manager *Manager) itemReuse(
 	ctx context.Context,
 	state deltaState,

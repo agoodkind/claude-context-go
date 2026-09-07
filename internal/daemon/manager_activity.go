@@ -31,7 +31,12 @@ func (manager *Manager) WatcherActivity() []WatcherActivity {
 // how many slots exist. A job that cannot take one stays queued, so the pair is
 // what explains a queued job that waits on no dependency.
 func (manager *Manager) IndexSlots() (int, int) {
-	return len(manager.indexSlots), cap(manager.indexSlots)
+	snapshot := manager.jobScheduler.Snapshot()
+	inUse := 0
+	for _, count := range snapshot.Running {
+		inUse += count
+	}
+	return inUse, snapshot.Capacity
 }
 
 // StartedAt reports when this daemon process built its manager, so a caller

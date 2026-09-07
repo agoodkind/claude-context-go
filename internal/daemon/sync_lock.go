@@ -34,10 +34,6 @@ const (
 	syncLockFailed syncLockOutcome = "failed"
 )
 
-// errSyncLockUnavailable stands in when a caller must report a lock it could
-// not take but the attempt carried no underlying error of its own.
-var errSyncLockUnavailable = errors.New("sync lock unavailable")
-
 // errSyncLockWaitCancelled reports a wait that ended because the caller's
 // context ended.
 var errSyncLockWaitCancelled = errors.New("sync lock wait cancelled")
@@ -156,41 +152,6 @@ func (lock *syncLock) unlockFileLocked(ctx context.Context) {
 		slog.ErrorContext(ctx, "close sync lock failed", "path", lock.lockPath, "err", err)
 	}
 	lock.file = nil
-}
-
-// acquireBlocking waits out ordinary contention until it takes a reference,
-// the context ends, or a permanent failure occurs.
-func (lock *syncLock) acquireBlocking(
-	ctx context.Context,
-) (syncLockLease, syncLockOutcome, error) {
-	for {
-		if ctx.Err() != nil {
-			return lock.cancelledWait(ctx)
-		}
-		lease, outcome, err := lock.acquire(ctx)
-		switch outcome {
-		case syncLockAcquired:
-			return lease, syncLockAcquired, nil
-		case syncLockFailed:
-			return syncLockLease{lock: nil, once: nil}, syncLockFailed, err
-		case syncLockBusy, syncLockCancelled:
-		}
-		select {
-		case <-ctx.Done():
-			return lock.cancelledWait(ctx)
-		case <-time.After(syncLockRetryInterval):
-		}
-	}
-}
-
-// cancelledWait reports a wait that ended because the caller's context did.
-func (lock *syncLock) cancelledWait(
-	ctx context.Context,
-) (syncLockLease, syncLockOutcome, error) {
-	slog.DebugContext(ctx, "sync lock wait cancelled", "path", lock.lockPath, "err", ctx.Err())
-	return syncLockLease{lock: nil, once: nil},
-		syncLockCancelled,
-		errSyncLockWaitCancelled
 }
 
 // releaseReference drops one reference and releases the kernel lock when the

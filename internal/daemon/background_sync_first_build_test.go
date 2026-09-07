@@ -270,7 +270,7 @@ func TestStaleConvergeTerminalStatePreservesNewerFirstBuild(t *testing.T) {
 			manager.codebases[staleCodebase.ID] = staleCodebase
 			manager.mu.Unlock()
 			syncer := NewBackgroundSync(manager.config, manager)
-			registration, err := syncer.registerConvergeJob(context.Background(), staleCodebase, []string{"main.go"})
+			registration, _, err := syncer.registerConvergeJob(context.Background(), staleCodebase, []string{"main.go"})
 			if err != nil {
 				t.Fatalf("registerConvergeJob returned error: %v", err)
 			}
@@ -332,7 +332,7 @@ func TestRegisterConvergeJobRejectsChangedOwnership(t *testing.T) {
 
 	syncer := NewBackgroundSync(manager.config, manager)
 	syncer.queue = NewEventQueue(time.Hour, func(string, []string) {})
-	if _, err := syncer.registerConvergeJob(context.Background(), staleCodebase, []string{"main.go"}); err == nil {
+	if _, _, err := syncer.registerConvergeJob(context.Background(), staleCodebase, []string{"main.go"}); err == nil {
 		t.Fatal("registerConvergeJob returned nil after ownership changed")
 	}
 	manager.mu.Lock()
@@ -350,13 +350,13 @@ func TestRegisterConvergeJobRejectsChangedOwnership(t *testing.T) {
 	}
 }
 
-func TestRegisterConvergeJobRequeuesPathsWhenJournalRunningFails(t *testing.T) {
+func TestRegisterConvergeJobRequeuesPathsWhenJournalQueuedFails(t *testing.T) {
 	manager, _, repoPath := newTestManager(t)
 	codebase := seedConvergeCodebase(t, manager, repoPath)
 	manager.jobJournal.close()
 	manager.jobJournal = nil
 	manager.appendJobEvent = func(_ string, event model.JobEvent) error {
-		if event.Event == "job_running" {
+		if event.Event == "converge_queued" {
 			return errors.New("journal unavailable")
 		}
 		return nil
@@ -364,8 +364,8 @@ func TestRegisterConvergeJobRequeuesPathsWhenJournalRunningFails(t *testing.T) {
 
 	syncer := NewBackgroundSync(manager.config, manager)
 	syncer.queue = NewEventQueue(time.Hour, func(string, []string) {})
-	if _, err := syncer.registerConvergeJob(context.Background(), codebase, []string{"main.go"}); err == nil {
-		t.Fatal("registerConvergeJob returned nil after running journal failure")
+	if _, _, err := syncer.registerConvergeJob(context.Background(), codebase, []string{"main.go"}); err == nil {
+		t.Fatal("registerConvergeJob returned nil after queued journal failure")
 	}
 	manager.mu.Lock()
 	jobCount := len(manager.jobs)

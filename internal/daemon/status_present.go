@@ -806,7 +806,7 @@ func isTerminalJobState(state model.JobState) bool {
 	switch state {
 	case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
 		return true
-	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+	case model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling:
 		return false
 	default:
 		return false

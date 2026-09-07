@@ -288,7 +288,7 @@ func TestStateNoteForEveryOutcome(t *testing.T) {
 func TestJobStateLabelForCoversEveryState(t *testing.T) {
 	t.Parallel()
 	for _, state := range []model.JobState{
-		model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling,
+		model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling,
 		model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled,
 	} {
 		if JobStateLabelFor(state) == "" {

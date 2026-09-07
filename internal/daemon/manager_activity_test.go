@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"goodkind.io/lm-semantic-search/internal/config"
+	"goodkind.io/lm-semantic-search/internal/jobscheduler"
 	"goodkind.io/lm-semantic-search/internal/model"
 )
 
@@ -163,7 +164,7 @@ func TestStatusSnapshotSeesADrainingSlotExactlyOnce(t *testing.T) {
 		jobs:                    map[string]model.Job{},
 		pendingCodeJobs:         map[string]pendingCodeRequest{codebaseID: {}},
 		pendingConversationJobs: map[string]conversationJobPayload{},
-		indexSlots:              make(chan struct{}, 1),
+		jobScheduler:            jobscheduler.New(1),
 	}
 
 	// Move the slot into the job store the way drainPendingJobLocked does, under
@@ -216,7 +217,7 @@ func TestStatusSnapshotOmitsTerminalJobs(t *testing.T) {
 		},
 		pendingCodeJobs:         map[string]pendingCodeRequest{},
 		pendingConversationJobs: map[string]conversationJobPayload{},
-		indexSlots:              make(chan struct{}, 4),
+		jobScheduler:            jobscheduler.New(4),
 	}
 
 	snapshot := manager.StatusSnapshot()
@@ -247,7 +248,7 @@ func TestStatusSnapshotResolvesHealthLikeEverySurface(t *testing.T) {
 			jobs:                    map[string]model.Job{},
 			pendingCodeJobs:         map[string]pendingCodeRequest{},
 			pendingConversationJobs: map[string]conversationJobPayload{},
-			indexSlots:              make(chan struct{}, 1),
+			jobScheduler:            jobscheduler.New(1),
 			semantic:                nil,
 			health: dependencyHealth{
 				Mode:  dependencyStoreUnavailable,

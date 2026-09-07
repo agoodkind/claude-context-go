@@ -174,19 +174,41 @@ func (manager *Manager) recordResumeLaunched(ctx context.Context, plan resumePla
 }
 
 func (manager *Manager) resumeConverge(ctx context.Context, plan resumePlan, client model.ClientInfo) error {
-	job, _, _, err := manager.SyncIndexWithPolicy(ctx, plan.canonicalPath, client, plan.schedulingOverride)
-	if err != nil {
-		return err
-	}
 	manager.mu.Lock()
-	current, found := manager.jobs[job.ID]
+	codebase, found := manager.codebases[plan.codebaseID]
 	if !found {
 		manager.mu.Unlock()
-		return fmt.Errorf("recovered converge successor %s is missing", job.ID)
+		return fmt.Errorf("recovered converge codebase %s is missing", plan.codebaseID)
 	}
+	indexConfig := manager.enrichIndexConfig(codebase.EffectiveConfig)
+	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
+	_, resolution, err := manager.activeJobLocked(codebase, indexConfig)
+	if err != nil {
+		manager.mu.Unlock()
+		return err
+	}
+	if resolution != activeJobNone {
+		manager.mu.Unlock()
+		return nil
+	}
+	job, err := manager.enqueueCodeSyncJobLocked(codebase, pendingCodeRequest{
+		requestedPath: plan.canonicalPath,
+		canonicalPath: plan.canonicalPath,
+		client:        client,
+		indexConfig:   indexConfig,
+		force:         false,
+		policyPatch:   plan.schedulingOverride,
+	})
+	if err != nil {
+		manager.mu.Unlock()
+		return err
+	}
+	current := manager.jobs[job.ID]
 	current.EffectiveSchedulingPolicy = plan.effectiveSchedulingPolicy
 	current.SchedulingOverride = plan.schedulingOverride
-	current.QueueSequence = plan.queueSequence
+	if plan.queueSequence != 0 {
+		current.QueueSequence = plan.queueSequence
+	}
 	manager.jobs[job.ID] = current
 	if err := manager.appendJobLocked("resume_converge_sync", current); err != nil {
 		manager.mu.Unlock()
@@ -194,6 +216,7 @@ func (manager *Manager) resumeConverge(ctx context.Context, plan resumePlan, cli
 		return err
 	}
 	manager.mu.Unlock()
+	manager.runJobAsync(ctx, job.ID)
 	return nil
 }
 

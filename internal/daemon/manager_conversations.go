@@ -436,7 +436,7 @@ func (manager *Manager) activeConversationJobLocked(codebase model.Codebase) (mo
 	switch activeJob.State {
 	case model.JobStateCompleted, model.JobStateFailed, model.JobStateCancelled:
 		return emptyJob, false, nil
-	case model.JobStateQueued, model.JobStateRunning, model.JobStateCancelling:
+	case model.JobStateQueued, model.JobStateRunning, model.JobStatePaused, model.JobStateCancelling:
 		return activeJob, true, nil
 	default:
 		return emptyJob, false, fmt.Errorf("unknown job state %s for active job %s", activeJob.State, activeJob.ID)
@@ -508,12 +508,13 @@ func (manager *Manager) runConversationDelete(ctx context.Context, job model.Job
 }
 
 func (manager *Manager) finishConversationDelete(ctx context.Context, jobID string) {
+	manager.transitionMutex.Lock()
 	manager.mu.Lock()
-
 	job, found := manager.jobs[jobID]
-	if !found {
+	if !found || isTerminalJobState(job.State) {
 		delete(manager.conversationJobs, jobID)
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
 	now := clock.Now()
@@ -524,14 +525,19 @@ func (manager *Manager) finishConversationDelete(ctx context.Context, jobID stri
 	job.Progress.OverallPercent = 100
 	job.Progress.LastEventAt = now
 	job.Progress.HeartbeatAt = now
-	delete(manager.conversationJobs, jobID)
-	if err := manager.appendJobLocked("job_completed", job); err != nil {
-		slog.ErrorContext(ctx, "append completed conversation delete event failed", "job_id", jobID, "err", err)
+	jobEvent := model.JobEvent{Event: "job_completed", OccurredAt: clock.Now(), Job: job}
+	manager.mu.Unlock()
+	journalErr := manager.writeJobTransition(jobEvent)
+	manager.mu.Lock()
+	manager.jobs[jobID] = job
+	if journalErr != nil {
+		slog.ErrorContext(ctx, "append completed conversation delete event failed", "job_id", jobID, "err", journalErr)
 	}
-
+	delete(manager.conversationJobs, jobID)
 	codebase, found := manager.codebases[job.CodebaseID]
 	if !found {
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
 	// Clear ActiveJobID only when it still points at this job, so a raced or
@@ -553,6 +559,7 @@ func (manager *Manager) finishConversationDelete(ctx context.Context, jobID stri
 	drainedJobID, drained := manager.drainPendingJobLocked(ctx, codebase.ID)
 	codebaseID := codebase.ID
 	manager.mu.Unlock()
+	manager.transitionMutex.Unlock()
 	if drained {
 		manager.runDrainedJob(ctx, codebaseID, drainedJobID)
 	}

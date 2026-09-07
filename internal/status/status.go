@@ -265,6 +265,7 @@ func Resolve(in Inputs) Surface {
 var jobStateWordByState = map[model.JobState]string{
 	model.JobStateQueued:     "queued",
 	model.JobStateRunning:    "running",
+	model.JobStatePaused:     "paused",
 	model.JobStateCancelling: "canceling",
 	model.JobStateCompleted:  "completed",
 	model.JobStateFailed:     "failed",

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,18 +59,21 @@ func newTestManagerWithCap(t *testing.T, maxConcurrent int) (*Manager, config.Co
 	if err != nil {
 		t.Fatalf("NewManager returned error: %v", err)
 	}
-	t.Cleanup(manager.CloseGraphEngines)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := manager.cancelAndWaitForJobs(ctx); err != nil {
+			t.Errorf("cancelAndWaitForJobs: %v", err)
+		}
+		manager.CloseGraphEngines()
+	})
 	return manager, cfg
 }
 
-func TestDefaultJobCapacityReleaseLeavesSchedulerMargin(t *testing.T) {
+func TestDefaultJobCapacityReleaseGraceMatchesWatchdogContract(t *testing.T) {
 	timings := defaultJobCapacityTimings()
-	if timings.ReleaseGrace >= defaultJobCapacityReacquireTimeout {
-		t.Fatalf(
-			"release grace = %s, want less than the %s capacity recovery contract",
-			timings.ReleaseGrace,
-			defaultJobCapacityReacquireTimeout,
-		)
+	if timings.ReleaseGrace != 4500*time.Millisecond {
+		t.Fatalf("release grace = %s, want 4.5s", timings.ReleaseGrace)
 	}
 }
 
@@ -215,6 +219,101 @@ func TestStartIndexQueuedBehindCapReportsQueuedThenRunning(t *testing.T) {
 	waitForCodebaseStatus(t, manager, secondRepo, model.CodebaseStatusIndexed)
 }
 
+func TestSchedulerAdmissionRegistersQueuedJobBeforeRunning(t *testing.T) {
+	manager, _ := newTestManagerWithCap(t, 1)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	inFlight := atomic.Int32{}
+	maxInFlight := atomic.Int32{}
+	manager.runner = blockingRunner(entered, release, &inFlight, &maxInFlight)
+
+	firstRepo := newCapTestRepo(t)
+	secondRepo := newCapTestRepo(t)
+	if _, _, _, _, err := manager.StartIndex(
+		context.Background(),
+		firstRepo,
+		testClientInfo(),
+		defaultIndexConfig(),
+		false,
+		emptyAdmissionBudget,
+	); err != nil {
+		t.Fatalf("first StartIndex returned error: %v", err)
+	}
+	<-entered
+
+	highPriority := model.JobPriorityHigh
+	secondJob, _, _, _, err := manager.StartIndexWithPolicy(
+		context.Background(),
+		secondRepo,
+		testClientInfo(),
+		defaultIndexConfig(),
+		false,
+		emptyAdmissionBudget,
+		model.SchedulingPolicyPatch{Priority: &highPriority},
+	)
+	if err != nil {
+		t.Fatalf("second StartIndexWithPolicy returned error: %v", err)
+	}
+
+	waitForCondition(t, func() bool {
+		snapshot := manager.jobScheduler.Snapshot()
+		return snapshot.Queued[model.JobPriorityHigh] == 1
+	})
+	queued, found := manager.GetJob(secondJob.ID)
+	if !found {
+		t.Fatal("second job not found")
+	}
+	if queued.State != model.JobStateQueued {
+		t.Fatalf("second job state = %q, want %q", queued.State, model.JobStateQueued)
+	}
+
+	close(release)
+	for range 1 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second scheduler admission did not enter the runner")
+		}
+	}
+	waitForCodebaseStatus(t, manager, firstRepo, model.CodebaseStatusIndexed)
+	waitForCodebaseStatus(t, manager, secondRepo, model.CodebaseStatusIndexed)
+}
+
+func TestConversationUsesNormalPriority(t *testing.T) {
+	manager, _ := newTestManagerWithCap(t, 1)
+	codebase := newCodebaseRecord("chat:///scheduler-priority")
+	codebase.Kind = model.CodebaseKindDocument
+	codebase.Status = model.CodebaseStatusIndexed
+	codebase.SchedulingPolicy.Priority = model.JobPriorityHigh
+	payload := conversationJobPayload{
+		Kind:           conversationJobKindUpsert,
+		CollectionName: "conversation_scheduler_priority",
+		Manifest:       map[string]string{"conversation-1": "fingerprint-1"},
+		Documents: []model.ConversationDocument{{
+			ConversationID: "conversation-1",
+			MessageIndex:   0,
+			Role:           "user",
+			Text:           "hello",
+		}},
+		Absence: absenceRetain,
+	}
+
+	manager.mu.Lock()
+	manager.codebases[codebase.ID] = codebase
+	job, err := manager.enqueueConversationJobLocked(codebase, testClientInfo(), payload)
+	manager.mu.Unlock()
+	if err != nil {
+		t.Fatalf("enqueueConversationJobLocked returned error: %v", err)
+	}
+	if job.EffectiveSchedulingPolicy.Priority != model.JobPriorityNormal {
+		t.Fatalf(
+			"conversation priority = %q, want %q",
+			job.EffectiveSchedulingPolicy.Priority,
+			model.JobPriorityNormal,
+		)
+	}
+}
+
 // A reuse collection can spend the full bounded load window in Milvus. Once
 // that read has run past the release grace, it gives up both scarce holds, so
 // another job can start even when the configured job cap is one.
@@ -300,7 +399,8 @@ func TestStuckReuseLoadDoesNotHoldIndexSlotOrSyncLock(t *testing.T) {
 		manager.syncLock.mu.Lock()
 		lockRefcount := manager.syncLock.refcount
 		manager.syncLock.mu.Unlock()
-		return len(manager.indexSlots) == 0 && lockRefcount == 0
+		slotsInUse, _ := manager.IndexSlots()
+		return slotsInUse == 0 && lockRefcount == 0
 	})
 
 	if _, _, _, _, err := manager.StartIndex(
@@ -327,15 +427,116 @@ func TestStuckReuseLoadDoesNotHoldIndexSlotOrSyncLock(t *testing.T) {
 	waitForCodebaseStatus(t, manager, secondRepo, model.CodebaseStatusIndexed)
 }
 
-// A job whose stalled reuse read finally returns must reach a terminal state
-// even when another job has taken the slot it gave up. The read here stalls
-// well past the release grace, so the holds really are surrendered; the resume
-// then has its own deadline, and the caller observes a failed terminal job
-// instead of one left running behind the holder.
-func TestReuseLoadResumeDeadlineTerminatesJobWhileReplacementHoldsSlot(t *testing.T) {
+func TestExternalSyncLockRetryAdmitsHighBeforeLow(t *testing.T) {
+	manager, cfg := newTestManagerWithCap(t, 1)
+	manager.semantic = &fakeSemantic{}
+	lowRepo := newMultiFileRepo(t, "low.go")
+	highRepo := newMultiFileRepo(t, "high.go")
+	_, lowJob := seedBootstrapCodebase(t, manager, lowRepo, defaultIndexConfig())
+	_, highJob := seedBootstrapCodebase(t, manager, highRepo, defaultIndexConfig())
+	lowPolicy := model.DefaultSchedulingPolicy()
+	lowPolicy.Priority = model.JobPriorityLow
+	highPolicy := model.DefaultSchedulingPolicy()
+	highPolicy.Priority = model.JobPriorityHigh
+	manager.mu.Lock()
+	lowJob.EffectiveSchedulingPolicy = lowPolicy
+	lowJob.QueueSequence = 1
+	highJob.EffectiveSchedulingPolicy = highPolicy
+	highJob.QueueSequence = 2
+	manager.jobs[lowJob.ID] = lowJob
+	manager.jobs[highJob.ID] = highJob
+	manager.mu.Unlock()
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	t.Cleanup(func() { closeOnce(release) })
+	manager.runner = fakeRunner{indexOne: func(
+		ctx context.Context,
+		_ string,
+		relativePath string,
+		_ model.IndexConfig,
+	) (indexer.OneFileResult, error) {
+		entered <- relativePath
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return indexer.OneFileResult{}, ctx.Err()
+		}
+		content := "package retry\n"
+		return indexer.OneFileResult{
+			Chunks: []model.StoredChunk{{
+				Content:       content,
+				RelativePath:  relativePath,
+				StartLine:     1,
+				EndLine:       1,
+				Language:      "go",
+				FileExtension: ".go",
+			}},
+			FileHash: hashText(content),
+		}, nil
+	}}
+
+	lockPath := filepath.Join(cfg.ContextRoot, "mcp-sync.flock")
+	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Close() })
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("Flock: %v", err)
+	}
+
+	manager.runJobAsync(context.Background(), lowJob.ID)
+	waitForCondition(t, func() bool {
+		return manager.jobScheduler.Snapshot().Paused[model.JobPriorityLow] == 1
+	})
+	manager.runJobAsync(context.Background(), highJob.ID)
+	waitForCondition(t, func() bool {
+		snapshot := manager.jobScheduler.Snapshot()
+		return snapshot.Paused[model.JobPriorityHigh] == 1 &&
+			snapshot.Paused[model.JobPriorityLow] == 1
+	})
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock external holder: %v", err)
+	}
+
+	select {
+	case relativePath := <-entered:
+		if relativePath != "high.go" {
+			t.Fatalf("first admitted retry = %q, want high.go", relativePath)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no retry entered after external lock release")
+	}
+	select {
+	case relativePath := <-entered:
+		t.Fatalf("second retry %q entered before high released", relativePath)
+	default:
+	}
+	close(release)
+	select {
+	case relativePath := <-entered:
+		if relativePath != "low.go" {
+			t.Fatalf("second admitted retry = %q, want low.go", relativePath)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("low retry did not run after high completed")
+	}
+	waitForCondition(t, func() bool {
+		low, lowFound := manager.GetJob(lowJob.ID)
+		high, highFound := manager.GetJob(highJob.ID)
+		return lowFound && highFound &&
+			low.State == model.JobStateCompleted &&
+			high.State == model.JobStateCompleted
+	})
+}
+
+// A job whose stalled reuse read finally returns stays visibly paused while
+// another job holds the slot it yielded. It resumes through the scheduler after
+// that replacement finishes instead of failing on a second timeout.
+func TestReuseLoadWaitsPausedWhileReplacementHoldsSlot(t *testing.T) {
 	manager, _ := newTestManagerWithCap(t, 1)
 	manager.jobCapacityTimings.ReleaseGrace = 10 * time.Millisecond
-	manager.jobCapacityTimings.Reacquire = 100 * time.Millisecond
 	parentRepo, childRepo := newParentWithChildRepo(t)
 	replacementRepo := newCapTestRepo(t)
 
@@ -439,29 +640,14 @@ func TestReuseLoadResumeDeadlineTerminatesJobWhileReplacementHoldsSlot(t *testin
 	}
 
 	close(releaseLoad)
-	terminalDeadline := time.NewTimer(2 * time.Second)
-	defer terminalDeadline.Stop()
-	terminalPoll := time.NewTicker(10 * time.Millisecond)
-	defer terminalPoll.Stop()
-	var terminal model.Job
-	for terminal.State != model.JobStateFailed {
-		select {
-		case <-terminalDeadline.C:
-			t.Fatalf("parent job remained non-terminal after its resume deadline: state=%q", terminal.State)
-		case <-terminalPoll.C:
-			observed, found := manager.GetJob(firstJob.ID)
-			if !found {
-				t.Fatalf("parent job %s disappeared", firstJob.ID)
-			}
-			terminal = observed
-		}
-	}
-	if terminal.CompletedAt == nil || terminal.Error == nil {
-		t.Fatalf("failed parent job lacks terminal error metadata: %+v", terminal)
-	}
+	waitPauseTestJobState(t, manager, firstJob.ID, model.JobStatePaused)
 
 	close(releaseReplacement)
 	waitForCodebaseStatus(t, manager, replacementRepo, model.CodebaseStatusIndexed)
+	waitForCondition(t, func() bool {
+		completed, found := manager.GetJob(firstJob.ID)
+		return found && completed.State == model.JobStateCompleted
+	})
 }
 
 // An ordinary sync reads stored vectors once per changed file, and every one of
@@ -472,9 +658,7 @@ func TestReuseLoadResumeDeadlineTerminatesJobWhileReplacementHoldsSlot(t *testin
 func TestHealthyPerFileReuseReadsKeepTheIndexSlot(t *testing.T) {
 	manager, _ := newTestManagerWithCap(t, 1)
 	// The production release grace stands, so a read that answers immediately
-	// must never reach it. The resume bound is shortened so that a job which did
-	// give up its holds fails fast rather than stretching the test.
-	manager.jobCapacityTimings.Reacquire = 100 * time.Millisecond
+	// must never reach it.
 
 	const syncFileCount = 6
 	syncRepo := newMultiFileRepo(t, "a.go", "b.go", "c.go", "d.go", "e.go", "f.go")
@@ -668,6 +852,111 @@ func TestCancelQueuedJobBehindCapReachesCancelled(t *testing.T) {
 	close(release)
 	waitForCodebaseStatus(t, manager, firstRepo, model.CodebaseStatusIndexed)
 	waitForCodebaseStatus(t, manager, secondRepo, model.CodebaseStatusIndexed)
+}
+
+func TestCancelPausedJobWakesSchedulerWaiter(t *testing.T) {
+	manager, _ := newTestManagerWithCap(t, 1)
+	manager.semantic = nil
+	lowRepo := newCapTestRepo(t)
+	highRepo := newCapTestRepo(t)
+	lowEntered := make(chan struct{})
+	releaseLow := make(chan struct{})
+	highEntered := make(chan struct{})
+	releaseHigh := make(chan struct{})
+	t.Cleanup(func() {
+		closeOnce(releaseLow)
+		closeOnce(releaseHigh)
+	})
+	var callCount atomic.Int32
+
+	manager.runner = fakeRunner{indexOne: func(
+		ctx context.Context,
+		_ string,
+		relativePath string,
+		_ model.IndexConfig,
+	) (indexer.OneFileResult, error) {
+		switch callCount.Add(1) {
+		case 1:
+			close(lowEntered)
+			select {
+			case <-releaseLow:
+			case <-ctx.Done():
+				return indexer.OneFileResult{}, ctx.Err()
+			}
+		case 2:
+			close(highEntered)
+			select {
+			case <-releaseHigh:
+			case <-ctx.Done():
+				return indexer.OneFileResult{}, ctx.Err()
+			}
+		}
+		content := "package main\n"
+		return indexer.OneFileResult{
+			Chunks: []model.StoredChunk{{
+				Content:       content,
+				RelativePath:  relativePath,
+				StartLine:     1,
+				EndLine:       1,
+				Language:      "go",
+				FileExtension: ".go",
+			}},
+			FileHash: hashText(content),
+		}, nil
+	}}
+
+	lowPriority := model.JobPriorityLow
+	lowJob, _, _, _, err := manager.StartIndexWithPolicy(
+		context.Background(),
+		lowRepo,
+		testClientInfo(),
+		defaultIndexConfig(),
+		false,
+		emptyAdmissionBudget,
+		model.SchedulingPolicyPatch{Priority: &lowPriority},
+	)
+	if err != nil {
+		t.Fatalf("low StartIndexWithPolicy returned error: %v", err)
+	}
+	<-lowEntered
+
+	highPriority := model.JobPriorityHigh
+	if _, _, _, _, err := manager.StartIndexWithPolicy(
+		context.Background(),
+		highRepo,
+		testClientInfo(),
+		defaultIndexConfig(),
+		false,
+		emptyAdmissionBudget,
+		model.SchedulingPolicyPatch{Priority: &highPriority},
+	); err != nil {
+		t.Fatalf("high StartIndexWithPolicy returned error: %v", err)
+	}
+	waitForCondition(t, func() bool {
+		snapshot := manager.jobScheduler.Snapshot()
+		return snapshot.Queued[model.JobPriorityHigh] == 1
+	})
+	close(releaseLow)
+	<-highEntered
+	waitPauseTestJobState(t, manager, lowJob.ID, model.JobStatePaused)
+
+	manager.mu.Lock()
+	lowDone := manager.done[lowJob.ID]
+	manager.mu.Unlock()
+	if _, err := manager.CancelJob(context.Background(), lowJob.ID); err != nil {
+		t.Fatalf("CancelJob returned error: %v", err)
+	}
+	select {
+	case <-lowDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("paused job did not stop after cancellation")
+	}
+	if snapshot := manager.jobScheduler.Snapshot(); snapshot.Paused[model.JobPriorityLow] != 0 {
+		t.Fatal("cancelled paused job retained its scheduler entry")
+	}
+
+	close(releaseHigh)
+	waitForCodebaseStatus(t, manager, highRepo, model.CodebaseStatusIndexed)
 }
 
 func TestResumeOrphanedJobsHonorsResumeOnBoot(t *testing.T) {

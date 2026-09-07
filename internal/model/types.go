@@ -75,6 +75,8 @@ const (
 	JobStateQueued JobState = "queued"
 	// JobStateRunning means the job is actively running.
 	JobStateRunning JobState = "running"
+	// JobStatePaused means the job retained its work state while yielding capacity.
+	JobStatePaused JobState = "paused"
 	// JobStateCancelling means the job is winding down after cancellation.
 	JobStateCancelling JobState = "cancelling"
 	// JobStateCompleted means the job finished successfully.

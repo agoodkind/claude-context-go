@@ -32,40 +32,45 @@ const (
 )
 
 func (manager *Manager) updateJobRunning(job model.Job) error {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 
 	currentJob, found := manager.jobs[job.ID]
 	if !found {
+		manager.mu.Unlock()
 		return fmt.Errorf("start job: job missing")
 	}
 	now := clock.Now()
-	previousJob := currentJob
 	// A first build was pending while its job sat queued; now that the job is
 	// running, the codebase is actively indexing. Persist this transition before
 	// journaling the running job so a crash leaves boot recovery a resumable
 	// registry state. A rebuild was already indexing.
 	codebase, found := manager.codebases[currentJob.CodebaseID]
 	if !found {
+		manager.mu.Unlock()
 		return fmt.Errorf("start job: codebase missing")
 	}
 	if codebase.ActiveJobID != currentJob.ID {
+		manager.mu.Unlock()
 		return fmt.Errorf("start job: codebase ownership changed")
 	}
+	previousCodebase := codebase
 	switch codebase.Status {
 	case model.CodebaseStatusPending:
-		previousCodebase := codebase
 		codebase.Status = model.CodebaseStatusIndexing
 		codebase.UpdatedAt = now
 		manager.codebases[codebase.ID] = codebase
 		if err := manager.saveLocked(); err != nil {
 			manager.codebases[codebase.ID] = previousCodebase
+			manager.mu.Unlock()
 			wrapped := errors.Join(errRetryJobStart, fmt.Errorf("persist running codebase state: %w", err))
 			slog.Error("persist running codebase state", "err", wrapped, "codebase_id", codebase.ID, "job_id", currentJob.ID)
 			return wrapped
 		}
 	case model.CodebaseStatusIndexing:
 		if err := manager.saveLocked(); err != nil {
+			manager.mu.Unlock()
 			wrapped := errors.Join(errRetryJobStart, fmt.Errorf("revalidate running codebase state: %w", err))
 			slog.Error("revalidate running codebase state", "err", wrapped, "codebase_id", codebase.ID, "job_id", currentJob.ID)
 			return wrapped
@@ -77,25 +82,46 @@ func (manager *Manager) updateJobRunning(job model.Job) error {
 		model.CodebaseStatusMissing,
 		model.CodebaseStatusDiscovered,
 		model.CodebaseStatusQuarantined:
+		manager.mu.Unlock()
 		return fmt.Errorf("start job: codebase status %q cannot run", codebase.Status)
 	default:
+		manager.mu.Unlock()
 		return fmt.Errorf("start job: codebase status %q cannot run", codebase.Status)
 	}
-	currentJob.State = model.JobStateRunning
-	currentJob.UpdatedAt = now
-	currentJob.Progress.Phase = "Preparing and scanning files..."
-	currentJob.Progress.LastEventAt = now
-	currentJob.Progress.HeartbeatAt = now
-	currentJob.Progress.OverallPercent = 0
-	manager.jobs[currentJob.ID] = currentJob
-	if err := manager.appendJobLocked("job_running", currentJob); err != nil {
-		manager.jobs[currentJob.ID] = previousJob
-		return errors.Join(errRetryJobStart, fmt.Errorf("append running job event: %w", err))
+	manager.mu.Unlock()
+
+	_, transitioned, transitionErr := manager.serializeJobTransitionLocked(
+		job.ID,
+		"job_running",
+		func(current *model.Job) bool {
+			if current.State != model.JobStateQueued {
+				return false
+			}
+			current.State = model.JobStateRunning
+			current.SchedulingReason = ""
+			current.UpdatedAt = now
+			current.Progress.Phase = "Preparing and scanning files..."
+			current.Progress.LastEventAt = now
+			current.Progress.HeartbeatAt = now
+			current.Progress.OverallPercent = 0
+			return true
+		},
+	)
+	if transitionErr != nil {
+		manager.mu.Lock()
+		manager.jobs[currentJob.ID] = currentJob
+		manager.mu.Unlock()
+		return errors.Join(errRetryJobStart, fmt.Errorf("append running job event: %w", transitionErr))
+	}
+	if !transitioned {
+		return fmt.Errorf("start job: job state changed")
 	}
 	return nil
 }
 
 func (manager *Manager) updateJobProgress(jobID string, progress indexer.Progress, unit string) {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -213,6 +239,8 @@ func (manager *Manager) updateDetachedJobHeartbeat(jobID string) {
 // counters and the change breakdown alone, since reportDeltaProgress owns the
 // per-file totals and setJobDeltaCounts owns the added/modified/removed counts.
 func (manager *Manager) updateJobChunkProgress(jobID string, processed int32, reused int32, embedded int32, dropped int32, batchesTotal int32, batchesCompleted int32, rowsWritten int32) {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -286,6 +314,8 @@ func (manager *Manager) updateCodebaseLiveTotalsLocked(job model.Job) {
 // are set once when the diff is known; updateJobProgress sets only the embed
 // counters, so these survive the per-file progress updates.
 func (manager *Manager) setJobDeltaCounts(jobID string, added int, modified int, removed int, filesInCodebase int) {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -303,6 +333,8 @@ func (manager *Manager) setJobDeltaCounts(jobID string, added int, modified int,
 // setJobRunMode records the kind of pass a run is making, decided once when
 // the plan is chosen, so surfaces can label denominators and name a resume.
 func (manager *Manager) setJobRunMode(jobID string, runMode string) {
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -322,6 +354,8 @@ func (manager *Manager) routeToBootstrap(ctx context.Context, jobID string, reas
 		slog.WarnContext(ctx, "unknown bootstrap reason", "reason", reason, "caller", caller, "job_id", jobID)
 	}
 
+	manager.transitionMutex.Lock()
+	defer manager.transitionMutex.Unlock()
 	manager.mu.Lock()
 	job, found := manager.jobs[jobID]
 	if !found {
@@ -364,35 +398,21 @@ func bootstrapRouteCaller() string {
 }
 
 func (manager *Manager) updateJobCompleted(ctx context.Context, jobID string, result indexer.Result) {
+	manager.transitionMutex.Lock()
 	manager.mu.Lock()
-
 	job, found := manager.jobs[jobID]
-	if !found {
+	if !found || job.State == model.JobStateCancelled {
 		manager.mu.Unlock()
-		return
-	}
-	if job.State == model.JobStateCancelled {
-		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
 	if job.State == model.JobStateCancelling {
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		manager.updateJobCancelled(ctx, jobID)
 		return
 	}
-
 	now := clock.Now()
-	metrics.JobCompleted()
-	// Clear the degraded banner only when this run actually embedded a file this
-	// run, which proves the dependency is reachable, matching the embed-progress
-	// clear path. FilesEmbedded is the per-run embedded count the embed loop
-	// recorded, zero for an empty-diff no-op or a skipped-only sync. Gating on
-	// result.IndexedFiles instead would clear the banner for a no-op completion,
-	// because that path reports the whole codebase file count without touching the
-	// store, and could wipe a banner raised by a real outage on another codebase.
-	if job.Progress.FilesEmbedded > 0 {
-		manager.noteDependencyHealthyLocked()
-	}
 	job.State = model.JobStateCompleted
 	job.UpdatedAt = now
 	job.CompletedAt = &now
@@ -400,23 +420,23 @@ func (manager *Manager) updateJobCompleted(ctx context.Context, jobID string, re
 	job.Progress.OverallPercent = 100
 	job.Progress.FilesProcessed = result.IndexedFiles
 	job.Progress.FilesTotal = result.IndexedFiles
-	// ChunksTotal is the codebase's collection size. ChunksProcessed, ChunksReused,
-	// and ChunksEmbedded stay at the real per-run values the embed loop recorded,
-	// which are zero for a completion that embedded nothing (an empty-diff no-op or
-	// a skipped-only sync). Reporting the collection total as embedded here would
-	// make a no-embed run look like a full re-embed.
 	job.Progress.ChunksTotal = result.TotalChunks
 	job.Progress.ChunksGenerated = job.Progress.ChunksEmbedded
 	job.Progress.LastEventAt = now
 	job.Progress.HeartbeatAt = now
+	manager.jobs[jobID] = job
+	metrics.JobCompleted()
+	if job.Progress.FilesEmbedded > 0 {
+		manager.noteDependencyHealthyLocked()
+	}
 	if err := manager.appendJobLocked("job_completed", job); err != nil {
 		slog.ErrorContext(ctx, "append completed job event failed", "job_id", jobID, "err", err)
 	}
-
 	manager.forgetJobJournalLocked(jobID)
 	codebase, found := manager.codebases[job.CodebaseID]
 	if !found {
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
 	delete(manager.failedBuildRetries, codebase.ID)
@@ -448,6 +468,7 @@ func (manager *Manager) updateJobCompleted(ctx context.Context, jobID string, re
 	// transition that did not own the slot never drains a duplicate.
 	drainedJobID, drained := manager.drainPendingJobLocked(ctx, codebase.ID)
 	manager.mu.Unlock()
+	manager.transitionMutex.Unlock()
 	manager.notifyIndexReady(ctx, codebase)
 	if drained {
 		manager.runDrainedJob(ctx, codebase.ID, drainedJobID)
@@ -473,29 +494,45 @@ func (manager *Manager) writeCompletedArtifacts(ctx context.Context, codebase mo
 }
 
 func (manager *Manager) updateJobFailed(ctx context.Context, jobID string, runErr error) {
+	manager.transitionMutex.Lock()
 	manager.mu.Lock()
-
-	job, found := manager.markJobFailedLocked(ctx, jobID, runErr)
-	if !found {
+	job, found := manager.jobs[jobID]
+	if !found || isTerminalJobState(job.State) {
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
+	traceID := string(correlation.FromContext(ctx).TraceID)
+	transient := adapterr.IsTransient(runErr)
 	now := clock.Now()
-	// A self-healing failure marks the job retryable. A shared-infrastructure
-	// failure (the embedding pipeline or the vector store) never changes the
-	// codebase's durable state, because it affects every codebase the same way
-	// and is surfaced once by the daemon health banner; only a fault local to
-	// this codebase becomes terminal. The persisted message is the safe class
-	// message, never the wrapped cause, which stays in the log below correlated
-	// by trace_id.
+	job.State = model.JobStateFailed
+	job.UpdatedAt = now
+	job.CompletedAt = &now
+	job.Progress.Phase = "failed"
+	job.Progress.LastEventAt = now
+	job.Progress.HeartbeatAt = now
+	job.Error = &model.JobError{
+		Message:   adapterr.SafeMessage(runErr),
+		Code:      adapterr.Code(runErr),
+		Retryable: transient,
+		TraceID:   traceID,
+		JobID:     jobID,
+	}
+	metrics.JobFailed()
+	slog.ErrorContext(ctx, "job.failed", "component", "daemon", "subcomponent", "jobs", "job_id", jobID, "trace_id", traceID, "transient", transient, "err", runErr)
+	manager.jobs[jobID] = job
+	delete(manager.conversationJobs, jobID)
+	if err := manager.appendJobLocked("job_failed", job); err != nil {
+		slog.ErrorContext(ctx, "append failed job event failed", "job_id", jobID, "err", err)
+	}
+	manager.forgetJobJournalLocked(jobID)
 	infra := adapterr.IsInfraFailure(runErr)
 	safeMessage := job.Error.Message
 	errorCode := job.Error.Code
-	traceID := job.Error.TraceID
-
 	codebase, found := manager.codebases[job.CodebaseID]
 	if !found {
 		manager.mu.Unlock()
+		manager.transitionMutex.Unlock()
 		return
 	}
 	// Clear ActiveJobID only when it still points at this job, so a raced or
@@ -535,6 +572,7 @@ func (manager *Manager) updateJobFailed(ctx context.Context, jobID string, runEr
 	drainedJobID, drained := manager.drainPendingJobLocked(ctx, codebase.ID)
 	codebaseID := codebase.ID
 	manager.mu.Unlock()
+	manager.transitionMutex.Unlock()
 	manager.notifyIndexStopped(ctx, codebaseID)
 	if drained {
 		manager.runDrainedJob(ctx, codebaseID, drainedJobID)
@@ -542,129 +580,165 @@ func (manager *Manager) updateJobFailed(ctx context.Context, jobID string, runEr
 }
 
 func (manager *Manager) updateDetachedJobFailed(ctx context.Context, jobID string, runErr error) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	job, found := manager.jobs[jobID]
-	if !found || isTerminalJobState(job.State) {
-		return
+	job, transitioned := manager.failJobTransition(ctx, jobID, runErr)
+	if transitioned {
+		manager.finishDetachedCodebase(ctx, job)
 	}
-	_, _ = manager.markJobFailedLocked(ctx, jobID, runErr)
 }
 
 func (manager *Manager) updateDetachedJobCompleted(ctx context.Context, jobID string, result indexer.Result) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	job, found := manager.jobs[jobID]
-	if !found || isTerminalJobState(job.State) {
+	job, transitioned, journalErr := manager.serializeJobTransition(
+		jobID,
+		"job_completed",
+		func(job *model.Job) bool {
+			if isTerminalJobState(job.State) {
+				return false
+			}
+			now := clock.Now()
+			job.State = model.JobStateCompleted
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			job.Progress.Phase = "completed"
+			job.Progress.OverallPercent = 100
+			// Detached watcher converges report paths examined through their
+			// progress callback. Result.IndexedFiles counts only paths that
+			// changed the index, so it can be zero after a complete missing-path
+			// converge. Terminal completion must not move those counters backward.
+			job.Progress.FilesProcessed = max(job.Progress.FilesProcessed, result.IndexedFiles)
+			job.Progress.FilesTotal = max(job.Progress.FilesTotal, result.IndexedFiles)
+			job.Progress.ChunksTotal = result.TotalChunks
+			job.Progress.ChunksGenerated = job.Progress.ChunksEmbedded
+			job.Progress.LastEventAt = now
+			job.Progress.HeartbeatAt = now
+			return true
+		},
+	)
+	if !transitioned {
 		return
 	}
-	now := clock.Now()
 	metrics.JobCompleted()
-	job.State = model.JobStateCompleted
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "completed"
-	job.Progress.OverallPercent = 100
-	job.Progress.FilesProcessed = result.IndexedFiles
-	job.Progress.FilesTotal = result.IndexedFiles
-	job.Progress.ChunksTotal = result.TotalChunks
-	job.Progress.ChunksGenerated = job.Progress.ChunksEmbedded
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	if err := manager.appendJobLocked("job_completed", job); err != nil {
-		slog.ErrorContext(ctx, "append completed job event failed", "job_id", jobID, "err", err)
+	if journalErr != nil {
+		slog.ErrorContext(ctx, "append completed job event failed", "job_id", jobID, "err", journalErr)
 	}
+	manager.mu.Lock()
 	manager.forgetJobJournalLocked(jobID)
+	manager.mu.Unlock()
+	manager.finishDetachedCodebase(ctx, job)
 }
 
 func (manager *Manager) updateDetachedJobCancelled(ctx context.Context, jobID string) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	job, found := manager.jobs[jobID]
-	if !found || isTerminalJobState(job.State) {
-		return
-	}
-	manager.forgetJobJournalLocked(jobID)
-	now := clock.Now()
-	metrics.JobCancelled()
-	job.State = model.JobStateCancelled
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "cancelled"
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	if err := manager.appendJobLocked("job_cancelled", job); err != nil {
-		slog.ErrorContext(ctx, "append cancelled job event failed", "job_id", jobID, "err", err)
-	}
+	manager.updateJobCancelled(ctx, jobID)
 }
 
-func (manager *Manager) markJobFailedLocked(ctx context.Context, jobID string, runErr error) (model.Job, bool) {
-	job, found := manager.jobs[jobID]
-	if !found || isTerminalJobState(job.State) {
-		var emptyJob model.Job
-		return emptyJob, false
+func (manager *Manager) finishDetachedCodebase(ctx context.Context, job model.Job) {
+	manager.mu.Lock()
+	codebase, found := manager.codebases[job.CodebaseID]
+	if !found || codebase.ActiveJobID != job.ID {
+		manager.mu.Unlock()
+		return
 	}
-	delete(manager.conversationJobs, jobID)
-	manager.forgetJobJournalLocked(jobID)
-
-	traceID := string(correlation.FromContext(ctx).TraceID)
-	now := clock.Now()
-	transient := adapterr.IsTransient(runErr)
-	metrics.JobFailed()
-	job.State = model.JobStateFailed
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "failed"
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	job.Error = &model.JobError{
-		Message:   adapterr.SafeMessage(runErr),
-		Code:      adapterr.Code(runErr),
-		Retryable: transient,
-		TraceID:   traceID,
-		JobID:     jobID,
+	codebase.ActiveJobID = ""
+	switch job.State {
+	case model.JobStateCompleted:
+		codebase.Status = model.CodebaseStatusIndexed
+	case model.JobStateFailed:
+		codebase.Status = model.CodebaseStatusFailed
+	case model.JobStateCancelled:
+		codebase.Status = codebaseStatusAfterCancellation(codebase)
+	case model.JobStateQueued,
+		model.JobStateRunning,
+		model.JobStatePaused,
+		model.JobStateCancelling:
+		manager.mu.Unlock()
+		return
+	default:
+		manager.mu.Unlock()
+		return
 	}
-	manager.jobs[jobID] = job
-	slog.ErrorContext(ctx, "job.failed", "component", "daemon", "subcomponent", "jobs", "job_id", jobID, "trace_id", traceID, "transient", transient, "err", runErr)
-	if err := manager.appendJobLocked("job_failed", job); err != nil {
-		slog.ErrorContext(ctx, "append failed job event failed", "job_id", jobID, "err", err)
+	codebase.UpdatedAt = clock.Now()
+	manager.codebases[codebase.ID] = codebase
+	if err := manager.saveLocked(); err != nil {
+		slog.ErrorContext(ctx, "write registry after detached job terminal transition failed", "job_id", job.ID, "err", err)
 	}
-	return job, true
+	drainedJobID, drained := manager.drainPendingJobLocked(ctx, codebase.ID)
+	manager.mu.Unlock()
+	manager.notifyIndexStopped(ctx, codebase.ID)
+	if drained {
+		manager.runDrainedJob(ctx, codebase.ID, drainedJobID)
+	}
 }
 
 func (manager *Manager) updateJobCancelled(ctx context.Context, jobID string) {
-	manager.mu.Lock()
+	manager.policyMutationMutex.Lock()
+	followup := manager.updateJobCancelledWithPolicy(ctx, jobID)
+	manager.policyMutationMutex.Unlock()
+	manager.runCancellationFollowup(ctx, followup)
+}
 
-	job, found := manager.jobs[jobID]
-	if !found {
-		manager.mu.Unlock()
+type cancellationFollowup struct {
+	codebaseID   string
+	drainedJobID string
+	drained      bool
+}
+
+func emptyCancellationFollowup() cancellationFollowup {
+	return cancellationFollowup{
+		codebaseID:   "",
+		drainedJobID: "",
+		drained:      false,
+	}
+}
+
+func (manager *Manager) runCancellationFollowup(
+	ctx context.Context,
+	followup cancellationFollowup,
+) {
+	if !followup.drained {
 		return
 	}
+	manager.runDrainedJob(ctx, followup.codebaseID, followup.drainedJobID)
+}
+
+func (manager *Manager) updateJobCancelledWithPolicy(
+	ctx context.Context,
+	jobID string,
+) cancellationFollowup {
+	job, transitioned, journalErr := manager.serializeJobTransition(
+		jobID,
+		"job_cancelled",
+		func(job *model.Job) bool {
+			if isTerminalJobState(job.State) {
+				return false
+			}
+			now := clock.Now()
+			job.State = model.JobStateCancelled
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			job.Progress.Phase = "cancelled"
+			job.Progress.LastEventAt = now
+			job.Progress.HeartbeatAt = now
+			return true
+		},
+	)
+	if !transitioned {
+		return emptyCancellationFollowup()
+	}
+	metrics.JobCancelled()
+	if journalErr != nil {
+		slog.ErrorContext(ctx, "append cancelled job event failed", "job_id", jobID, "err", journalErr)
+	}
+	now := *job.CompletedAt
+	manager.mu.Lock()
 	delete(manager.conversationJobs, jobID)
 	manager.forgetJobJournalLocked(jobID)
-
-	now := clock.Now()
-	metrics.JobCancelled()
-	job.State = model.JobStateCancelled
-	job.UpdatedAt = now
-	job.CompletedAt = &now
-	job.Progress.Phase = "cancelled"
-	job.Progress.LastEventAt = now
-	job.Progress.HeartbeatAt = now
-	if err := manager.appendJobLocked("job_cancelled", job); err != nil {
-		slog.ErrorContext(ctx, "append cancelled job event failed", "job_id", jobID, "err", err)
-	}
-
 	codebase, found := manager.codebases[job.CodebaseID]
 	if !found {
 		manager.mu.Unlock()
-		return
+		return emptyCancellationFollowup()
 	}
 	if codebase.ActiveJobID != jobID {
 		manager.mu.Unlock()
-		return
+		return emptyCancellationFollowup()
 	}
 	// A cancellation is not a failure: leave the codebase at its last-good state
 	// so a status check reflects the current usable state, not a stale failure.
@@ -683,8 +757,10 @@ func (manager *Manager) updateJobCancelled(ctx context.Context, jobID string) {
 	codebaseID := codebase.ID
 	manager.mu.Unlock()
 	manager.notifyIndexStopped(ctx, codebaseID)
-	if drained {
-		manager.runDrainedJob(ctx, codebaseID, drainedJobID)
+	return cancellationFollowup{
+		codebaseID:   codebaseID,
+		drainedJobID: drainedJobID,
+		drained:      drained,
 	}
 }
 
