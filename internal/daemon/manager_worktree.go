@@ -69,8 +69,17 @@ func (manager *Manager) discoverWorktree(ctx context.Context, info gitworktree.I
 	indexConfig.IgnoreDigest = digestIndexConfig(indexConfig)
 
 	collectionName := ""
+	collectionAbsent := true
 	if manager.semantic != nil {
 		collectionName = manager.semantic.CollectionName(info.WorktreeRoot)
+		if manager.semantic.Available() {
+			hasCollection, collectionErr := manager.semantic.HasCollectionForPath(ctx, info.WorktreeRoot)
+			if collectionErr != nil {
+				slog.WarnContext(ctx, "discover worktree: check collection failed", "path", info.WorktreeRoot, "err", collectionErr)
+			} else {
+				collectionAbsent = !hasCollection
+			}
+		}
 	}
 
 	manager.mu.Lock()
@@ -80,6 +89,7 @@ func (manager *Manager) discoverWorktree(ctx context.Context, info gitworktree.I
 	}
 	record := newCodebaseRecord(info.WorktreeRoot)
 	record.Status = model.CodebaseStatusDiscovered
+	record.PolicyPendingInitialization = collectionAbsent
 	record.EffectiveConfig = indexConfig
 	record.CollectionName = collectionName
 	record.WorktreeCommonDir = info.CommonDir
