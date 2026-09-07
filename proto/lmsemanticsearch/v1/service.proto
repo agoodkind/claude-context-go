@@ -86,6 +86,15 @@ enum SchedulingPriority {
   SCHEDULING_PRIORITY_LOW = 3;
 }
 
+// SchedulingReason is the closed reason a queued or paused job cannot run.
+enum SchedulingReason {
+  SCHEDULING_REASON_UNSPECIFIED = 0;
+  SCHEDULING_REASON_HIGHER_PRIORITY_WORK = 1;
+  SCHEDULING_REASON_USER_ACTIVE = 2;
+  SCHEDULING_REASON_ACTIVITY_UNAVAILABLE = 3;
+  SCHEDULING_REASON_THERMAL_SAFETY = 4;
+}
+
 message SchedulingPolicy {
   SchedulingPriority priority = 1;
   bool quiet = 2;
@@ -294,7 +303,8 @@ message Job {
   string outcome = 20;
   SchedulingPolicy effective_scheduling_policy = 21;
   uint64 queue_sequence = 22;
-  string scheduling_reason = 23;
+  // scheduling_reason is set only from the closed scheduling reason vocabulary.
+  SchedulingReason scheduling_reason = 23;
 }
 
 message SearchResult {

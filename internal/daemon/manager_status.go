@@ -41,6 +41,13 @@ func (manager *Manager) GetIndex(ctx context.Context, requestedPath string) (mod
 		codebase := matches[0]
 		activeJob := manager.activeJobSnapshotLocked(codebase)
 		manager.mu.Unlock()
+		if activeJob != nil && manager.jobScheduler != nil {
+			resolvedJob := jobWithSchedulerReason(
+				*activeJob,
+				manager.jobScheduler.Snapshot().Reasons,
+			)
+			activeJob = &resolvedJob
+		}
 		classification := manager.classifyTrackedPath(ctx, codebase, canonicalPath)
 		return codebase, activeJob, true, classification, nil
 	}

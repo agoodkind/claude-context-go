@@ -13,6 +13,7 @@ type JobSurface struct {
 	ErrorLine         string
 	Superseded        bool
 	SupersededByJobID string
+	Scheduling        SchedulingView
 }
 
 // FailureSurface is the resolved failure detail for a codebase.
@@ -429,6 +430,7 @@ type ListSummary struct {
 	Total      int
 	Queued     int
 	Running    int
+	Paused     int
 	Canceling  int
 	Completed  int
 	Failed     int
@@ -447,6 +449,7 @@ type StatusView struct {
 	Name            string
 	Path            string
 	UpdatedAt       string
+	Scheduling      SchedulingView
 	PrepareLabel    string
 	WaitLabel       string
 	Heading         string
@@ -611,6 +614,7 @@ type CodebaseRowView struct {
 	ID            string
 	CanonicalPath string
 	Display       Display
+	Scheduling    SchedulingView
 	// ReuseSiblingCount surfaces a discovered worktree's reuse forecast in the
 	// list, so a deferred build reads as cheap rather than a blank pending row. It
 	// is zero for codebases that are not discovered worktrees.

@@ -128,6 +128,9 @@ type Inputs struct {
 	// JobQueued reports whether the live job is queued but not yet running, so it
 	// reads as pending rather than preparing.
 	JobQueued bool
+	// JobPaused reports whether the live job yielded capacity and is waiting to
+	// resume, so the codebase reads as waiting rather than indexing.
+	JobPaused bool
 	// JobScopeKnown reports whether the live job has measured its file scope, so
 	// it reads as indexing rather than preparing.
 	JobScopeKnown bool
@@ -185,6 +188,7 @@ type displayRule struct {
 // A codebase that matches no rule (NotIndexed or Indexing with no live job, an
 // interrupted build the background pass re-queues) defaults to preparing.
 var displayRules = []displayRule{
+	{func(in Inputs) bool { return in.HasActiveJob && in.JobPaused }, DisplayWaiting},
 	{func(in Inputs) bool { return in.HasActiveJob && in.BackgroundSyncReconcile }, DisplayIndexed},
 	{func(in Inputs) bool { return in.HasActiveJob && in.JobQueued }, DisplayPending},
 	{func(in Inputs) bool { return in.HasActiveJob && in.JobScopeKnown }, DisplayIndexing},

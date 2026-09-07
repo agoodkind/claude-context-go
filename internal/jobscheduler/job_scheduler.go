@@ -14,16 +14,17 @@ import (
 )
 
 const (
-	// ReasonWaitingForCapacity means every slot is occupied by equal-priority work.
-	ReasonWaitingForCapacity = "waiting for capacity"
+	// ReasonWaitingForCapacity remains unspecified because capacity alone is not
+	// one of the policy reasons exposed to clients.
+	ReasonWaitingForCapacity = model.SchedulingReasonUnspecified
 	// ReasonHigherPriorityWork means higher-priority work controls admission.
-	ReasonHigherPriorityWork = "higher-priority work"
+	ReasonHigherPriorityWork = model.SchedulingReasonHigherPriorityWork
 	// ReasonActivityUnavailable means quiet work cannot observe input idle time.
-	ReasonActivityUnavailable = "input activity unavailable"
+	ReasonActivityUnavailable = model.SchedulingReasonActivityUnavailable
 	// ReasonWaitingForInputIdle means the configured idle duration has not elapsed.
-	ReasonWaitingForInputIdle = "waiting for input idle"
+	ReasonWaitingForInputIdle = model.SchedulingReasonUserActive
 	// ReasonThermalUnsafe means quiet work cannot run under the current thermal state.
-	ReasonThermalUnsafe    = "thermal state unsafe"
+	ReasonThermalUnsafe    = model.SchedulingReasonThermalSafety
 	activitySampleInterval = 2 * time.Second
 )
 
@@ -45,7 +46,7 @@ type Entry struct {
 	Policy           model.SchedulingPolicy
 	QueueSequence    uint64
 	State            EntryState
-	Reason           string
+	Reason           model.SchedulingReason
 	PauseRequested   bool
 	generation       uint64
 	policyGeneration uint64
@@ -57,6 +58,7 @@ type Snapshot struct {
 	Running  map[model.JobPriority]int
 	Queued   map[model.JobPriority]int
 	Paused   map[model.JobPriority]int
+	Reasons  map[string]model.SchedulingReason
 	Yields   uint64
 	Activity platformactivity.Snapshot
 }
@@ -98,7 +100,7 @@ type Lease struct {
 type PauseClaim struct {
 	lease      *Lease
 	generation uint64
-	reason     string
+	reason     model.SchedulingReason
 }
 
 // New creates a scheduler that samples host activity when a source is supplied.
@@ -128,7 +130,7 @@ func New(
 		activity: platformactivity.Snapshot{
 			InputAvailable:   false,
 			InputIdleFor:     0,
-			InputReason:      ReasonActivityUnavailable,
+			InputReason:      string(ReasonActivityUnavailable),
 			ThermalAvailable: false,
 			ThermalUnsafe:    false,
 			ThermalReason:    "",
@@ -208,10 +210,10 @@ func unavailableActivitySnapshot() platformactivity.Snapshot {
 	return platformactivity.Snapshot{
 		InputAvailable:   false,
 		InputIdleFor:     0,
-		InputReason:      ReasonActivityUnavailable,
+		InputReason:      string(ReasonActivityUnavailable),
 		ThermalAvailable: false,
 		ThermalUnsafe:    false,
-		ThermalReason:    ReasonActivityUnavailable,
+		ThermalReason:    string(ReasonActivityUnavailable),
 	}
 }
 
@@ -332,10 +334,12 @@ func (scheduler *Scheduler) Snapshot() Snapshot {
 		Running:  newSchedulerPriorityCounts(),
 		Queued:   newSchedulerPriorityCounts(),
 		Paused:   newSchedulerPriorityCounts(),
+		Reasons:  make(map[string]model.SchedulingReason, len(scheduler.entries)),
 		Yields:   scheduler.yields,
 		Activity: scheduler.activity,
 	}
 	for _, entry := range scheduler.entries {
+		snapshot.Reasons[entry.JobID] = entry.Reason
 		switch entry.State {
 		case EntryWaiting:
 			snapshot.Queued[entry.Policy.Priority]++
@@ -349,7 +353,7 @@ func (scheduler *Scheduler) Snapshot() Snapshot {
 }
 
 // Checkpoint reports whether running work must cooperatively pause.
-func (lease *Lease) Checkpoint() (bool, string) {
+func (lease *Lease) Checkpoint() (bool, model.SchedulingReason) {
 	lease.scheduler.mutex.Lock()
 	defer lease.scheduler.mutex.Unlock()
 
@@ -369,12 +373,12 @@ func (lease *Lease) ClaimPauseRequest() (*PauseClaim, bool) {
 }
 
 // ClaimYield claims a running lease for one non-priority yield.
-func (lease *Lease) ClaimYield(reason string) (*PauseClaim, bool) {
+func (lease *Lease) ClaimYield(reason model.SchedulingReason) (*PauseClaim, bool) {
 	return lease.claimPause(reason, false)
 }
 
 func (lease *Lease) claimPause(
-	reason string,
+	reason model.SchedulingReason,
 	requireRequest bool,
 ) (*PauseClaim, bool) {
 	lease.scheduler.mutex.Lock()
@@ -404,7 +408,7 @@ func (lease *Lease) claimPause(
 }
 
 // Reason returns the scheduling reason captured by this claim.
-func (claim *PauseClaim) Reason() string {
+func (claim *PauseClaim) Reason() model.SchedulingReason {
 	return claim.reason
 }
 
@@ -447,7 +451,7 @@ func (claim *PauseClaim) Yield() bool {
 }
 
 // Yield releases capacity once and retains the entry for reacquisition.
-func (lease *Lease) Yield(reason string) bool {
+func (lease *Lease) Yield(reason model.SchedulingReason) bool {
 	claim, claimed := lease.ClaimYield(reason)
 	if !claimed {
 		return false
@@ -459,7 +463,7 @@ func (lease *Lease) Yield(reason string) bool {
 func (lease *Lease) RetryAfter(
 	ctx context.Context,
 	delay time.Duration,
-	reason string,
+	reason model.SchedulingReason,
 ) error {
 	return lease.retryAfter(ctx, delay, reason, false)
 }
@@ -470,7 +474,7 @@ func (lease *Lease) RetryAfter(
 func (lease *Lease) RetrySharedAfter(
 	ctx context.Context,
 	delay time.Duration,
-	reason string,
+	reason model.SchedulingReason,
 ) error {
 	return lease.retryAfter(ctx, delay, reason, true)
 }
@@ -478,7 +482,7 @@ func (lease *Lease) RetrySharedAfter(
 func (lease *Lease) retryAfter(
 	ctx context.Context,
 	delay time.Duration,
-	reason string,
+	reason model.SchedulingReason,
 	shared bool,
 ) error {
 	if err := ctx.Err(); err != nil {
@@ -659,7 +663,7 @@ func (scheduler *Scheduler) openRetryRound(generation uint64) {
 	scheduler.retryTimer = nil
 	scheduler.retryTimerDeadline = time.Time{}
 	now := scheduler.now()
-	sharedReasons := map[string]struct{}{}
+	sharedReasons := map[model.SchedulingReason]struct{}{}
 	for jobID, deadline := range scheduler.retryWaiting {
 		if deadline.After(now) || !scheduler.retryShared[jobID] {
 			continue
@@ -827,7 +831,9 @@ func schedulerVictimBefore(left *Entry, right *Entry) bool {
 	return left.JobID > right.JobID
 }
 
-func (scheduler *Scheduler) waitingReasonLocked(entry *Entry) string {
+func (scheduler *Scheduler) waitingReasonLocked(
+	entry *Entry,
+) model.SchedulingReason {
 	if reason := scheduler.quietBlockingReasonLocked(entry.Policy); reason != "" {
 		return reason
 	}
@@ -848,31 +854,24 @@ func (scheduler *Scheduler) waitingReasonLocked(entry *Entry) string {
 
 func (scheduler *Scheduler) quietBlockingReasonLocked(
 	policy model.SchedulingPolicy,
-) string {
+) model.SchedulingReason {
 	if !policy.Quiet {
 		return ""
 	}
 	if scheduler.activity.ThermalAvailable && scheduler.activity.ThermalUnsafe {
-		return reasonOrFallback(scheduler.activity.ThermalReason, ReasonThermalUnsafe)
+		return ReasonThermalUnsafe
 	}
 	if policy.Priority == model.JobPriorityHigh {
 		return ""
 	}
 	if !scheduler.activity.InputAvailable {
-		return reasonOrFallback(scheduler.activity.InputReason, ReasonActivityUnavailable)
+		return ReasonActivityUnavailable
 	}
 	idleThreshold := time.Duration(policy.IdleAfterSeconds) * time.Second
 	if scheduler.activity.InputIdleFor < idleThreshold {
-		return reasonOrFallback(scheduler.activity.InputReason, ReasonWaitingForInputIdle)
+		return ReasonWaitingForInputIdle
 	}
 	return ""
-}
-
-func reasonOrFallback(reason string, fallback string) string {
-	if reason != "" {
-		return reason
-	}
-	return fallback
 }
 
 func (scheduler *Scheduler) runningCountLocked() int {

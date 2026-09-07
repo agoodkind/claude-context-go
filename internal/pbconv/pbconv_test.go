@@ -93,20 +93,47 @@ func TestSchedulingPolicyViewsCarryStoredAndEffectiveValues(t *testing.T) {
 	}
 
 	job := ToJob(model.Job{
+		State: model.JobStateQueued,
 		EffectiveSchedulingPolicy: model.SchedulingPolicy{
 			Priority:         model.JobPriorityLow,
 			Quiet:            false,
 			IdleAfterSeconds: 120,
 		},
 		QueueSequence:    42,
-		SchedulingReason: "waiting for input idle",
+		SchedulingReason: model.SchedulingReasonUserActive,
 	})
 	if job.GetEffectiveSchedulingPolicy().GetPriority() != pb.SchedulingPriority_SCHEDULING_PRIORITY_LOW ||
 		job.GetEffectiveSchedulingPolicy().GetQuiet() ||
 		job.GetEffectiveSchedulingPolicy().GetIdleAfterSeconds() != 120 ||
 		job.GetQueueSequence() != 42 ||
-		job.GetSchedulingReason() != "waiting for input idle" {
-		t.Fatalf("job policy view = %+v sequence=%d reason=%q", job.GetEffectiveSchedulingPolicy(), job.GetQueueSequence(), job.GetSchedulingReason())
+		job.GetSchedulingReason() != pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE {
+		t.Fatalf("job policy view = %+v sequence=%d reason=%v", job.GetEffectiveSchedulingPolicy(), job.GetQueueSequence(), job.GetSchedulingReason())
+	}
+}
+
+func TestSchedulingReasonProtoConversionIsClosed(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[model.SchedulingReason]pb.SchedulingReason{
+		model.SchedulingReasonUnspecified:         pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED,
+		model.SchedulingReasonHigherPriorityWork:  pb.SchedulingReason_SCHEDULING_REASON_HIGHER_PRIORITY_WORK,
+		model.SchedulingReasonUserActive:          pb.SchedulingReason_SCHEDULING_REASON_USER_ACTIVE,
+		model.SchedulingReasonActivityUnavailable: pb.SchedulingReason_SCHEDULING_REASON_ACTIVITY_UNAVAILABLE,
+		model.SchedulingReasonThermalSafety:       pb.SchedulingReason_SCHEDULING_REASON_THERMAL_SAFETY,
+	}
+	for modelReason, protoReason := range testCases {
+		if got := schedulingReasonToProto(modelReason); got != protoReason {
+			t.Errorf("reason %q converts to %v, want %v", modelReason, got, protoReason)
+		}
+		if got := schedulingReasonFromProto(protoReason); got != modelReason {
+			t.Errorf("reason %v converts to %q, want %q", protoReason, got, modelReason)
+		}
+	}
+	if got := schedulingReasonToProto(model.SchedulingReason("free-form")); got != pb.SchedulingReason_SCHEDULING_REASON_UNSPECIFIED {
+		t.Fatalf("free-form model reason converts to %v, want unspecified", got)
+	}
+	if got := schedulingReasonFromProto(pb.SchedulingReason(99)); got != model.SchedulingReasonUnspecified {
+		t.Fatalf("unknown proto reason converts to %q, want unspecified", got)
 	}
 }
 

@@ -100,7 +100,7 @@ func (manager *Manager) updateJobRunning(job model.Job) error {
 				return false
 			}
 			current.State = model.JobStateRunning
-			current.SchedulingReason = ""
+			current.SchedulingReason = model.SchedulingReasonUnspecified
 			current.UpdatedAt = now
 			current.Progress.Phase = "Preparing and scanning files..."
 			current.Progress.LastEventAt = now

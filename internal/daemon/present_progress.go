@@ -211,6 +211,7 @@ func resolveListSummary(jobs []model.Job, pipelineDegraded bool) view.ListSummar
 		Total:      len(jobs),
 		Queued:     0,
 		Running:    0,
+		Paused:     0,
 		Canceling:  0,
 		Completed:  0,
 		Failed:     0,
@@ -224,7 +225,7 @@ func resolveListSummary(jobs []model.Job, pipelineDegraded bool) view.ListSummar
 		case model.JobStateRunning:
 			summary.Running++
 		case model.JobStatePaused:
-			summary.Queued++
+			summary.Paused++
 		case model.JobStateCancelling:
 			summary.Canceling++
 		case model.JobStateCompleted:

@@ -57,6 +57,7 @@ func computeDisplayStatus(codebase model.Codebase, activeJob *model.Job, depende
 		Status:                  codebase.Status,
 		HasActiveJob:            activeJob != nil,
 		JobQueued:               activeJob != nil && activeJob.State == model.JobStateQueued,
+		JobPaused:               activeJob != nil && activeJob.State == model.JobStatePaused,
 		JobScopeKnown:           activeJob != nil && jobScopeKnown(activeJob.Progress),
 		BackgroundSyncReconcile: activeJob != nil && isBackgroundSyncReconcile(&codebase, activeJob),
 		Dependency:              dependency,
@@ -78,6 +79,7 @@ func computeSearchable(searchableEligible bool, dependency dependencyMode, readi
 		Status:                  "",
 		HasActiveJob:            false,
 		JobQueued:               false,
+		JobPaused:               false,
 		JobScopeKnown:           false,
 		BackgroundSyncReconcile: false,
 		Dependency:              dependency,
@@ -118,7 +120,26 @@ func resolveJobSurface(job model.Job, pipelineDegraded bool, supersededByJobID s
 		ErrorLine:         resolved.ErrorLine,
 		Superseded:        resolved.Superseded,
 		SupersededByJobID: resolved.SupersededByJobID,
+		Scheduling: resolveSchedulingView(
+			job.EffectiveSchedulingPolicy,
+			job.State,
+			job.SchedulingReason,
+		),
 	}
+}
+
+func resolveSchedulingView(
+	policy model.SchedulingPolicy,
+	state model.JobState,
+	reason model.SchedulingReason,
+) view.SchedulingView {
+	return view.ResolveScheduling(
+		string(policy.Priority),
+		policy.Quiet,
+		policy.IdleAfterSeconds,
+		string(state),
+		view.SchedulingReason(reason),
+	)
 }
 
 // resolveCodebaseFailure reduces a codebase's raw failure record into the
@@ -178,9 +199,14 @@ func resolveQuarantineSurface(codebase model.Codebase) view.QuarantineSurface {
 // It is the relocated body of the render-side builder, so the templates keep
 // their exact output. templateName selects among preparing, building,
 // incremental, idle, ready, and waiting.
-func resolveStatusView(codebase model.Codebase, activeJob *model.Job, display displayStatus, waitLabel string) (view.StatusView, string) {
+func resolveStatusView(codebase model.Codebase, activeJob *model.Job, display displayStatus, dependency dependencyMode) (view.StatusView, string) {
 	statusView := blankStatusView(filepath.Base(codebase.CanonicalPath), formatStampWithRelative(codebase.UpdatedAt))
 	statusView.Path = codebase.CanonicalPath
+	statusView.Scheduling = resolveSchedulingView(
+		codebase.SchedulingPolicy,
+		"",
+		"",
+	)
 	switch display {
 	case displayDiscovered:
 		// A discovered worktree is registered and watched but not yet built. The
@@ -201,7 +227,7 @@ func resolveStatusView(codebase model.Codebase, activeJob *model.Job, display di
 	case displayIdle:
 		return statusView, "idle.md.tmpl"
 	case displayWaiting:
-		statusView.WaitLabel = waitLabel
+		statusView.WaitLabel = schedulingWaitLabel(activeJob, dependency, waitingLabel(dependency))
 		return statusView, "waiting.md.tmpl"
 	case displayIndexed:
 		return resolveIndexedStatusView(statusView, codebase, activeJob)
@@ -306,6 +332,7 @@ func blankStatusView(name string, updatedAt string) view.StatusView {
 			TotalChunks:  nil,
 		},
 		UpdatedAt:                    updatedAt,
+		Scheduling:                   view.ZeroScheduling(),
 		LastSuccessfulRunCompletedAt: "",
 		SyncNote:                     "",
 		GraphUpdatedAt:               "",
@@ -314,6 +341,21 @@ func blankStatusView(name string, updatedAt string) view.StatusView {
 		GraphReadyNoTime:             false,
 		GraphNotBuilt:                false,
 	}
+}
+
+func schedulingWaitLabel(activeJob *model.Job, dependency dependencyMode, fallback string) string {
+	if activeJob == nil || activeJob.State != model.JobStatePaused || dependency != dependencyHealthy {
+		return fallback
+	}
+	reason := resolveSchedulingView(
+		activeJob.EffectiveSchedulingPolicy,
+		activeJob.State,
+		activeJob.SchedulingReason,
+	).Reason
+	if reason == "" {
+		return "Paused"
+	}
+	return "Waiting: " + string(reason)
 }
 
 // formatBoundaryStatusTime renders a compact wall-clock time with zone for the
@@ -499,7 +541,7 @@ func (manager *Manager) resolveGetIndexView(
 	getIndex.Display = view.Display(display)
 	getIndex.Failure = resolveCodebaseFailure(*codebase)
 	getIndex.Quarantine = resolveQuarantineSurface(*codebase)
-	statusView, templateName := resolveStatusView(*codebase, activeJob, display, waitingLabel(health.Mode))
+	statusView, templateName := resolveStatusView(*codebase, activeJob, display, health.Mode)
 	if display == displayIndexed {
 		statusView.CurrentIndex = manager.currentIndexCounts(ctx, *codebase, observedRows)
 	}
@@ -753,7 +795,7 @@ func resolveSearchStatusView(codebase model.Codebase, activeJob *model.Job, heal
 		return blankStatusView("", ""), "", false
 	}
 	display := computeDisplayStatus(codebase, activeJob, health.Mode, status.CollectionNotApplicable)
-	statusView, templateName := resolveStatusView(codebase, activeJob, display, waitingLabel(health.Mode))
+	statusView, templateName := resolveStatusView(codebase, activeJob, display, health.Mode)
 	resolveGraphStatusFields(&statusView, codebase, graphBuilding)
 	return statusView, templateName, isBackgroundSyncReconcile(&codebase, activeJob)
 }

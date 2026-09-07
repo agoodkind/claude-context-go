@@ -190,9 +190,11 @@ func renderGetIndexBody(getIndex view.GetIndexView) string {
 			// A non-template state must always arrive with a narrative. An empty one
 			// means a caller skipped resolveStatusNarrative; surface the status word
 			// and path so the gap is visible rather than rendering a blank body.
-			return fmt.Sprintf("Codebase '%s' status: %s", getIndex.CanonicalPath, getIndex.Display)
+			body := fmt.Sprintf("Codebase '%s' status: %s", getIndex.CanonicalPath, getIndex.Display)
+			return insertSchedulingPolicy(body, "🗓️ Stored policy: ", getIndex.Status.Scheduling)
 		}
-		return strings.Join(getIndex.Narrative.Lines, "\n")
+		body := strings.Join(getIndex.Narrative.Lines, "\n")
+		return insertSchedulingPolicy(body, "🗓️ Stored policy: ", getIndex.Status.Scheduling)
 	default:
 		return renderStatusBody(getIndex.Status, getIndex.TemplateName)
 	}
@@ -200,11 +202,12 @@ func renderGetIndexBody(getIndex view.GetIndexView) string {
 
 func renderStatusBody(statusView view.StatusView, templateName string) string {
 	block := strings.Join(BreakdownLines(statusView.Breakdown), "\n")
-	return renderStatusTemplate(templateName, statusTemplateData{
+	body := renderStatusTemplate(templateName, statusTemplateData{
 		StatusView:     statusView,
 		BreakdownBlock: block,
 		QuotedPath:     shellQuote(statusView.Path),
 	})
+	return insertSchedulingPolicy(body, "🗓️ Stored policy: ", statusView.Scheduling)
 }
 
 func renderListIndexes(views []view.CodebaseRowView) string {
@@ -221,6 +224,9 @@ func renderListIndexes(views []view.CodebaseRowView) string {
 		// status detail shows.
 		if row.Display == displayDiscovered && row.ReuseSiblingCount > 0 {
 			line += fmt.Sprintf("  ♻️ reuses %d sibling %s", row.ReuseSiblingCount, plural("collection", int(row.ReuseSiblingCount)))
+		}
+		if policy := SchedulingPolicy(row.Scheduling); policy != "" {
+			line += "  stored policy: " + policy
 		}
 		lines = append(lines, line)
 		// An actively-indexing codebase shows its live breakdown tree inline, the
@@ -243,9 +249,17 @@ func renderGetJob(entry view.JobEntryView, found bool) string {
 		"📁 Codebase: " + entry.CanonicalPath,
 		"⚙️ Operation: " + entry.Operation,
 		"🚦 State: " + entry.Surface.StateLabel,
-		"🔧 Phase: " + entry.PhaseLabel,
-		"📊 Run progress: " + entry.Progress.PercentLabel,
 	}
+	if policy := SchedulingPolicy(entry.Surface.Scheduling); policy != "" {
+		lines = append(lines, "🗓️ Effective policy: "+policy)
+	}
+	if reason := SchedulingReason(entry.Surface.Scheduling); reason != "" {
+		lines = append(lines, "⏳ Waiting: "+reason)
+	}
+	lines = append(lines,
+		"🔧 Phase: "+entry.PhaseLabel,
+		"📊 Run progress: "+entry.Progress.PercentLabel,
+	)
 	lines = append(lines, renderTimingLines(entry.Timing)...)
 	lines = append(lines, renderProgressLines(entry.Progress)...)
 	if entry.Surface.ErrorLine != "" {
@@ -386,7 +400,13 @@ func renderListJobs(summary view.ListSummary, active []view.JobEntryView, termin
 
 	lines := make([]string, 0, 32)
 	lines = append(lines, fmt.Sprintf("Tracked jobs: %d total", summary.Total))
-	lines = append(lines, fmt.Sprintf("Active: %d queued, %d running, %d canceling", summary.Queued, summary.Running, summary.Canceling))
+	lines = append(lines, fmt.Sprintf(
+		"Active: %d queued, %d running, %d paused, %d canceling",
+		summary.Queued,
+		summary.Running,
+		summary.Paused,
+		summary.Canceling,
+	))
 	lines = append(lines, fmt.Sprintf("Ended: %d completed, %d failed, %d superseded, %d canceled",
 		summary.Completed, summary.Failed, summary.Superseded, summary.Canceled))
 	if len(active) == 0 {
@@ -416,6 +436,12 @@ func renderJobListEntry(entry view.JobEntryView) []string {
 	// detail block above prints the bare figure under its own "Run progress" key.
 	lines := []string{fmt.Sprintf("- %s [%s · %s] %s %s",
 		entry.ID, entry.Surface.StateLabel, entry.Progress.PercentScopeLabel, entry.Operation, entry.CanonicalPath)}
+	if policy := SchedulingPolicy(entry.Surface.Scheduling); policy != "" {
+		lines = append(lines, "  Effective policy: "+policy)
+	}
+	if reason := SchedulingReason(entry.Surface.Scheduling); reason != "" {
+		lines = append(lines, "  Waiting: "+reason)
+	}
 	lines = append(lines, renderTimingLines(entry.Timing)...)
 	lines = append(lines, renderProgressLines(entry.Progress)...)
 	if entry.Surface.ErrorLine != "" {

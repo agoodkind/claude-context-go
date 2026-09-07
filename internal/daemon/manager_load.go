@@ -52,6 +52,9 @@ func (manager *Manager) load(ctx context.Context) error {
 			return fmt.Errorf("normalize effective scheduling policy for job %s: %w", id, policyErr)
 		}
 		job.EffectiveSchedulingPolicy = normalizedPolicy
+		job.SchedulingReason = model.CanonicalSchedulingReason(
+			string(job.SchedulingReason),
+		)
 		manager.jobs[id] = job
 	}
 	manager.policyMutationMutex.Lock()
