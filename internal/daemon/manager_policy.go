@@ -350,7 +350,7 @@ func (manager *Manager) preparePolicyUpdate(
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
-	matches := manager.findCodebasesByCoverage(canonicalPath)
+	matches := manager.findPolicyUpdateCodebasesLocked(canonicalPath)
 	if len(matches) == 0 {
 		return policyUpdatePlan{}, false, errors.New("codebase not tracked: " + requestedPath)
 	}
@@ -407,6 +407,17 @@ func (manager *Manager) preparePolicyUpdate(
 		return plan, true, wrappedErr
 	}
 	return plan, true, nil
+}
+
+func (manager *Manager) findPolicyUpdateCodebasesLocked(
+	canonicalPath string,
+) []model.Codebase {
+	for _, codebase := range manager.codebases {
+		if codebase.CanonicalPath == canonicalPath {
+			return []model.Codebase{codebase}
+		}
+	}
+	return manager.findCodebasesByCoverage(canonicalPath)
 }
 
 // preparePolicyUpdateJobsLocked captures every current schedulable job for the
